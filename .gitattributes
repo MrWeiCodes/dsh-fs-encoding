@@ -1,0 +1,64 @@
+# ===========================================================================
+# 换行符策略 / Line-ending policy
+# ===========================================================================
+#
+# 统一换行符：无论谁、在哪个系统克隆，工作区文件都是 LF。
+# Normalize line endings: the working tree stays LF no matter who clones the
+# repository or which system they are on.
+#
+# 为什么需要 / Why this matters:
+#   git 的 core.autocrlf 是每台机器的本地设置，默认值因平台而异。
+#   git's core.autocrlf is a per-machine local setting whose default varies by
+#   platform.
+#
+#   没有这一行时，Windows 用户（autocrlf=true）克隆得到的会是 CRLF 文件，
+#   与仓库中存储的 LF 不一致，会导致：
+#     - diff 出现整文件变更 / whole-file diffs that hide the real change
+#     - 测试快照失配 / mismatched test snapshots
+#     - 换行符保真相关的断言基线不可靠
+#       unreliable baselines for the line-ending fidelity assertions
+#
+#   Without this line, Windows users (autocrlf=true) get CRLF files while the
+#   repository stores LF, which causes all of the above.
+#
+# 本项目所有源文件均为 LF，且插件本身会读写这些文件，因此显式锁定。
+# Every source file here is LF, and the plugin itself reads and writes these
+# files, so the policy is pinned explicitly.
+#
+# 本文件优先级高于 core.autocrlf，因此无需依赖任何人的本地设置。
+# This file takes precedence over core.autocrlf, so nobody's local setting can
+# change the outcome.
+
+* text=auto eol=lf
+
+# ===========================================================================
+# 二进制文件 / Binary files
+# ===========================================================================
+#
+# 不做任何换行符转换，避免损坏内容。
+# No line-ending conversion at all, so the bytes are never corrupted.
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.zip binary
+*.gz binary
+*.tgz binary
+*.pdf binary
+
+# ===========================================================================
+# Windows 脚本 / Windows scripts
+# ===========================================================================
+#
+# 这些脚本必须使用 CRLF 才能被 cmd.exe / PowerShell 正确执行。
+# These scripts require CRLF to run correctly under cmd.exe / PowerShell.
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

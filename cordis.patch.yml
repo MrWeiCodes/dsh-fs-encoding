@@ -1,0 +1,21 @@
+# dsh-fs-encoding bundle patch: mount the host-plane plugin row.
+#
+# The plugin registers encoding-governed `read` / `write` / `edit` tools on each
+# agent's OWN scope layer at `agent/session-start`, so they shadow the preset's
+# built-in tools (nearest layer wins in dsh's tool registry) and unwind when the
+# agent is disposed. No preset editing is required.
+#
+# It does NOT replace `ctx.fs`: reads still go through `ctx.fs.readBytes`, and
+# writes reuse the public `fs/write-intent` + `fs/observed` event gate and the
+# public sandbox policy API, so the sandbox fence and the read-before-write
+# policy keep working exactly as with the built-ins.
+#
+# CONFLICT: this plugin and `dsh-better-edit` both register `read` / `write` /
+# `edit` on the same layer. Registering a name twice in one layer throws, so the
+# two cannot be enabled together. Disable the other one:
+#
+#   - id: dsh-better-edit
+#     disabled: true
+- insert:
+    - id: dsh-fs-encoding
+      name: dsh-fs-encoding
