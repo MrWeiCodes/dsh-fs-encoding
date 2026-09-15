@@ -27,9 +27,9 @@ This plugin takes over those three tools and, while **preserving every existing 
 - **Line-ending fidelity**: CRLF / LF / CR are detected at read and restored on save, so Windows projects are not rewritten to LF.
 - **No silent corruption**: if the target encoding cannot represent the new content (an emoji in a GBK file), the plugin **refuses the write** and explains why, leaving the file untouched — instead of filling it with `?` and destroying it.
 - **It tells you what to do when it cannot read**: for a non-UTF-8 file, the plugin lists the most likely encodings with a sample decode of each, so the AI (or you) can pick one and re-read — like VS Code's "Reopen with Encoding".
-- **Twelve encodings**: UTF-8 (with BOM), UTF-16, UTF-32, plus common code pages such as GBK, Big5, Shift-JIS, EUC-KR, Windows-1251 and ISO-8859-1.
+- **Nineteen encodings**: UTF-8 (with BOM), UTF-16, UTF-32, plus GBK, Big5, Shift-JIS, EUC-KR and the full Windows-125x family (Western, Central European, Cyrillic, Greek, Turkish, Hebrew, Arabic, Baltic).
 - **Zero learning curve**: arguments and output format are identical to the built-ins — these are **drop-in replacements**, so existing prompts and habits keep working; `read` merely gains one optional `encoding` argument.
-- **Simple configuration**: one YAML file with four switches, all overridable by environment variables.
+- **Simple configuration**: one YAML file with a few switches, all overridable by environment variables.
 
 ## Usage
 
@@ -43,56 +43,54 @@ Without `encoding`, the plugin auto-detects UTF-8 files, UTF-16 / UTF-32 files t
 
 ```
 [E_NOT_TEXT] legacy.txt is not valid UTF-8. Most likely gbk. Re-read with
-read({ encoding: "gbk" }) to decode it, or set autoGuessEncoding: true in the
-plugin config to decode automatically.
+read({ file_path: "legacy.txt", encoding: "gbk" }) to decode it, or set
+autoGuessEncoding: true in the plugin config to decode automatically.
 Candidates: gbk("你好，世界"), big5("斕疑"), shift_jis("ﾄ羲")
 ```
 
 Re-read with the call shown in the message and the encoding turns from a guess into a known fact that every later save follows.
 
-> **UTF-16 / UTF-32 files without a BOM** work the same way — specify explicitly with `read({ encoding: "utf16le" })`. Such files are rare on Windows, and without a BOM the byte order cannot be reliably detected, so the plugin does not guess.
+> **UTF-16 / UTF-32 files without a BOM** work the same way — specify explicitly with `read({ file_path: "<path>", encoding: "utf16le" })`. Such files are rare on Windows, and without a BOM the byte order cannot be reliably detected, so the plugin does not guess.
 
 > **Why does it ask by default?** GBK, Big5 and Shift-JIS byte ranges overlap on short inputs, so a wrong guess is invisible in the UI — and would then be **written back under the wrong encoding**, ruining the file. The plugin therefore prefers "fail rather than guess wrong". If you would rather have best-effort decoding, set `autoGuessEncoding: true`.
 
 ## Installation
 
+> **⚠️ Conflict**: **any** plugin that registers `read` / `write` / `edit` on the same scope layer is mutually exclusive with this one — registering a name twice in a layer throws, so only one such plugin can be enabled.
+>
+> If those three names are already held by another plugin **on the same layer**, the install is refused with the offending tool named, rather than leaving a half-registered tool set. To resolve it, either remove this plugin from the profile or disable the plugin that holds the name:
+>
+> ```yaml
+> # in the profile's cordis.patch.yml
+> - id: <the other plugin's id>
+>   disabled: true
+> ```
+>
+> Note: the built-in `read` / `write` / `edit` live on an outer host/preset layer and are **not** a conflict — shadowing them on the agent's own layer is exactly what this plugin does, matching how the native tools shadow each other.
+
 ### Option 1: let the AI install (easiest)
 
 Just give your DSH AI assistant the repository URL, e.g. "install the plugin https://github.com/MrWeiCodes/dsh-fs-encoding". The AI handles plugin loading, dependencies and the patch for you; then restart `dsh web`.
 
-> **⚠️ Conflict**: this plugin and `dsh-better-edit` both register `read` / `write` / `edit` on the same layer, so **only one of them can be enabled**. If you have `dsh-better-edit`, disable it in your profile's `cordis.patch.yml`:
->
-> ```yaml
-> - id: dsh-better-edit
->   disabled: true
-> ```
->
-> The plugin detects this conflict at boot and reports it with an actionable message rather than leaving a half-registered tool set.
+### Option 2: install from npm (recommended)
 
-### Option 2: one-liner (self-service)
+```powershell
+dsh plugin --profile web add dsh-fs-encoding
+```
+
+**Why this is the recommended path**: the npm package already ships the compiled `lib/`, so the install runs no build scripts at all — unaffected by pnpm's build-script gate, and independent of your local build environment. Then restart `dsh web`.
+
+### Option 3: install from GitHub
 
 ```powershell
 dsh plugin --profile web add -w github:MrWeiCodes/dsh-fs-encoding
 ```
 
-> **⚠️ The first install needs build scripts allowed.** This is a TypeScript project, and `lib/` is produced by the `prepare` script. For safety, pnpm 10 **blocks dependency build scripts by default**, so the first install fails and prints a message containing a full identifier with a commit hash (it changes on every commit, so it cannot be pre-written in this document).
->
-> Follow the printed instruction:
->
-> 1. Open `pnpm-workspace.yaml` in your profile directory (create it if absent) and paste the printed line verbatim:
->
->    ```yaml
->    onlyBuiltDependencies:
->      - "dsh-fs-encoding@git+https://github.com/MrWeiCodes/dsh-fs-encoding.git#<commit-hash-from-the-message>"
->    ```
->
-> 2. Re-run the `dsh plugin add` command above.
->
-> This is pnpm 10's blanket security policy for all git dependencies (it prevents arbitrary code execution at install time), not something specific to this plugin. If you would rather not allow build scripts, use **Option 3: manual installation**.
->
-> **Known issue with local-directory installs**: on Windows, if the plugin directory and the profile are on **different drives** (e.g. plugin on `G:\`, profile on `C:\`), pnpm mis-resolves the `file:` dependency to `C:\Users\<username>\...` and the install fails. Use **Option 3** instead.
+A GitHub install fetches the sources, so `lib/` is compiled on the spot by the `prepare` script — which means **you may need to allow build scripts** in the profile's `pnpm-workspace.yaml` (pnpm 10 and later blocks dependency build scripts by default; paste the line it prints and re-run). **If you would rather skip that, use Option 2** — the npm package already contains the compiled output and has no such step.
 
-### Option 3: manual installation
+> **Known issue with local-directory installs**: on Windows, if the plugin directory and the profile are on **different drives** (e.g. plugin on `G:\`, profile on `C:\`), pnpm mis-resolves the `file:` dependency to `C:\Users\<username>\...` and the install fails. Use **Option 4** instead.
+
+### Option 4: manual installation
 
 Fallback for environments without pnpm or for offline use:
 
@@ -114,7 +112,12 @@ Fallback for environments without pnpm or for offline use:
 ## Updating
 
 - **Installed via Option 1 (AI)**: just tell your AI assistant "update the dsh-fs-encoding plugin".
-- **Installed via Option 2 (dsh plugin)**:
+- **Installed via Option 2 (npm)**:
+  ```powershell
+  dsh plugin --profile web add dsh-fs-encoding@latest
+  ```
+  Then restart `dsh web`. The npm path involves no build step either.
+- **Installed via Option 3 (GitHub)**:
   ```powershell
   dsh plugin --profile web add -w github:MrWeiCodes/dsh-fs-encoding
   ```
@@ -123,8 +126,8 @@ Fallback for environments without pnpm or for offline use:
   dsh plugin --profile web remove dsh-fs-encoding
   dsh plugin --profile web add -w github:MrWeiCodes/dsh-fs-encoding
   ```
-  Then restart `dsh web`. **The commit hash changes with the new commit**, so if pnpm again asks you to allow build scripts, update the identifier in `pnpm-workspace.yaml` as described under Option 2.
-- **Installed via Option 3 (manual)**:
+  Then restart `dsh web`. **The commit hash changes with the new commit**, so if pnpm asks you to allow build scripts again, redo the step described under Option 3.
+- **Installed via Option 4 (manual)**:
   ```powershell
   cd "$HOME\.dsh\profiles\web\packages\dsh-fs-encoding"
   git pull            # or re-copy the new version over the old files
@@ -140,7 +143,7 @@ Your configuration (`$DSH_HOME/plugins/dsh-fs-encoding/config.yaml`) is preserve
 
 Just tell your AI assistant "uninstall the dsh-fs-encoding plugin"; the AI removes the plugin and cleans up the patch and dependencies.
 
-### Installed via Option 2 (dsh plugin)
+### Installed via Option 2 (npm) / Option 3 (GitHub)
 
 ```powershell
 dsh plugin --profile web remove dsh-fs-encoding
@@ -148,7 +151,7 @@ dsh plugin --profile web remove dsh-fs-encoding
 
 Then restart `dsh web`. The built-in `read` / `write` / `edit` come back immediately — nothing else to do.
 
-### Installed via Option 3 (manual)
+### Installed via Option 4 (manual)
 
 1. Remove this plugin's `insert` row from your profile's `cordis.patch.yml`.
 2. Remove `"dsh-fs-encoding": ...` from the `dependencies` of the profile's `package.json`.
@@ -157,40 +160,94 @@ Then restart `dsh web`. The built-in `read` / `write` / `edit` come back immedia
 ### Leftover locations (cleanup checklist for the AI)
 
 - **Config directory**: `$DSH_HOME/plugins/dsh-fs-encoding/` — `$DSH_HOME` defaults to `~/.dsh` (`C:\Users\<username>\.dsh` on Windows); the plugin's `config.yaml` lives here. Uninstallation does not delete it automatically; delete the whole directory manually for a complete cleanup.
-- **Plugin directory** (Option 3 installs): `$DSH_HOME/profiles/<profile>/packages/dsh-fs-encoding/`.
-- **Dependency & patch** (Option 3 installs): the `"dsh-fs-encoding": ...` dependency in the profile's `package.json`, and the `insert` row in `cordis.patch.yml`.
+- **Plugin directory** (Option 4 installs): `$DSH_HOME/profiles/<profile>/packages/dsh-fs-encoding/`.
+- **Dependency & patch** (Option 4 installs): the `"dsh-fs-encoding": ...` dependency in the profile's `package.json`, and the `insert` row in `cordis.patch.yml`.
 - No global registry, npm global packages, or system-level writes; the plugin writes no events of its own into session logs.
 
 ## Configuration
 
-`$DSH_HOME/plugins/dsh-fs-encoding/config.yaml`, generated on first load:
+**The defaults work — you normally do not need to touch this.** Only change it to adjust how encoding *guessing* behaves.
 
-```yaml
-# Decode a non-UTF-8 file by guessing instead of failing.
-# false (default, like VS Code): fail loud with Top-3 candidates.
-autoGuessEncoding: false
+Config file location (created automatically on first start, with full comments inside):
 
-# Migrate legacy (non-UTF-8) files to UTF-8 on their first save.
-# false (default): preserve the original encoding byte-exactly.
-normalizeToUtf8: false
-
-# Encodings considered when guessing, and listed in the Top-3 error hint.
-supportedEncodings: [gbk, big5, shift_jis, euc-kr, windows-1251, iso-8859-1]
-
-# Inclusive byte cap for reading a whole file into memory (default 10485760 = 10 MiB).
-maxFileBytes: 10485760
+```
+$DSH_HOME/plugins/dsh-fs-encoding/config.yaml
 ```
 
-Environment overrides: `DSH_FS_ENCODING_AUTO_GUESS`, `DSH_FS_ENCODING_NORMALIZE_TO_UTF8`, `DSH_FS_ENCODING_SUPPORTED_ENCODINGS`, `DSH_FS_ENCODING_MAX_FILE_BYTES`.
+### All options
 
-> **About `normalizeToUtf8`**: when set to `true`, legacy files such as GBK are converted to UTF-8 on their first save (encoding problems gone for good). UTF-16 / UTF-32 files are **not** converted — they are already Unicode, and re-encoding them would break programs that depend on them.
+| Option | Default | What it does |
+|---|---|---|
+| `autoGuessEncoding` | `false` | On an unreadable non-UTF-8 file: guess, or fail and let you choose |
+| `normalizeToUtf8` | `false` | Whether saving converts legacy files (GBK, …) **to UTF-8** |
+| `supportedEncodings` | built-in list | The encodings considered by **automatic guessing** |
+| `excludeEncodings` | empty | **Remove** a few encodings from the built-in list |
+| `maxFileBytes` | 10 MiB | Read size limit for a single file |
+
+### Common needs (copy and paste)
+
+**Let it guess instead of asking every time**
+
+```yaml
+autoGuessEncoding: true
+```
+
+**Be done with encoding problems for good** (a GBK file becomes UTF-8 after its first save)
+
+```yaml
+normalizeToUtf8: true
+```
+
+**One encoding keeps guessing wrong** (e.g. Cyrillic stealing Western text)
+
+```yaml
+excludeEncodings: [windows-1251]
+```
+
+### The encoding list: what the two keys do
+
+The plugin ships a built-in list used for **automatic guessing**. You can subtract from it, or replace it wholesale:
+
+| What you want | Which key | When the plugin adds an encoding later |
+|---|---|---|
+| Just drop one or two | `excludeEncodings` | ✅ You get it automatically |
+| Use a list of your own | `supportedEncodings` | ❌ You will not receive it |
+
+**Why `excludeEncodings` is the better default**: writing `supportedEncodings` **freezes** the list into your config file — encodings added in a later release will never reach you, and the plugin will not change it back for you (it never modifies an existing config).
+
+> **The list only affects *guessing*, not *reading*.** Any encoding can be read by naming it explicitly, even when it is not on the list:
+>
+> ```
+> read({ file_path: "legacy.txt", encoding: "windows-1253" })
+> ```
+
+### Environment variables
+
+Useful for a quick test or a container deployment. **An environment override always wins over the config file**:
+
+| Variable | Option |
+|---|---|
+| `DSH_FS_ENCODING_AUTO_GUESS` | `autoGuessEncoding` |
+| `DSH_FS_ENCODING_NORMALIZE_TO_UTF8` | `normalizeToUtf8` |
+| `DSH_FS_ENCODING_SUPPORTED_ENCODINGS` | `supportedEncodings` |
+| `DSH_FS_ENCODING_MAX_FILE_BYTES` | `maxFileBytes` |
+
+`excludeEncodings` has **no** environment variable — it is the only option that lives in the config file alone.
+
+> **`normalizeToUtf8` does not convert UTF-16 / UTF-32 files**: they are already Unicode, and re-encoding them would break programs that depend on them.
 
 ## Supported encodings
 
 | Kind | Encodings |
 |---|---|
 | Unicode | `utf8`, `utf8bom`, `utf16le`, `utf16be`, `utf32le`, `utf32be` |
-| Legacy code pages | `gbk` (incl. `gb18030`, `gb2312`, `cp936`), `big5`, `shift_jis` (incl. `sjis`, `cp932`), `euc-kr`, `windows-1251`, `iso-8859-1` |
+| East Asian | `gbk` (incl. `gb18030`, `gb2312`, `cp936`), `big5` (incl. `cp950`), `shift_jis` (incl. `sjis`, `cp932`), `euc-kr` (incl. `cp949`) |
+| Windows ANSI | `windows-1250` (Central European), `windows-1251` (Cyrillic), `windows-1252` (Western), `windows-1253` (Greek), `windows-1254` (Turkish), `windows-1255` (Hebrew), `windows-1256` (Arabic), `windows-1257` (Baltic) — each also accepted as `cp12xx` |
+| Other | `iso-8859-1` (incl. `latin1`) |
+
+> **On `windows-1258` (Vietnamese)**: not supported. Vietnamese needs combining sequences — `ế` is one code point but two bytes — and the underlying `iconv-lite` single-byte table cannot split them, so 52 of 67 common Vietnamese characters encode to `?`. Offering it would let a file be read but almost never saved, which reads as a bug rather than a limitation, so the name is deliberately absent.
+
+> **This table is what can be *read and written*, not what gets *guessed*.** Automatic guessing uses only the short list in the config (7 encodings by default) — a small set keeps the wrong-guess rate down. Everything else in the table still works when named explicitly: `read({ file_path: "x.txt", encoding: "windows-1253" })`. See [Configuration](#configuration) for how to adjust the list.
 
 Names are case- and style-insensitive: `Shift-JIS`, `shift_jis` and `SJIS` all mean the same encoding.
 
@@ -198,7 +255,7 @@ Names are case- and style-insensitive: `Shift-JIS`, `shift_jis` and `SJIS` all m
 
 | Error | Meaning and fix |
 |---|---|
-| `E_NOT_TEXT` | Not valid UTF-8 and no BOM. Re-read with `read({ encoding: "..." })` as suggested, or enable `autoGuessEncoding`. |
+| `E_NOT_TEXT` | Not valid UTF-8 and no BOM. Re-read with `read({ file_path: "...", encoding: "..." })` as suggested, or enable `autoGuessEncoding`. |
 | `E_UNMAPPABLE` | The target encoding cannot represent the new content (an emoji in a GBK file). **The file was not modified** — switch to an encoding that can, or migrate with `normalizeToUtf8` first. |
 | `E_BAD_ENCODING` | Unknown encoding name; use one from the table above. |
 | `E_DECODE_FAILED` | The bytes do not decode under the requested encoding — the encoding is probably wrong; try another candidate. |
@@ -212,8 +269,7 @@ Names are case- and style-insensitive: `Shift-JIS`, `shift_jis` and `SJIS` all m
 
 - **Zero-intrusion**: the plugin only uses DSH's public interfaces to register tools; it does **not** modify native DSH code and does not replace the `ctx.fs` filesystem itself. Uninstalling restores the built-in tools immediately, leaving nothing behind.
 - **Every existing guarantee is kept**: sandbox fence, read-before-write protection, version checking and observation records all behave exactly as before — anything that should be blocked or questioned still is.
-- **Mutually exclusive with `dsh-better-edit`**: both register `read` / `write` / `edit` on the same scope layer, and registering one name twice in a layer throws. **Enable only one** (see Installation above). The plugin detects this at boot and reports it clearly rather than failing silently.
-- **Other file-related plugins**: if another plugin also registers tools with these names, check whether they share a layer and keep only one if needed.
+- **Mutually exclusive with any plugin registering the same tool names**: this plugin registers `read` / `write` / `edit` on the scope layer, and registering a name twice in a layer throws, so only one such plugin can be active at a time. The test is whether those three names are already occupied **on that agent's own layer**, regardless of who occupies them — on a collision it refuses to install and names the occupied tool (see Installation above). Built-ins on a host/preset layer are not a collision.
 - **Session state**: encoding information is kept in memory and isolated per session — never written to disk, never polluting your repository. After a DSH restart, the encoding is detected afresh on the first read.
 
 ## Development
@@ -221,11 +277,11 @@ Names are case- and style-insensitive: `Shift-JIS`, `shift_jis` and `SJIS` all m
 ```powershell
 npm install
 npm run typecheck   # tsc --noEmit for src and test
-npm test            # 133 tests
+npm test            # run the test suite
 npm run build       # src/ → lib/
 ```
 
-The suite covers the encoding algorithms themselves and drives the real filesystem and sandbox components for integration cases, including byte-exact round-trips for all twelve encodings, BOM / CRLF fidelity, unmappable-character refusal, stale-write rejection and the sandbox fence.
+The suite covers the encoding algorithms themselves and drives the real filesystem and sandbox components for integration cases, including byte-exact round-trips for every supported encoding, BOM / CRLF fidelity, unmappable-character refusal, stale-write rejection and the sandbox fence.
 
 To customize the plugin, use DSH's Creator mode for quick development.
 

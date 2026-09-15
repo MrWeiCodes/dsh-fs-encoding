@@ -13,7 +13,7 @@
 import type { Context } from "@deepseek-ai/cordis";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolExecution } from "@deepseek-ai/dsh-tools";
-import { normalizeEncoding } from "./encoding.js";
+import { normalizeEncoding, SUPPORTED_ENCODINGS_TEXT } from "./encoding.js";
 import { DecodeError } from "./encoding-state.js";
 import { readFile } from "./io.js";
 import { READ_DESCRIPTION } from "./prompts.js";
@@ -94,7 +94,7 @@ function parseArgs(args: Record<string, unknown>): {
     }
     if (normalizeEncoding(rawEncoding) === undefined) {
       throw new Error(
-        `[E_BAD_ENCODING] Unknown encoding: ${rawEncoding}. Supported: utf8, utf8bom, utf16le, utf16be, utf32le, utf32be, gbk, big5, shift_jis, euc-kr, windows-1251, iso-8859-1`,
+        `[E_BAD_ENCODING] Unknown encoding: ${rawEncoding}. Supported: ${SUPPORTED_ENCODINGS_TEXT}`,
       );
     }
     out.encoding = rawEncoding;
@@ -129,8 +129,8 @@ export function buildReadTool(ctx: Context) {
         type: "string",
         description:
           "Decode the file with this encoding instead of detecting it (like VS Code's " +
-          '"Reopen with Encoding"). Use the candidates from a failed read. ' +
-          "Case-insensitive, e.g. gbk, shift_jis, windows-1251.",
+          '"Reopen with Encoding"). Use a candidate from a failed read. ' +
+          "Case- and punctuation-insensitive, e.g. gbk, shift_jis, windows-1252.",
       },
     },
     output: {

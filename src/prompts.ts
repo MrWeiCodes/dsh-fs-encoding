@@ -20,11 +20,28 @@ export const ORDER_READ = 130;
 export const ORDER_WRITE = 131;
 export const ORDER_EDIT = 132;
 
+/**
+ * The `read` call that re-opens a file under an explicit encoding.
+ *
+ * The single source for a hint that appears in four places: the `E_NOT_TEXT`
+ * message, the auto-guess footer, this module's read section, and the generated
+ * config template. They used to be four independent literals, so adding
+ * `file_path` to the call meant editing all four — and a site that was missed
+ * would hand the model a call the tool's own payload validation rejects, which
+ * reads as a second, unrelated error.
+ *
+ * @param encoding - the encoding to name, or a placeholder when none applies.
+ * @param filePath - the path to name, or a placeholder when none applies.
+ */
+export function reReadCall(encoding = "<name>", filePath = "<path>"): string {
+  return `read({ file_path: ${JSON.stringify(filePath)}, encoding: ${JSON.stringify(encoding)} })`;
+}
+
 export const READ_DESCRIPTION =
   "Read a text file and return line-numbered content. Handles any text encoding: " +
   "UTF-8 (with or without BOM), UTF-16, UTF-32, and legacy code pages such as GBK, " +
-  "Big5, Shift-JIS, EUC-KR, Windows-1251 and ISO-8859-1. A non-UTF-8 file without a " +
-  "BOM fails with candidate encodings listed; pass `encoding` to decode it explicitly.";
+  "Big5, Shift-JIS and the Windows ANSI pages. A non-UTF-8 file without a BOM fails " +
+  "with candidate encodings listed; pass `encoding` to decode it explicitly.";
 
 export const WRITE_DESCRIPTION =
   "Create or fully replace a text file. The file's existing encoding is preserved " +
@@ -38,11 +55,11 @@ export const EDIT_DESCRIPTION =
 
 export function readSectionText(): string {
   return (
-    "Use the read tool to view a file's contents. It decodes UTF-8, UTF-16, and legacy " +
-    "code pages such as GBK, Big5, Shift-JIS, EUC-KR and Windows-1251. A non-UTF-8 file " +
-    "without a BOM fails with candidate encodings listed — re-read it with " +
-    'read({ encoding: "<name>" }) to decode it. Reads are required before edit or "write" ' +
-    "on an existing file."
+    "Use the read tool to view a file's contents. It decodes UTF-8, UTF-16, UTF-32 and " +
+    "legacy code pages automatically. A file that is not valid UTF-8 and has no BOM " +
+    "fails with candidate encodings listed — re-read it with " +
+    `${reReadCall()} to decode it. Reads are required ` +
+    'before edit or "write" on an existing file.'
   );
 }
 

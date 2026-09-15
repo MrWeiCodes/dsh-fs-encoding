@@ -7,6 +7,7 @@ import {
   UnmappableError,
   type FileEncodingState,
 } from "../src/encoding-state.js";
+import { decodeBytes, isAcceptableDecode, unassignedBytes } from "../src/encoding.js";
 import { UTF8_BOM_BYTES } from "../src/line-endings.js";
 
 const utf8 = (s: string) => new Uint8Array(Buffer.from(s, "utf8"));
@@ -67,7 +68,23 @@ describe("decodeForOpen — deterministic admission", () => {
     } catch (error) {
       expect((error as DecodeError).code).toBe("E_NOT_TEXT");
       expect((error as Error).message).toContain("gbk");
-      expect((error as Error).message).toContain('read({ encoding: "gbk" })');
+      // The suggested call must be usable as written: `read` rejects a payload
+      // without `file_path`, so the hint has to carry the path it refers to.
+      expect((error as Error).message).toContain('file_path: "(unknown path)"');
+      expect((error as Error).message).toContain('encoding: "gbk"');
+    }
+  });
+
+  it("suggests a re-read call that carries the real path", async () => {
+    try {
+      await decodeForOpen(gbk("你好，世界，这是中文内容测试"), noGuess, {
+        displayPath: "legacy.txt",
+      });
+      expect.unreachable("expected E_NOT_TEXT");
+    } catch (error) {
+      const message = (error as Error).message;
+      expect((error as DecodeError).code).toBe("E_NOT_TEXT");
+      expect(message).toContain('read({ file_path: "legacy.txt", encoding: "gbk" })');
     }
   });
 
@@ -110,6 +127,100 @@ describe("decodeForOpen — deterministic admission", () => {
     await expect(
       decodeForOpen(Uint8Array.from([0x41, 0xff, 0x42]), noGuess, { encodingHint: "gbk" }),
     ).rejects.toThrow(/E_DECODE_FAILED/);
+  });
+
+  it("names the unassigned byte but offers no way to read the file anyway", async () => {
+    // 0x81 has no character in windows-1252, so the byte is worth naming. But the
+    // message must not hand the model a way to read the file as something it is
+    // not: two revisions did, and both corrupted files. The first flipped the
+    // verdict to "not necessarily wrong"; the second kept the verdict but
+    // suggested re-reading with iso-8859-1 — following that on a Greek
+    // windows-1253 file decoded it as Latin-1 mojibake with no U+FFFD, so it was
+    // accepted and recorded as the session's encoding.
+    //
+    // Asserting on the absence of a phrase would be vacuous, so this checks the
+    // absence of the ADVICE: no encoding name is proposed anywhere in the text.
+    try {
+      await decodeForOpen(
+        Uint8Array.from([0x43, 0x61, 0x66, 0xe9, 0x20, 0x81, 0x20, 0x6d]),
+        noGuess,
+        { encodingHint: "windows-1252", displayPath: "menu.txt" },
+      );
+      expect.unreachable("expected E_DECODE_FAILED");
+    } catch (error) {
+      const message = (error as Error).message;
+      expect((error as DecodeError).code).toBe("E_DECODE_FAILED");
+      // The useful, factual part is kept.
+      expect(message).toContain("0x81");
+      expect(message).toContain("probably wrong");
+      // No alternative encoding is recommended, and no "read it anyway" is offered.
+      expect(message).not.toContain("iso-8859-1");
+      expect(message).not.toContain("re-reading it with");
+      expect(message).toContain("Re-read without an encoding to see candidates");
+    }
+  });
+
+  it("does not offer a way to read a genuinely wrong guess as something else", async () => {
+    // A GBK file read as windows-1252. 0x81 is an unassigned windows-1252 byte, so
+    // a rule keyed on "the file contains a gap byte" fires here — and it is wrong:
+    // the file is GBK. The danger is not just the verdict, it is any instruction
+    // that makes the wrong decode stick. iso-8859-1 would decode these bytes with
+    // no U+FFFD at all, so it would be ACCEPTED and recorded as the encoding.
+    const bytes = new Uint8Array(iconv.encode("\u4e02\u4e04\u4e05\u4e06", "gbk"));
+    expect(bytes.includes(0x81), "fixture must contain a windows-1252 gap byte").toBe(true);
+
+    // The property that makes the advice harmful, asserted as a CONTRAST on this
+    // fixture: the hint's own page rejects these bytes while latin1 accepts them,
+    // so latin1 is exactly the escape hatch that would make the wrong decode
+    // stick. Asserting only `isAcceptableDecode(asLatin1) === true` would be
+    // vacuous — iso-8859-1 maps all 256 byte values to non-U+FFFD characters, so
+    // that holds for any input whatsoever. The windows-1252 half is what makes
+    // this fixture-specific and able to fail.
+    const asLatin1 = decodeBytes(bytes, "iso-8859-1");
+    const asHintPage = decodeBytes(bytes, "windows-1252");
+    expect(asLatin1).toBeDefined();
+    expect(asHintPage).toBeDefined();
+    expect(
+      isAcceptableDecode(asHintPage!),
+      "the hint's own page must reject this fixture, or the test proves nothing",
+    ).toBe(false);
+    expect(
+      isAcceptableDecode(asLatin1!),
+      "iso-8859-1 is the tempting-but-wrong escape hatch this test guards",
+    ).toBe(true);
+
+    try {
+      await decodeForOpen(bytes, noGuess, {
+        encodingHint: "windows-1252",
+        displayPath: "gbk.txt",
+      });
+      expect.unreachable("expected E_DECODE_FAILED");
+    } catch (error) {
+      const message = (error as Error).message;
+      expect((error as DecodeError).code).toBe("E_DECODE_FAILED");
+      expect(message).toContain("probably wrong");
+      expect(message).not.toContain("iso-8859-1");
+      expect(message).not.toContain("re-reading it with");
+    }
+  });
+
+  it("blames the encoding when no unassigned byte is involved", async () => {
+    // A real cp1252 file's bytes read as GBK: GBK is a multi-byte page, so it
+    // has no "unassigned byte" story to tell at all, and the message carries no
+    // byte note. The byte note is what distinguishes the two messages, so this
+    // asserts on that rather than on wording that would hold either way.
+    const cp1252Text = "\u201CCurly\u201D \u2014 it\u2019s caf\u00E9 r\u00E9sum\u00E9";
+    const bytes = new Uint8Array(iconv.encode(cp1252Text, "windows-1252"));
+    expect(unassignedBytes("gbk")).toEqual([]);
+    try {
+      await decodeForOpen(bytes, noGuess, { encodingHint: "gbk", displayPath: "x.txt" });
+      expect.unreachable("expected E_DECODE_FAILED");
+    } catch (error) {
+      const message = (error as Error).message;
+      expect((error as DecodeError).code).toBe("E_DECODE_FAILED");
+      expect(message).toContain("probably wrong");
+      expect(message).not.toContain("has no character in");
+    }
   });
 });
 

@@ -20,10 +20,12 @@ import {
   decodeBytes,
   detectBom,
   encodeText,
+  isAcceptableDecode,
   isValidUtf8,
   normalizeEncoding,
-  REPLACEMENT_CHAR,
+  SUPPORTED_ENCODINGS_TEXT,
   top3Candidates,
+  unassignedBytes,
   type CandidatePreview,
 } from "./encoding.js";
 import {
@@ -33,6 +35,7 @@ import {
   UTF8_BOM_BYTES,
   type LineEnding,
 } from "./line-endings.js";
+import { reReadCall } from "./prompts.js";
 
 /** What was learned about one file the first time it was read this session. */
 export interface FileEncodingState {
@@ -270,15 +273,37 @@ function bomBytesFor(encoding: string): Uint8Array | undefined {
   return undefined;
 }
 
+/**
+ * The first byte a single-byte page leaves unassigned, or `undefined`.
+ *
+ * @param bytes - the bytes that were decoded.
+ * @param encoding - the encoding they were decoded under.
+ * @returns the offending byte value.
+ */
+function firstUnassignedByte(bytes: Uint8Array, encoding: string): number | undefined {
+  const unassigned = new Set(unassignedBytes(encoding));
+  if (unassigned.size === 0) return undefined;
+  for (const b of bytes) {
+    if (unassigned.has(b)) return b;
+  }
+  return undefined;
+}
+
 function buildTop3Message(displayPath: string, candidates: readonly CandidatePreview[]): string {
   const list = candidates
     .map((c) => `${c.encoding}("${c.sample.slice(0, 20).replace(/"/g, "'")}")`)
     .join(", ");
   const first = candidates[0];
-  const actionable =
-    first === undefined
-      ? "No candidate encoding decoded cleanly. This may be a binary file."
-      : `Most likely ${first.encoding}. Re-read with read({ encoding: "${first.encoding}" }) to decode it, or set autoGuessEncoding: true in the plugin config to decode automatically.`;
+  let actionable: string;
+  if (first === undefined) {
+    actionable = "No candidate encoding decoded cleanly. This may be a binary file.";
+  } else {
+    // The suggested call repeats the path so it can be copied verbatim. A hint
+    // that omits `file_path` is rejected by the tool's own payload validation,
+    // which would turn a helpful message into a second, confusing error.
+    const call = reReadCall(first.encoding, displayPath);
+    actionable = `Most likely ${first.encoding}. Re-read with ${call} to decode it, or set autoGuessEncoding: true in the plugin config to decode automatically.`;
+  }
   return `[E_NOT_TEXT] ${displayPath} is not valid UTF-8. ${actionable} Candidates: ${list}`;
 }
 
@@ -286,7 +311,7 @@ function buildGuessFooter(candidates: readonly CandidatePreview[]): string | und
   const top = candidates[0];
   if (top === undefined) return undefined;
   const list = candidates.map((c) => `${c.encoding} ${c.score.toFixed(0)}`).join(", ");
-  return `\n\n[Auto-guessed: ${top.encoding} ${top.score.toFixed(0)} — candidates: ${list}. Re-read with read({ encoding }) if the text looks garbled.]`;
+  return `\n\n[Auto-guessed: ${top.encoding} ${top.score.toFixed(0)} — candidates: ${list}. Re-read with ${reReadCall()} if the text looks garbled.]`;
 }
 
 /**
@@ -317,7 +342,7 @@ export async function decodeForOpen(
     const hint = normalizeEncoding(opts.encodingHint);
     if (hint === undefined) {
       throw new DecodeError(
-        `[E_BAD_ENCODING] Unknown encoding: ${opts.encodingHint}. Supported: utf8, utf8bom, utf16le, utf16be, utf32le, utf32be, gbk, big5, shift_jis, euc-kr, windows-1251, iso-8859-1`,
+        `[E_BAD_ENCODING] Unknown encoding: ${opts.encodingHint}. Supported: ${SUPPORTED_ENCODINGS_TEXT}`,
         "E_BAD_ENCODING",
       );
     }
@@ -332,9 +357,39 @@ export async function decodeForOpen(
         "E_DECODE_FAILED",
       );
     }
-    if (decoded.includes(REPLACEMENT_CHAR)) {
+    if (!isAcceptableDecode(decoded)) {
+      // The verdict is "probably wrong" — the common case, and the safe one.
+      // Naming the byte is additive FACT, never advice and never a reprieve.
+      //
+      // Two earlier revisions of this branch were reverted for the same reason:
+      // they handed the model a way to read the file as something it is not.
+      // The first flipped the verdict to "the encoding is not necessarily
+      // wrong", which fired on every failure of a single-byte page (there, every
+      // U+FFFD necessarily comes from an unassigned byte). The second kept the
+      // verdict but appended "re-reading it with iso-8859-1 keeps that byte as a
+      // control character instead" — which is the same trap in a footnote:
+      // following it on a Greek windows-1253 file decoded the text as Latin-1
+      // mojibake, produced no U+FFFD, was therefore ACCEPTED, and recorded
+      // iso-8859-1 as the session's encoding, so every later save wrote the file
+      // back in the wrong page. The claim was also false for 14 distinct byte
+      // values across three pages — 0xAA/0xD2/0xFF in windows-1253, 0xD9–0xDF
+      // and 0xFB/0xFC/0xFF in windows-1255, 0xA1/0xA5 in windows-1257 (0xFF
+      // appears in two of them, so 15 by page and 14 by value). Every one of
+      // them decodes to a printable letter under iso-8859-1 — "ª Ò ÿ Ù ß û ü ¡ ¥"
+      // — not to a control character.
+      //
+      // So the note states the byte and stops. `firstUnassignedByte` only asks
+      // whether such a byte VALUE occurs in the file — it cannot tell a genuine
+      // gap from a wrong page that happens to hit one, so any instruction built
+      // on it would be guessing.
+      const unmapped = firstUnassignedByte(body, hint);
+      const note =
+        unmapped === undefined
+          ? ""
+          : ` Byte 0x${unmapped.toString(16).toUpperCase().padStart(2, "0")} has no character in ` +
+            `${hint}, which is where the replacement comes from.`;
       throw new DecodeError(
-        `[E_DECODE_FAILED] ${display} decoded as ${hint} contains replacement characters — the encoding is probably wrong. Re-read without an encoding to see candidates.`,
+        `[E_DECODE_FAILED] ${display} decoded as ${hint} contains replacement characters — the encoding is probably wrong.${note} Re-read without an encoding to see candidates.`,
         "E_DECODE_FAILED",
       );
     }
@@ -387,7 +442,7 @@ export async function decodeForOpen(
     const best = candidates[0];
     if (best !== undefined) {
       const decoded = decodeBytes(bytes, best.encoding);
-      if (decoded !== undefined && !decoded.includes(REPLACEMENT_CHAR)) {
+      if (decoded !== undefined && isAcceptableDecode(decoded)) {
         const footer = buildGuessFooter(candidates);
         return {
           text: decoded,

@@ -18,11 +18,25 @@
  * `fs/observed` observation — using only public seams, so the built-in tools
  * keep working against the same state.
  *
- * CONFLICT: `dsh-better-edit` registers `read` / `edit` (and a
- * `str_replace_editor` shadow) on the same layer. Registering one name twice in
- * a layer throws, so the two plugins cannot be enabled together; this one
- * detects that and refuses to install rather than leaving a half-registered
- * tool set.
+ * CONFLICT: any plugin that shadows `read` / `write` / `edit` on the same layer
+ * collides with this one, because registering a name twice in a layer throws.
+ * The conflict is detected by letting the registry answer — the registration is
+ * what actually fails — and the rejection is reported with the tool name it
+ * names. Whatever landed before the failure is rolled back, so the install is
+ * refused with an actionable message rather than leaving a half-registered set.
+ *
+ * Deliberately NOT probed up front with `ctx.tools.get(name)`: without a scope
+ * argument that reads the GLOBAL view, and the global layer is precisely the
+ * one this plugin shadows on purpose. The built-in `read` / `write` / `edit`
+ * sit there in every profile that mounts `tool-fs` host-plane (`dsh-headless`,
+ * the SDK and ACP profiles), so treating an inherited name as a conflict would
+ * refuse an install that would have succeeded — and silently, because the
+ * refusal is only logged.
+ *
+ * The message deliberately names no other plugin. Which one is installed is the
+ * operator's to determine — a hard-coded name would be wrong whenever a
+ * different plugin holds the layer, and pointing at a specific project reads as
+ * a judgement about it rather than a statement about this one.
  *
  * @module dsh-fs-encoding
  */
@@ -65,25 +79,26 @@ export const inject = ["tools", "systemPrompt", "fs"];
 const OWNED_TOOLS = ["read", "write", "edit"] as const;
 
 /**
- * A tool name only `dsh-better-edit` registers.
+ * The operator-facing message for a detected conflict.
  *
- * Detecting the conflict by a tool that plugin OWNS is deliberately different
- * from reading a bundle list: it observes the real condition (another plugin
- * has taken this layer) rather than predicting it from configuration. A
- * renamed bundle, a reordered profile, or a hand-written patch all still land
- * here, because the question asked is "is something already here?".
+ * States what was observed and what the two ways out are, and stops there: the
+ * operator knows which plugins they installed, and this plugin cannot tell them
+ * which one owns the layer. Naming a specific project would be wrong as soon as
+ * a different one collides, and would read as a complaint about that project.
+ *
+ * @param taken - the tool name the registry rejected, when the error named one.
  */
-const COMPETING_TOOL = "undo_last_edit";
+function conflictMessage(taken?: string): string {
+  const who =
+    taken === undefined
+      ? `another plugin already provides ${OWNED_TOOLS.join(" / ")} on this scope layer`
+      : `the tool "${taken}" is already registered on this scope layer by another plugin`;
 
-/** The plugin known to register the same tool names on the same layer. */
-const COMPETING_PLUGIN = "dsh-better-edit";
-
-/** The operator-facing message for a detected conflict. */
-function conflictMessage(): string {
   return (
-    `dsh-fs-encoding: refusing to install — ${COMPETING_PLUGIN} registers the same tools ` +
-    `(${OWNED_TOOLS.join(", ")}) on the same scope layer. Enable only one of them in the ` +
-    `profile's cordis.patch.yml:\n  - id: ${COMPETING_PLUGIN}\n    disabled: true`
+    `dsh-fs-encoding: refusing to install — ${who}. Only one plugin can own a tool ` +
+    `name on a layer, so enable either that plugin or this one: remove this plugin ` +
+    `from the profile, or disable the other one in the profile's cordis.patch.yml ` +
+    `with:\n  - id: <the other plugin's id>\n    disabled: true`
   );
 }
 
@@ -93,25 +108,31 @@ function isDuplicateRegistration(error: unknown): boolean {
 }
 
 /**
+ * The tool name a duplicate-registration error refers to, when it names one.
+ *
+ * @param error - the rejection thrown by the tool registry.
+ */
+function duplicateToolName(error: unknown): string | undefined {
+  if (!(error instanceof Error)) return undefined;
+  return error.message.match(/tool "([^"]+)" is already registered/)?.[1];
+}
+
+/**
  * One per-agent registration bundle, disposed with the agent.
  *
- * The conflict check runs here rather than once at `apply()` because the
- * competing plugin also installs per agent: only at this point is the layer's
- * real occupancy observable.
+ * Registration is where the conflict is settled, and it is wrapped: a plugin
+ * that already owns one of these names on the agent's layer makes the registry
+ * reject the duplicate, and that rejection is turned into the actionable
+ * message instead of a raw registry error. Tools that landed before the failure
+ * are rolled back, so a conflict never leaves a partially installed set.
  *
- * Registration is additionally wrapped, so a conflict this check cannot see —
- * a plugin that registers only some of the names, or one that installs after
- * this listener — still produces the actionable message instead of a raw
- * registry error. Already-registered tools are rolled back so a failure never
- * leaves a partially installed set.
+ * The check cannot be hoisted into a pre-flight occupancy probe: the only
+ * scope-blind read (`ctx.tools.get(name)`) answers for the GLOBAL layer, which
+ * this plugin is designed to shadow, so it would report the built-ins as a
+ * conflict and refuse an install that the registry would have accepted.
  */
 function installAgentTools(rootCtx: Context, agent: Agent): void {
   agent.ctx.effect(() => {
-    if (agent.ctx.tools.get(COMPETING_TOOL) !== undefined) {
-      rootCtx.logger.error(conflictMessage());
-      return () => undefined;
-    }
-
     // `fs` is host-plane: read it off the plugin's own context (covered by
     // `inject`) rather than the agent's scoped one, whose fiber chain does not
     // declare it. Session cwd still reaches each call via `execCwd`.
@@ -137,7 +158,9 @@ function installAgentTools(rootCtx: Context, agent: Agent): void {
         }
       }
       if (isDuplicateRegistration(error)) {
-        rootCtx.logger.error(conflictMessage());
+        // Name the tool the registry actually rejected, so the message points
+        // at the real collision rather than a guessed plugin.
+        rootCtx.logger.error(conflictMessage(duplicateToolName(error)));
         return () => undefined;
       }
       throw error;

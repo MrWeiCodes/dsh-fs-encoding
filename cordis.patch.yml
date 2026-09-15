@@ -10,12 +10,19 @@
 # public sandbox policy API, so the sandbox fence and the read-before-write
 # policy keep working exactly as with the built-ins.
 #
-# CONFLICT: this plugin and `dsh-better-edit` both register `read` / `write` /
-# `edit` on the same layer. Registering a name twice in one layer throws, so the
-# two cannot be enabled together. Disable the other one:
+# CONFLICT: only one plugin can own a tool name on a given layer, so this plugin
+# cannot be enabled alongside any other plugin that also registers `read` /
+# `write` / `edit` on the agent's OWN layer — registering a name twice throws.
+# The plugin detects that collision at session-start and refuses to install
+# rather than leaving a half-registered tool set. To resolve it, either remove
+# this plugin from the profile or disable the other one in the profile's
+# cordis.patch.yml:
 #
-#   - id: dsh-better-edit
+#   - id: <the other plugin's id>
 #     disabled: true
+#
+# The built-in `read` / `write` / `edit` are NOT a conflict: they live on the
+# host or preset layer, which this plugin shadows on purpose.
 - insert:
     - id: dsh-fs-encoding
       name: dsh-fs-encoding
