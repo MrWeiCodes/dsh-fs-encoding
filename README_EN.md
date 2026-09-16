@@ -53,6 +53,10 @@ Re-read with the call shown in the message and the encoding turns from a guess i
 > **UTF-16 / UTF-32 files without a BOM** work the same way — specify explicitly with `read({ file_path: "<path>", encoding: "utf16le" })`. Such files are rare on Windows, and without a BOM the byte order cannot be reliably detected, so the plugin does not guess.
 
 > **Why does it ask by default?** GBK, Big5 and Shift-JIS byte ranges overlap on short inputs, so a wrong guess is invisible in the UI — and would then be **written back under the wrong encoding**, ruining the file. The plugin therefore prefers "fail rather than guess wrong". If you would rather have best-effort decoding, set `autoGuessEncoding: true`.
+>
+> Even with `autoGuessEncoding` on, one case still fails loudly with the candidate list: a **very short** file (a few bytes) where two independent detectors name **different** pages. Nothing then distinguishes them — measured, the top pick is wrong about 79% of the time in that case — so the plugin lets you choose from the candidates instead of gambling for you. When both detectors name the **same** page it is adopted directly, and files of any ordinary length (tens of bytes and up) effectively never hit this.
+>
+> A second case that fails loudly: a detector names a **single-byte page** such as ISO-8859-1 or Windows-1252, but decoding with it yields text that is **almost entirely non-ASCII**. Real Western text is mostly letters and spaces, so it does not look like that — whereas 2-byte CJK, Korean or Cyrillic text read as a single-byte page turns every character into two Latin ones, which is exactly that shape. The plugin refuses the verdict and lists candidates instead. Measured, this catches 24 files that would otherwise be silently mis-read, and refuses **none** that previously read correctly.
 
 ## Installation
 

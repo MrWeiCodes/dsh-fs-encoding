@@ -37,7 +37,7 @@ export interface PluginConfig {
    * the file any more portable — and would break a consumer expecting UTF-16.
    */
   normalizeToUtf8: boolean;
-  /** Encodings considered by `autoGuessEncoding` and listed in Top-3 hints. */
+  /** Encodings considered by `autoGuessEncoding` and listed in the error hint. */
   supportedEncodings: string[];
   /**
    * Encodings removed from the default guess set, when the user did not supply a
@@ -75,7 +75,7 @@ export const DEFAULT_CONFIG_YAML = `# dsh-fs-encoding config
 # Generated with defaults on first load — edit or delete freely.
 
 # Decode a non-UTF-8 file by guessing instead of failing.
-# false (default, like VS Code): fail loud with Top-3 candidates and re-read
+# false (default, like VS Code): fail loud with the candidate list and re-read
 #   with ${reReadCall("gbk")}. A wrong guess is invisible and
 #   would be written back under the wrong encoding, so guessing stays opt-in.
 # true: auto-decode with the best-scoring allowlisted encoding.
@@ -86,7 +86,7 @@ autoGuessEncoding: false
 # true: rewrite as UTF-8 and remember the file as UTF-8 from then on.
 normalizeToUtf8: false
 
-# Encodings considered when guessing, and listed in the Top-3 error hint.
+# Encodings considered when guessing, and listed in the error hint.
 #
 # To CHANGE the set, prefer excludeEncodings below — it keeps following this
 # plugin's default, so encodings added in a later release still reach you.

@@ -16,17 +16,17 @@
  */
 
 import {
-  chardetTop3Candidates,
   decodeBytes,
   detectBom,
   encodeText,
   isAcceptableDecode,
   isValidUtf8,
   normalizeEncoding,
+  rankCandidates,
   SUPPORTED_ENCODINGS_TEXT,
-  top3Candidates,
   unassignedBytes,
   type CandidatePreview,
+  type RankedCandidates,
 } from "./encoding.js";
 import {
   detectEnding,
@@ -289,7 +289,8 @@ function firstUnassignedByte(bytes: Uint8Array, encoding: string): number | unde
   return undefined;
 }
 
-function buildTop3Message(displayPath: string, candidates: readonly CandidatePreview[]): string {
+function buildTop3Message(displayPath: string, ranked: RankedCandidates): string {
+  const { candidates, ranked: isRanked, adoptable } = ranked;
   const list = candidates
     .map((c) => `${c.encoding}("${c.sample.slice(0, 20).replace(/"/g, "'")}")`)
     .join(", ");
@@ -297,6 +298,35 @@ function buildTop3Message(displayPath: string, candidates: readonly CandidatePre
   let actionable: string;
   if (first === undefined) {
     actionable = "No candidate encoding decoded cleanly. This may be a binary file.";
+  } else if (!adoptable && isRanked) {
+    // chardet DID rank these pages, so the order is not arbitrary — but the head
+    // is a page this plugin has specifically decided is not credible for these
+    // bytes (see `isImplausibleSingleByteHead`). Saying "Most likely X" here would
+    // be worse than the placeholder bug this message already carries a fix for:
+    // the model copies the call verbatim and gets exactly the mangled text the
+    // refusal existed to prevent. Measured, that sentence was emitted for 100% of
+    // these refusals before this branch existed.
+    actionable =
+      `Its top pick (${first.encoding}) does not look credible for these bytes, so this ` +
+      `list is offered as candidates rather than a decision. ` +
+      `Re-read with ${reReadCall(first.encoding, displayPath)}, replacing ` +
+      `"${first.encoding}" with whichever encoding's sample above looks correct.`;
+  } else if (!isRanked) {
+    // Nothing separated these pages, so naming one "most likely" would be a
+    // claim the ranking cannot support — and the model acts on that sentence.
+    // The list is still offered, because a human or model reading the samples
+    // can often tell which page is right where the scorer could not.
+    //
+    // The example call names `first.encoding` but is worded as a SHAPE to fill
+    // in, not as a recommendation: the sentence right before it says the order
+    // means nothing, so picking the head is the model's choice, not the
+    // plugin's. An earlier revision emitted `reReadCall(undefined, path)`, which
+    // renders `encoding: "<name>"` — a literal placeholder the read tool rejects
+    // with `E_BAD_ENCODING`, turning a helpful message into a second error.
+    actionable =
+      `No encoding could be ranked above the others, so this list is unordered. ` +
+      `Re-read with ${reReadCall(first.encoding, displayPath)}, replacing ` +
+      `"${first.encoding}" with whichever encoding's sample above looks correct.`;
   } else {
     // The suggested call repeats the path so it can be copied verbatim. A hint
     // that omits `file_path` is rejected by the tool's own payload validation,
@@ -307,11 +337,28 @@ function buildTop3Message(displayPath: string, candidates: readonly CandidatePre
   return `[E_NOT_TEXT] ${displayPath} is not valid UTF-8. ${actionable} Candidates: ${list}`;
 }
 
-function buildGuessFooter(candidates: readonly CandidatePreview[]): string | undefined {
+function buildGuessFooter(ranked: RankedCandidates): string | undefined {
+  const { candidates, ranked: isRanked } = ranked;
   const top = candidates[0];
   if (top === undefined) return undefined;
-  const list = candidates.map((c) => `${c.encoding} ${c.score.toFixed(0)}`).join(", ");
-  return `\n\n[Auto-guessed: ${top.encoding} ${top.score.toFixed(0)} — candidates: ${list}. Re-read with ${reReadCall()} if the text looks garbled.]`;
+  // The candidate numbers are only comparable when one producer ranked them. An
+  // abstention list unions chardet's confidences (its floor, 10) with the
+  // heuristic's `scoreText` values (up to ~115), so printing them side by side
+  // shows the adopted pick losing to a rejected one — measured on 79% of these
+  // footers, e.g. "Auto-guessed: big5 10 — candidates: big5 10, gbk 110". The
+  // model reads that as "the pick is wrong" and re-reads under the higher-scoring
+  // page. So the unranked case lists names only, which is all that is honest.
+  const list = isRanked
+    ? candidates.map((c) => `${c.encoding} ${c.score.toFixed(0)}`).join(", ")
+    : candidates.map((c) => c.encoding).join(", ");
+  // The confidence caveat is what makes the silent guess honest: without it the
+  // footer reads as a decision, and on short CJK input the decision may be a
+  // page nobody could justify (see `rankCandidates`).
+  const caveat = isRanked
+    ? ""
+    : " No encoding could be ranked above the others, so this pick is a guess —";
+  const shown = isRanked ? `${top.encoding} ${top.score.toFixed(0)}` : top.encoding;
+  return `\n\n[Auto-guessed: ${shown} — candidates: ${list}.${caveat} Re-read with ${reReadCall()} if the text looks garbled.]`;
 }
 
 /**
@@ -431,44 +478,54 @@ export async function decodeForOpen(
   }
 
   // 4) Guessing — probabilistic, and therefore opt-in.
+  // Held so step 5 can reuse it instead of ranking the same bytes twice.
+  let stepFourRanked: RankedCandidates | undefined;
   if (config.autoGuessEncoding) {
-    const viaChardet = await chardetTop3Candidates(bytes, config.supportedEncodings).catch(
-      () => [],
-    );
-    const candidates: CandidatePreview[] =
-      viaChardet.length > 0
-        ? viaChardet.map((c) => ({ encoding: c.encoding, sample: c.sample, score: c.confidence }))
-        : top3Candidates(bytes, config.supportedEncodings);
-    const best = candidates[0];
+    // The same ranking the error message uses, so the guessed encoding and the
+    // candidates shown beside it cannot disagree — see `rankCandidates`.
+    const ranked = await rankCandidates(bytes, config.supportedEncodings);
+    stepFourRanked = ranked;
+    // `ranked.adoptable` gates the adoption, and the gate is the whole reason
+    // the flag exists. It is false only when chardet abstained AND the heuristic
+    // named a different page — measured, the head is wrong 79% of the time in
+    // that case, so adopting it would record a page nobody could justify and
+    // write it back. That is precisely the silent corruption this plugin exists
+    // to prevent, so the read fails loudly and the model picks from the list.
+    // Best-effort guessing still applies wherever there IS evidence, including
+    // when both producers independently agree.
+    const best = ranked.adoptable ? ranked.candidates[0] : undefined;
     if (best !== undefined) {
       const decoded = decodeBytes(bytes, best.encoding);
       if (decoded !== undefined && isAcceptableDecode(decoded)) {
-        const footer = buildGuessFooter(candidates);
+        const footer = buildGuessFooter(ranked);
         return {
           text: decoded,
           encoding: best.encoding,
           hasBOM: false,
           lineEnding: detectEnding(decoded),
           ...(footer === undefined ? {} : { footer }),
-          candidates,
+          candidates: ranked.candidates,
         };
       }
     }
-    // No candidate decoded cleanly — fall through to the loud failure below.
+    // Either nothing decoded cleanly, or nothing could rank the pages — both
+    // fall through to the loud failure below, which prints the same candidates.
   }
 
   // 5) Nothing worked: fail loud with candidates, always, even when guessing is off.
-  let candidates: CandidatePreview[] = [];
-  try {
-    const viaChardet = await chardetTop3Candidates(bytes, config.supportedEncodings);
-    candidates =
-      viaChardet.length > 0
-        ? viaChardet.map((c) => ({ encoding: c.encoding, sample: c.sample, score: c.confidence }))
-        : top3Candidates(bytes, config.supportedEncodings);
-  } catch {
-    candidates = top3Candidates(bytes, config.supportedEncodings);
-  }
-  throw new DecodeError(buildTop3Message(display, candidates), "E_NOT_TEXT");
+  // The ranking is computed once here and reused from step 4 when guessing was on,
+  // because `rankCandidates` is deterministic on the same bytes and the second
+  // pass would repeat a full decode per allowlisted encoding for nothing.
+  //
+  // Deliberately not wrapped in a try/catch. `rankCandidates` cannot throw for any
+  // input this plugin can produce: `chardetTop3Candidates` swallows its own import
+  // and analysis failures, `decodeBytes` swallows decode failures, and the
+  // allowlist is always a `string[]` because `config` builds it by splitting a
+  // string. Catching here would therefore only ever hide a programming error — and
+  // the only fallback available (an empty list) renders as "This may be a binary
+  // file", which would misdiagnose a perfectly decodable legacy text file.
+  const ranked = stepFourRanked ?? (await rankCandidates(bytes, config.supportedEncodings));
+  throw new DecodeError(buildTop3Message(display, ranked), "E_NOT_TEXT");
 }
 
 /**

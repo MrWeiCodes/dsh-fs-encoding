@@ -7,11 +7,13 @@ import {
   UnmappableError,
   type FileEncodingState,
 } from "../src/encoding-state.js";
-import { decodeBytes, isAcceptableDecode, unassignedBytes } from "../src/encoding.js";
+import { DEFAULT_SUPPORTED_ENCODINGS, decodeBytes, isAcceptableDecode, unassignedBytes } from "../src/encoding.js";
 import { UTF8_BOM_BYTES } from "../src/line-endings.js";
 
 const utf8 = (s: string) => new Uint8Array(Buffer.from(s, "utf8"));
 const gbk = (s: string) => new Uint8Array(iconv.encode(s, "gbk"));
+const shiftJis = (s: string) => new Uint8Array(iconv.encode(s, "shift_jis"));
+const big5 = (s: string) => new Uint8Array(iconv.encode(s, "big5"));
 const withBom = (s: string) => {
   const body = utf8(s);
   const out = new Uint8Array(3 + body.length);
@@ -94,6 +96,130 @@ describe("decodeForOpen — deterministic admission", () => {
     expect(r.encoding).toBe("gbk");
     expect(r.footer).toBeDefined();
     expect(r.footer).toContain("gbk");
+  });
+
+  it("refuses rather than records a short Shift_JIS file under a page nobody ranked", async () => {
+    // The corruption, pinned end to end. The heuristic's `scoreText` puts `gbk`
+    // in the same band whichever East Asian page is correct, so an earlier
+    // margin rule promoted it and recorded `gbk` for this file: the model saw
+    // `擔杮岅`, which is printable, U+FFFD-free, and re-encodes to the ORIGINAL
+    // bytes under gbk — so a write-back reproduced the file and nothing noticed.
+    //
+    // For this input chardet names `shift_jis` and the heuristic names `gbk`, so
+    // the two disagree and nothing establishes which is right. The read must
+    // therefore fail loudly with the candidates rather than silently adopt
+    // either page. Measured over 1915 native samples, an unranked head is wrong
+    // 79% of the time; adopting it is the corruption, refusing is the fix.
+    const bytes = shiftJis("日本語");
+    await expect(decodeForOpen(bytes, guessing)).rejects.toThrow(/E_NOT_TEXT/);
+    try {
+      await decodeForOpen(bytes, guessing, { displayPath: "legacy.txt" });
+      expect.unreachable("expected E_NOT_TEXT");
+    } catch (error) {
+      const message = (error as Error).message;
+      expect(message).not.toContain("Most likely");
+      expect(message).toContain("unordered");
+      // The list is still offered, with samples, so the model can choose.
+      expect(message).toMatch(/shift_jis\(".+?"\)/);
+      expect(message).toContain('file_path: "legacy.txt"');
+    }
+  });
+
+  it("adopts a page when chardet and the heuristic independently agree on it", async () => {
+    // Agreement is the one piece of real evidence in an abstention: measured, 62
+    // of 75 such cases are correct, against 21% for chardet's head alone and 36%
+    // for the heuristic's. Here both name `shift_jis`, so the read succeeds.
+    const r = await decodeForOpen(shiftJis("こんにちは"), guessing);
+    expect(r.encoding).toBe("shift_jis");
+    expect(r.text).toBe("こんにちは");
+    // It is still a guess, so the footer must say so.
+    expect(r.footer).toBeDefined();
+    expect(r.footer).toContain("No encoding could be ranked above the others");
+  });
+
+  it("never prints candidate scores that contradict the adopted pick", async () => {
+    // An abstention list unions chardet's confidences (its floor, 10) with the
+    // heuristic's `scoreText` values (up to ~115). `unionByScore` now re-scores
+    // every entry onto the `scoreText` scale so the exported field means one
+    // thing — measured, the concatenated list used to be non-monotone in 475 of
+    // 552 abstained samples. The footer still prints no numbers here, because
+    // the order is chardet's rather than the score order, and printing numbers
+    // beside an order they did not produce invites the model to distrust it.
+    const r = await decodeForOpen(shiftJis("こんにちは"), guessing);
+    expect(r.footer).toBeDefined();
+    const footer = r.footer as string;
+    expect(footer).toContain("No encoding could be ranked above the others");
+    // No candidate number may appear: that is what removed the contradiction.
+    expect(footer).not.toMatch(/\b(?:shift_jis|gbk|big5|euc-kr)\s+\d/);
+  });
+
+  it("does not call a rejected single-byte head most-likely", async () => {
+    // The message defect this pins. `isImplausibleSingleByteHead` returns
+    // `{ ranked: true, adoptable: false }` — the order is chardet's real ranking,
+    // but the head is a page the plugin has just decided is not credible. An
+    // earlier revision branched the wording on `ranked` alone, so this file got
+    // "Most likely iso-8859-1" plus a copy-pasteable
+    // `read({ ..., encoding: "iso-8859-1" })` — recommending the exact page the
+    // refusal existed to prevent, and handing the model the mangled text
+    // `ÁcÅé¤¤¤å´ú¸Õ`. Measured, that sentence was emitted for 100% of these
+    // refusals before the wording branched on `adoptable`.
+    //
+    // The full default allowlist is required: the rule only fires when chardet
+    // ranks `iso-8859-1`, which needs that page to be permitted.
+    const wide = { autoGuessEncoding: true, supportedEncodings: [...DEFAULT_SUPPORTED_ENCODINGS] };
+    try {
+      await decodeForOpen(big5("繁體中文測試"), wide, { displayPath: "legacy.txt" });
+      expect.unreachable("expected E_NOT_TEXT");
+    } catch (error) {
+      const message = (error as Error).message;
+      expect((error as DecodeError).code).toBe("E_NOT_TEXT");
+      expect(message).not.toContain("Most likely");
+      // It must say WHY the top pick is not being recommended, so the model does
+      // not read the list as a ranking it should follow from the top.
+      expect(message).toContain("does not look credible");
+      // The list is still offered, in chardet's order, with a usable call shape.
+      expect(message).toContain("big5");
+      expect(message).toContain('file_path: "legacy.txt"');
+    }
+  });
+
+  it("does not claim a most-likely encoding when nothing could be ranked", async () => {
+    // `buildTop3Message`'s "Most likely X" is acted on by the model, so it must
+    // not be emitted from a list nothing separated. Measured: this input's
+    // candidates are all at chardet's floor, and an earlier revision still said
+    // "Most likely shift_jis" — a claim the ranking could not support either way.
+    try {
+      await decodeForOpen(shiftJis("日本語"), noGuess, { displayPath: "legacy.txt" });
+      expect.unreachable("expected E_NOT_TEXT");
+    } catch (error) {
+      const message = (error as Error).message;
+      expect((error as DecodeError).code).toBe("E_NOT_TEXT");
+      expect(message).not.toContain("Most likely");
+      expect(message).toContain("unordered");
+      // The list is still offered, so the caller can choose with the samples in
+      // front of it rather than being told nothing.
+      expect(message).toContain("shift_jis");
+      expect(message).toContain('file_path: "legacy.txt"');
+    }
+  });
+
+  it("offers the unranked list as a real list, not an empty one", async () => {
+    // An abstention must still enumerate candidates. The failure this pins is a
+    // fallback to an EMPTY list, which would render as "No candidate encoding
+    // decoded cleanly. This may be a binary file." — a wrong diagnosis for a
+    // perfectly decodable legacy text file. It is also the shape a `try/catch`
+    // around the ranking would produce, and nothing in that chain can throw for a
+    // config-shaped allowlist, so such a catch could only ever hide a bug.
+    try {
+      await decodeForOpen(shiftJis("日本語"), noGuess, { displayPath: "legacy.txt" });
+      expect.unreachable("expected E_NOT_TEXT");
+    } catch (error) {
+      const message = (error as Error).message;
+      expect((error as DecodeError).code).toBe("E_NOT_TEXT");
+      expect(message).not.toContain("binary file");
+      // At least the page that decodes the bytes must be named, with a sample.
+      expect(message).toMatch(/shift_jis\(".+?"\)/);
+    }
   });
 
   it("honors an explicit encoding hint and bypasses guessing", async () => {
