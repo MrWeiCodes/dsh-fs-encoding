@@ -2,8 +2,6 @@
 
 > A file-encoding governance plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): stop the AI from wrecking BOMs and multi-byte encodings when it reads and writes files
 
-**Repository**: https://github.com/MrWeiCodes/dsh-fs-encoding
-
 **🌏 [中文](README.md) | English**
 
 `dsh` · `dsh-plugin` · `plugin` · `encoding` · `BOM` · `GBK` · `Big5` · `Shift-JIS` · `UTF-16` · `AI agent` · `编码` · `文件编码` · `乱码`

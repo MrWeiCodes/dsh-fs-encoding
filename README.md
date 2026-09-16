@@ -2,8 +2,6 @@
 
 > 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）提供的文件编码治理插件：让 AI 读写文件时不再弄坏 BOM 与多字节编码
 
-**仓库**：https://github.com/MrWeiCodes/dsh-fs-encoding
-
 **🌏 中文 | [English](README_EN.md)**
 
 `dsh` · `dsh-plugin` · `plugin` · `encoding` · `BOM` · `GBK` · `Big5` · `Shift-JIS` · `UTF-16` · `AI agent` · `编码` · `文件编码` · `乱码`
