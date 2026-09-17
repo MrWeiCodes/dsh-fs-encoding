@@ -26,12 +26,13 @@ This plugin takes over those three tools and, while **preserving every existing 
 - **No silent corruption**: if the target encoding cannot represent the new content (an emoji in a GBK file), the plugin **refuses the write** and explains why, leaving the file untouched — instead of filling it with `?` and destroying it.
 - **It tells you what to do when it cannot read**: for a non-UTF-8 file, the plugin lists the most likely encodings with a sample decode of each, so the AI (or you) can pick one and re-read — like VS Code's "Reopen with Encoding".
 - **Nineteen encodings**: UTF-8 (with BOM), UTF-16, UTF-32, plus GBK, Big5, Shift-JIS, EUC-KR and the full Windows-125x family (Western, Central European, Cyrillic, Greek, Turkish, Hebrew, Arabic, Baltic).
-- **Zero learning curve**: arguments and output format are identical to the built-ins — these are **drop-in replacements**, so existing prompts and habits keep working; `read` merely gains one optional `encoding` argument.
+- **Zero learning curve**: arguments and output format are identical to the built-ins — these are **drop-in replacements**, so existing prompts and habits keep working; `read` and `write` each gain one optional `encoding` argument (the one on `write` applies to new files only, see below).
+- **Create files in a chosen encoding**: one `encoding` argument on `write` produces a GBK, Shift-JIS or other legacy-encoded file directly — no writing UTF-8 and converting afterwards.
 - **Simple configuration**: one YAML file with a few switches, all overridable by environment variables.
 
 ## Usage
 
-The three tools work exactly as the built-ins; `read` gains one optional argument:
+The three tools work exactly as the built-ins; `read` and `write` each gain one optional argument:
 
 ```
 read({ file_path: "legacy.txt", encoding: "gbk" })
@@ -55,6 +56,18 @@ Re-read with the call shown in the message and the encoding turns from a guess i
 > Even with `autoGuessEncoding` on, one case still fails loudly with the candidate list: a **very short** file (a few bytes) where two independent detectors name **different** pages. Nothing then distinguishes them — measured, the top pick is wrong about 79% of the time in that case — so the plugin lets you choose from the candidates instead of gambling for you. When both detectors name the **same** page it is adopted directly, and files of any ordinary length (tens of bytes and up) effectively never hit this.
 >
 > A second case that fails loudly: a detector names a **single-byte page** such as ISO-8859-1 or Windows-1252, but decoding with it yields text that is **almost entirely non-ASCII**. Real Western text is mostly letters and spaces, so it does not look like that — whereas 2-byte CJK, Korean or Cyrillic text read as a single-byte page turns every character into two Latin ones, which is exactly that shape. The plugin refuses the verdict and lists candidates instead. Measured, this catches 24 files that would otherwise be silently mis-read, and refuses **none** that previously read correctly.
+
+### Creating a file in a chosen encoding
+
+A new file is UTF-8 without a BOM by default. To generate a GBK file for a legacy system, add `encoding`:
+
+```
+write({ file_path: "run.bat", content: "echo 中文\r\n", encoding: "gbk" })
+```
+
+The accepted names are the same as `read`'s, and aliases and case are insensitive (`cp936`, `Shift-JIS` both work). Names that carry a BOM (`utf8bom`, `utf16le`, `utf16be`, `utf32le`, `utf32be`) write it; every other name writes none. Content the encoding cannot represent is **refused**, never written as `?`.
+
+> **`encoding` applies to new files only.** Passing it for an existing file fails with `E_ENCODING_NOT_APPLICABLE` instead of converting — preserving a file's encoding is this plugin's core promise, and a conversion rewrites every character of the file in a way the AI cannot see from the reply. **Do not delete the file to force a conversion**: deleting bypasses the read-before-write gate, so content the session never read disappears silently behind a `before: null`, and if the session *had* read the file, every later write fails `FS_STALE_VERSION` and the path cannot be recreated for the rest of the session. This plugin does not convert encodings; when you need a copy in another encoding, write it to a **new path**.
 
 ## Installation
 
@@ -258,11 +271,12 @@ Names are case- and style-insensitive: `Shift-JIS`, `shift_jis` and `SJIS` all m
 | Error | Meaning and fix |
 |---|---|
 | `E_NOT_TEXT` | Not valid UTF-8 and no BOM. Re-read with `read({ file_path: "...", encoding: "..." })` as suggested, or enable `autoGuessEncoding`. |
-| `E_UNMAPPABLE` | The target encoding cannot represent the new content (an emoji in a GBK file). **The file was not modified** — switch to an encoding that can, or migrate with `normalizeToUtf8` first. |
+| `E_UNMAPPABLE` | The target encoding cannot represent the new content (an emoji in a GBK file). **The file was not modified** — switch to an encoding that can, or migrate with `normalizeToUtf8` (that migration applies to an **existing** file only; for a new file just name a different encoding). |
 | `E_BAD_ENCODING` | Unknown encoding name; use one from the table above. |
+| `E_ENCODING_NOT_APPLICABLE` | `encoding` was passed to `write` for a file that **already exists**. The argument applies to new files only; the file keeps its own encoding and nothing was changed. This plugin does **not** convert encodings — do not delete the file to force one (see above); write a copy to a new path instead. |
 | `E_DECODE_FAILED` | The bytes do not decode under the requested encoding — the encoding is probably wrong; try another candidate. |
-| `FS_STALE_VERSION` | The file changed after it was read. Read it again before editing, to avoid clobbering someone else's change. |
-| `FS_NOT_OBSERVED` | The file was never read in this session. Read before writing. |
+| `FS_STALE_VERSION` | The file changed after it was read (or was deleted). Read it again before editing, to avoid clobbering someone else's change. |
+| `FS_NOT_OBSERVED` | This session has no encoding record for the file, so it cannot be rewritten: an **existing** file that was not read this session (or whose record was reclaimed) is refused rather than re-encoded as UTF-8. Read it once before writing; if it is not a text file, this plugin cannot rewrite it. Creating a new file is unaffected. |
 | `FS_EDIT_NOT_FOUND` | The `old_string` to replace was not found; check the content and indentation. |
 | `FS_AMBIGUOUS_EDIT` | `old_string` matched more than once. Add surrounding context to make it unique, or set `replace_all: true`. |
 | `FS_SANDBOX_DENIED` | Refused by DSH's sandbox (e.g. writing outside the workspace) — the existing safety policy at work. |

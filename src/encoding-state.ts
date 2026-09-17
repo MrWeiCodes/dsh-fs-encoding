@@ -16,6 +16,7 @@
  */
 
 import {
+  bomBytesForEncoding,
   decodeBytes,
   detectBom,
   encodeText,
@@ -28,13 +29,7 @@ import {
   type CandidatePreview,
   type RankedCandidates,
 } from "./encoding.js";
-import {
-  detectEnding,
-  restoreEndings,
-  toLF,
-  UTF8_BOM_BYTES,
-  type LineEnding,
-} from "./line-endings.js";
+import { detectEnding, restoreEndings, toLF, type LineEnding } from "./line-endings.js";
 import { reReadCall } from "./prompts.js";
 
 /** What was learned about one file the first time it was read this session. */
@@ -81,10 +76,26 @@ interface SessionRecords {
 /**
  * Upper bound on sessions tracked at once. A long-lived process sees many
  * sessions; without a bound the map would grow forever.
+ *
+ * Eviction here is coarse — the OLDEST SESSION is dropped whole, losing every
+ * file's encoding with it — so it is the likelier of the two bounds to bite in
+ * practice: 64 sessions accumulate over ordinary use, while 4096 distinct files
+ * in one session does not. Either bound can leave a file on disk whose encoding
+ * this module no longer knows, which is why `writeFile` refuses to write an
+ * existing file with no record rather than defaulting it to UTF-8.
  */
 const MAX_SESSIONS = 64;
 
-/** Upper bound on files tracked per session. */
+/**
+ * Upper bound on files tracked per session.
+ *
+ * Same purpose as {@link MAX_SESSIONS}, and the same hazard when it evicts: a
+ * file that still exists can lose its record. `writeFile` is what keeps that from
+ * becoming a silent UTF-8 rewrite; see the guard in `io.ts` step 3.
+ *
+ * The value is arbitrary — it is a memory ceiling, not a tuned threshold, and
+ * nothing depends on the exact number.
+ */
 const MAX_FILES_PER_SESSION = 4096;
 
 const sessions = new Map<string, SessionRecords>();
@@ -264,13 +275,18 @@ export class DecodeError extends Error {
   }
 }
 
+/**
+ * The BOM bytes an encoding name denotes, or `undefined` for a BOM-free form.
+ *
+ * Delegates to the single BOM table in `encoding`, so the "which names carry a
+ * BOM" knowledge exists once: the read path's {@link detectBom} and this write
+ * path's answer are two directions of the same table and cannot drift.
+ *
+ * @param encoding - a canonical encoding identifier.
+ * @returns the BOM prefix to write, or `undefined`.
+ */
 function bomBytesFor(encoding: string): Uint8Array | undefined {
-  if (encoding === "utf8bom") return UTF8_BOM_BYTES;
-  if (encoding === "utf16le") return Uint8Array.from([0xff, 0xfe]);
-  if (encoding === "utf16be") return Uint8Array.from([0xfe, 0xff]);
-  if (encoding === "utf32le") return Uint8Array.from([0xff, 0xfe, 0x00, 0x00]);
-  if (encoding === "utf32be") return Uint8Array.from([0x00, 0x00, 0xfe, 0xff]);
-  return undefined;
+  return bomBytesForEncoding(encoding);
 }
 
 /**
@@ -529,6 +545,32 @@ export async function decodeForOpen(
 }
 
 /**
+ * Build the state a read established, WITHOUT recording it.
+ *
+ * Split out from {@link recordOpenState} because the two must be separable: a
+ * read whose only purpose is to render a diff learns an encoding but must not
+ * make it the session's answer. Recording a guess from a presentation-only read
+ * would let that guess authorize a later save, which is exactly the silent
+ * re-encode the write guard exists to refuse.
+ *
+ * @param decoded - the admission result.
+ * @param version - the version observed at read time, used for later invalidation.
+ * @returns the state, unrecorded.
+ */
+export function openStateFor(
+  decoded: DecodeForOpenResult,
+  version: string | undefined,
+): FileEncodingState {
+  return {
+    encoding: decoded.encoding,
+    hasBOM: decoded.hasBOM,
+    lineEnding: decoded.lineEnding,
+    version,
+    ...(decoded.footer === undefined ? {} : { footer: decoded.footer }),
+  };
+}
+
+/**
  * Record what a read learned about a file, for one session.
  *
  * @param sessionKey - the bucket key from {@link sessionKeyOf}.
@@ -543,13 +585,7 @@ export function recordOpenState(
   decoded: DecodeForOpenResult,
   version: string | undefined,
 ): FileEncodingState {
-  const state: FileEncodingState = {
-    encoding: decoded.encoding,
-    hasBOM: decoded.hasBOM,
-    lineEnding: decoded.lineEnding,
-    version,
-    ...(decoded.footer === undefined ? {} : { footer: decoded.footer }),
-  };
+  const state: FileEncodingState = openStateFor(decoded, version);
   setEncodingState(sessionKey, targetKey, state);
   return state;
 }
@@ -605,6 +641,12 @@ export class UnmappableError extends Error {
 export interface EncodeForSaveOptions {
   /** Rewrite a legacy file as UTF-8 instead of preserving its encoding. */
   normalizeToUtf8?: boolean;
+  /**
+   * The encoding to create a file in that has no recorded state, when the caller
+   * named one explicitly. Ignored whenever `state` is present: an existing file's
+   * own encoding always wins, which is this plugin's core contract.
+   */
+  newFileEncoding?: string | undefined;
 }
 
 /**
@@ -637,7 +679,11 @@ export function encodeForSave(
   state: FileEncodingState | undefined,
   opts: EncodeForSaveOptions = {},
 ): { bytes: Uint8Array; encoding: string; hasBOM: boolean } {
-  const encoding = state?.encoding ?? "utf8";
+  // An existing file's recorded encoding always wins; `newFileEncoding` applies
+  // only where there is no record to preserve, i.e. a file being created. The
+  // caller (`tool-write`) refuses the argument outright on an existing file, so
+  // this precedence is a backstop rather than the only guard.
+  const encoding = state?.encoding ?? opts.newFileEncoding ?? "utf8";
 
   // Line endings are restored first: they are pure ASCII and cannot introduce
   // an unmappable character, so doing it here keeps the verification below
@@ -647,7 +693,13 @@ export function encodeForSave(
 
   // Migration: a legacy file becomes UTF-8, and a BOM is preserved only if it
   // was a UTF-8 BOM to begin with (a UTF-16 BOM makes no sense on UTF-8 bytes).
-  const migrated = opts.normalizeToUtf8 === true && isLegacy(encoding);
+  //
+  // Gated on `state` being present, so it can never fire for a file being
+  // created. `normalizeToUtf8` exists to retire the encoding of an EXISTING
+  // legacy file on its first save; a caller that names an encoding for a new file
+  // has asked for that encoding, and letting a global config silently overrule it
+  // would create the file as UTF-8 while the reply implied otherwise.
+  const migrated = opts.normalizeToUtf8 === true && state !== undefined && isLegacy(encoding);
   const effective = migrated ? "utf8" : encoding;
 
   // A UTF-8 BOM is a *character* (U+FEFF) that the UTF-8 codec encodes into the
@@ -655,8 +707,17 @@ export function encodeForSave(
   // and UTF-32 codecs do NOT emit their BOM from the text form, so their BOM is
   // prepended as bytes below. A migrated file carries no BOM: it was not UTF-8
   // before, so there is no UTF-8 BOM to preserve.
+  //
+  // A NEW file has no recorded BOM to restore, so its BOM comes from the name it
+  // was created under: `utf8bom`/`utf16le`/`utf16be`/`utf32le`/`utf32be` each
+  // denote a BOM-carrying form in this plugin's vocabulary (that is exactly how
+  // the read path names them), so asking for one and getting BOM-less bytes would
+  // contradict the request. Every other name — including plain `utf8` — stays
+  // BOM-free, so a new file never gains one it did not ask for.
+  const wantsBom =
+    state !== undefined ? state.hasBOM : bomBytesFor(encoding) !== undefined;
   const target = effective === "utf8bom" ? "utf8" : effective;
-  const keepsBom = state?.hasBOM === true && !migrated;
+  const keepsBom = wantsBom && !migrated;
   const textWithBom = keepsBom && effective === "utf8bom" ? `\uFEFF${withEndings}` : withEndings;
 
   const encoded = encodeText(textWithBom, target);
@@ -675,10 +736,17 @@ export function encodeForSave(
       const detail = findFirstUnmappable(textWithBom, roundTripped);
       if (detail !== undefined) {
         const hex = detail.codePoint.toString(16).toUpperCase().padStart(4, "0");
+        // The remedy differs by whether there is a file to migrate. For a file
+        // being CREATED, `migrated` is gated off above, so advising
+        // `normalizeToUtf8` would send the model to a setting that cannot change
+        // this outcome — it would retry the same write and fail identically.
+        const remedy =
+          state === undefined
+            ? `Either remove that character, or create the file in an encoding that can represent it (utf8, utf16le, ...).`
+            : `Either remove that character, or set normalizeToUtf8: true in the plugin config to migrate this file to UTF-8.`;
         throw new UnmappableError(
           `[E_UNMAPPABLE] ${describeChar(detail.char)} (U+${hex}) cannot be represented in ${target}. ` +
-            `The write was refused and the file is unchanged. ` +
-            `Either remove that character, or set normalizeToUtf8: true in the plugin config to migrate this file to UTF-8.`,
+            `The write was refused and the file is unchanged. ${remedy}`,
           detail,
           target,
         );

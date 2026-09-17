@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import iconv from "iconv-lite";
 import {
+  bomBytesForEncoding,
   CANONICAL_ENCODINGS,
   chardetTop3Candidates,
   DEFAULT_SUPPORTED_ENCODINGS,
@@ -9,6 +10,7 @@ import {
   encodeText,
   getTop3Candidates,
   hasScriptFamily,
+  isSupportedEncoding,
   isValidUtf8,
   isAcceptableDecode,
   normalizeEncoding,
@@ -129,6 +131,46 @@ describe("normalizeEncoding", () => {
     expect(normalizeEncoding("klingon")).toBeUndefined();
     expect(normalizeEncoding("")).toBeUndefined();
     expect(normalizeEncoding("   ")).toBeUndefined();
+  });
+
+  it("rejects Object.prototype members instead of leaking them", () => {
+    // `ALIASES[key]` is a prototype-chain lookup on a plain object literal, so a
+    // bare index returns a FUNCTION for these names — truthy, not a string, and
+    // not an encoding. A `=== undefined` validation would accept `constructor`
+    // and pass it to the codec layer, which then surfaced the interpreter's own
+    // source text ("function Object() { [native code] }") in a model-facing
+    // error. The lookup must be an own-property check.
+    for (const name of ["constructor", "toString", "valueOf", "hasOwnProperty", "__proto__"]) {
+      expect(normalizeEncoding(name), `${name} must not resolve`).toBeUndefined();
+      expect(isSupportedEncoding(name), `${name} must not be supported`).toBe(false);
+    }
+  });
+});
+
+describe("the BOM table", () => {
+  it("names exactly the BOM-carrying encodings, both directions", () => {
+    // `detectBom` (bytes → name) and `bomBytesForEncoding` (name → bytes) are two
+    // directions of ONE table. If they ever disagree, a file can be written with a
+    // BOM its own reader does not recognize — or read as BOM-carrying and saved
+    // without one — and both failures are silent.
+    const expected = ["utf8bom", "utf16le", "utf16be", "utf32le", "utf32be"];
+    for (const enc of expected) {
+      const bytes = bomBytesForEncoding(enc);
+      expect(bytes, `${enc} must have a BOM`).toBeDefined();
+      // Round-trip: the bytes this table hands the writer must be the bytes the
+      // sniffer recognizes, and must name the same encoding back.
+      expect(detectBom(bytes!)?.encoding).toBe(enc);
+    }
+    // And nothing else carries one.
+    for (const enc of ["utf8", "gbk", "big5", "shift_jis", "euc-kr", "windows-1252"]) {
+      expect(bomBytesForEncoding(enc), `${enc} must not have a BOM`).toBeUndefined();
+    }
+  });
+
+  it("still prefers the longer BOM on a prefix overlap", () => {
+    // The table is ordered longest-signature-first so this holds structurally.
+    expect(bomBytesForEncoding("utf32le")).toEqual(Uint8Array.from([0xff, 0xfe, 0x00, 0x00]));
+    expect(detectBom(Uint8Array.from([0xff, 0xfe, 0x00, 0x00]))?.encoding).toBe("utf32le");
   });
 });
 

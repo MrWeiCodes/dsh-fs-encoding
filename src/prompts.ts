@@ -46,7 +46,10 @@ export const READ_DESCRIPTION =
 export const WRITE_DESCRIPTION =
   "Create or fully replace a text file. The file's existing encoding is preserved " +
   "byte-exactly (UTF-8 BOM, GBK, UTF-16 and so on); a new file is UTF-8 without a BOM. " +
-  "Content that the file's encoding cannot represent is refused rather than written.";
+  "Content that the file's encoding cannot represent is refused rather than written. " +
+  "For a NEW file, pass `encoding` to create it in that encoding instead (gbk, big5, " +
+  "utf16le, ...); on an existing file the argument is refused, because the file keeps " +
+  "its own encoding.";
 
 export const EDIT_DESCRIPTION =
   "Edit an existing text file by replacing literal text, preserving the file's " +
@@ -68,7 +71,8 @@ export function writeSectionText(): string {
     "Use the write tool to create files or completely replace file contents. The file's " +
     "existing encoding and line endings are preserved, so editing a GBK or UTF-16 file " +
     "does not silently convert it to UTF-8. Existing files are overwritten, so read an " +
-    "existing file first and prefer edit for targeted changes."
+    "existing file first and prefer edit for targeted changes. When creating a new file, " +
+    "pass encoding to write it in something other than UTF-8."
   );
 }
 

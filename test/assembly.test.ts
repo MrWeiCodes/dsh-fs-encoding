@@ -493,8 +493,13 @@ describe("tool schemas", () => {
     root.emit("agent/session-start", { agent: h.agent } as never);
 
     // fs-sandbox is mounted, so the escalation pair is advertised too.
+    //
+    // `encoding` is the one deliberate ADDITION to the built-in `write` shape: it
+    // names the encoding of a file being created. The built-in names must all
+    // still be present and unchanged, which is what this guards.
     expect(Object.keys(paramsOf(h.agent.ctx, "write")).sort()).toEqual([
       "content",
+      "encoding",
       "file_path",
       "justification",
       "sandbox_permissions",

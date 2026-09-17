@@ -197,11 +197,20 @@ export class EncodingSandbox {
    *
    * The observation policy answers `createIfAbsent` / `replaceIfVersion` from
    * the version this session last observed; with no policy mounted the bare
-   * `undefined` means an unconditional write, exactly as for the built-ins.
+   * `undefined` means no guard is taken, exactly as for the built-ins.
+   *
+   * "No guard" is NOT the same as "no checks", and this method must not be read
+   * that way. `writeFile` adds its own refusal — a file that EXISTS while the
+   * session holds no encoding record for it is rejected rather than re-encoded as
+   * UTF-8 — and that refusal is independent of the policy. So in a composition
+   * with no policy mounted, overwriting an existing file still requires reading
+   * it first; the plugin will not write a file whose encoding it does not know,
+   * because doing so silently replaces every non-ASCII byte of a legacy file.
+   * Only a genuinely new file is written unconditionally.
    *
    * @param target - the target about to be written.
    * @param exec - the calling execution, which the policy keys its state by.
-   * @returns the guard, or `undefined` for an unconditional write.
+   * @returns the guard, or `undefined` when no policy supplies one.
    */
   async takeWriteIntent(target: FsTarget, exec: ToolExecution): Promise<WriteIntent | undefined> {
     return (await this.ctx.waterfall("fs/write-intent", target, exec, () => undefined)) as

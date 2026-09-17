@@ -499,6 +499,80 @@ describe("encodeForSave — invert at save", () => {
   });
 });
 
+describe("encodeForSave — newFileEncoding (a file being created)", () => {
+  it("creates the file in the named encoding when there is no state", () => {
+    const out = encodeForSave("你好，世界", undefined, { newFileEncoding: "gbk" });
+    expect(out.encoding).toBe("gbk");
+    expect(Buffer.from(out.bytes).equals(Buffer.from(iconv.encode("你好，世界", "gbk")))).toBe(true);
+  });
+
+  it("defaults to UTF-8 when neither state nor a name is present", () => {
+    const out = encodeForSave("你好", undefined);
+    expect(out.encoding).toBe("utf8");
+    expect(Buffer.from(out.bytes).toString("utf8")).toBe("你好");
+  });
+
+  it("gives a BOM only for a BOM-carrying name", () => {
+    // `utf8bom`/`utf16le` denote BOM-carrying forms on the read side, so a new
+    // file created under one must carry it. Every other name stays BOM-free.
+    expect(encodeForSave("x", undefined, { newFileEncoding: "utf8bom" }).hasBOM).toBe(true);
+    expect(encodeForSave("x", undefined, { newFileEncoding: "utf8" }).hasBOM).toBe(false);
+    expect(encodeForSave("x", undefined, { newFileEncoding: "gbk" }).hasBOM).toBe(false);
+    expect(encodeForSave("x", undefined, { newFileEncoding: "utf16le" }).hasBOM).toBe(true);
+
+    const le = encodeForSave("x", undefined, { newFileEncoding: "utf16le" });
+    expect([le.bytes[0], le.bytes[1]]).toEqual([0xff, 0xfe]);
+  });
+
+  it("refuses content the named encoding cannot represent", () => {
+    expect(() => encodeForSave("emoji 🎉", undefined, { newFileEncoding: "gbk" })).toThrow(
+      UnmappableError,
+    );
+  });
+
+  it("lets an existing file's own encoding win over the name", () => {
+    // The backstop for plan B's precedence: a recorded encoding is never
+    // overridden by `newFileEncoding`. `tool-write` refuses the argument earlier
+    // on an existing file, so this asserts the lower layer cannot be talked into
+    // a conversion either.
+    const state: FileEncodingState = {
+      encoding: "gbk",
+      hasBOM: false,
+      lineEnding: "\n",
+      version: undefined,
+    };
+    const out = encodeForSave("你好", state, { newFileEncoding: "big5" });
+    expect(out.encoding).toBe("gbk");
+    expect(Buffer.from(out.bytes).equals(Buffer.from(iconv.encode("你好", "gbk")))).toBe(true);
+  });
+
+  it("is not migrated to UTF-8 by the normalizeToUtf8 config", () => {
+    // `normalizeToUtf8` retires the encoding of an EXISTING legacy file on its
+    // first save. A caller naming an encoding for a NEW file has asked for that
+    // encoding, so a global config must not silently overrule it and create the
+    // file as UTF-8 while the reply implies otherwise.
+    const out = encodeForSave("你好", undefined, {
+      newFileEncoding: "gbk",
+      normalizeToUtf8: true,
+    });
+    expect(out.encoding).toBe("gbk");
+    expect(Buffer.from(out.bytes).equals(Buffer.from(iconv.encode("你好", "gbk")))).toBe(true);
+  });
+
+  it("still migrates an EXISTING legacy file under the same config", () => {
+    // The other half of the gate above: the migration must keep working for the
+    // case it was written for.
+    const state: FileEncodingState = {
+      encoding: "gbk",
+      hasBOM: false,
+      lineEnding: "\n",
+      version: undefined,
+    };
+    const out = encodeForSave("你好", state, { normalizeToUtf8: true });
+    expect(out.encoding).toBe("utf8");
+  });
+});
+
 describe("byte-exact round-trip", () => {
   /**
    * A file is admitted the way the plugin really admits it: BOM-carrying files

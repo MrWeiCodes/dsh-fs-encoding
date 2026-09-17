@@ -9,6 +9,7 @@
  */
 
 import iconv from "iconv-lite";
+import { UTF8_BOM_BYTES } from "./line-endings.js";
 
 /**
  * Encodings `autoGuessEncoding` may consider when the config does not say otherwise.
@@ -115,6 +116,13 @@ export const SUPPORTED_ENCODINGS_TEXT = CANONICAL_ENCODINGS.join(", ");
  * Case-insensitive and punctuation-insensitive: `Shift-JIS`, `shift_jis` and
  * `SJIS` all resolve to `shift_jis`.
  *
+ * The lookup is an OWN-property check, not a bare `ALIASES[key]`. A plain
+ * object literal inherits `Object.prototype`, so a raw index returns a function
+ * for names like `constructor` or `toString` — truthy values that are not
+ * strings and not encodings. A bare lookup would let `constructor` pass a
+ * `=== undefined` validation, reach the codec layer, and surface the
+ * interpreter's own source text in a model-facing error message.
+ *
  * @param input - the raw encoding name.
  * @returns the canonical identifier, or `undefined` when unrecognized.
  */
@@ -122,6 +130,7 @@ export function normalizeEncoding(input: string): string | undefined {
   const trimmed = input.trim().toLowerCase();
   if (trimmed.length === 0) return undefined;
   const key = trimmed.replace(/[-_\s]/g, "");
+  if (!Object.prototype.hasOwnProperty.call(ALIASES, key)) return undefined;
   return ALIASES[key];
 }
 
@@ -139,42 +148,58 @@ export interface BomInfo {
 }
 
 /**
- * Sniff a leading byte-order mark.
+ * The single table of encodings that carry a byte-order mark, name → BOM bytes.
  *
- * Order matters: the UTF-32LE BOM starts with the UTF-16LE BOM, and UTF-32BE
- * with a prefix that no shorter BOM matches, so the 4-byte checks must run
- * before the 2-byte ones.
+ * This is the ONE place that knowledge lives. Both directions are derived from
+ * it: {@link detectBom} reads it to name the encoding a file's leading bytes
+ * declare, and {@link bomBytesForEncoding} reads it to answer whether a name
+ * denotes a BOM-carrying form. Two hand-written copies of the same table drift,
+ * and the failure is silent in both directions — a name the writer knows but the
+ * sniffer does not produces a file whose BOM is dropped on the next save, which
+ * is precisely the corruption this plugin exists to prevent.
+ *
+ * Order is load-bearing for {@link detectBom}: the UTF-32LE BOM begins with the
+ * UTF-16LE BOM, so longer signatures must be tested first. Entries are listed
+ * longest-first to make that requirement structural rather than a comment.
+ */
+const BOM_TABLE: ReadonlyArray<readonly [string, Uint8Array]> = [
+  ["utf32le", Uint8Array.from([0xff, 0xfe, 0x00, 0x00])],
+  ["utf32be", Uint8Array.from([0x00, 0x00, 0xfe, 0xff])],
+  ["utf8bom", UTF8_BOM_BYTES],
+  ["utf16le", Uint8Array.from([0xff, 0xfe])],
+  ["utf16be", Uint8Array.from([0xfe, 0xff])],
+];
+
+/**
+ * The BOM bytes an encoding name denotes, or `undefined` for a BOM-free form.
+ *
+ * @param encoding - a canonical encoding identifier.
+ * @returns the BOM prefix to write, or `undefined`.
+ */
+export function bomBytesForEncoding(encoding: string): Uint8Array | undefined {
+  for (const [name, bytes] of BOM_TABLE) {
+    if (name === encoding) return bytes;
+  }
+  return undefined;
+}
+
+/**
+ * Sniff a leading byte-order mark.
  *
  * @param bytes - the file's leading bytes (the whole file is fine).
  * @returns the BOM, or `undefined` when the content starts with no BOM.
  */
 export function detectBom(bytes: Uint8Array): BomInfo | undefined {
-  if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
-    return { encoding: "utf8bom", bomLen: 3 };
-  }
-  if (
-    bytes.length >= 4 &&
-    bytes[0] === 0xff &&
-    bytes[1] === 0xfe &&
-    bytes[2] === 0x00 &&
-    bytes[3] === 0x00
-  ) {
-    return { encoding: "utf32le", bomLen: 4 };
-  }
-  if (
-    bytes.length >= 4 &&
-    bytes[0] === 0x00 &&
-    bytes[1] === 0x00 &&
-    bytes[2] === 0xfe &&
-    bytes[3] === 0xff
-  ) {
-    return { encoding: "utf32be", bomLen: 4 };
-  }
-  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
-    return { encoding: "utf16le", bomLen: 2 };
-  }
-  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
-    return { encoding: "utf16be", bomLen: 2 };
+  for (const [encoding, bom] of BOM_TABLE) {
+    if (bytes.length < bom.length) continue;
+    let matches = true;
+    for (let i = 0; i < bom.length; i += 1) {
+      if (bytes[i] !== bom[i]) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) return { encoding, bomLen: bom.length };
   }
   return undefined;
 }

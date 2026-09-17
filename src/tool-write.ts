@@ -14,6 +14,7 @@ import { FsError } from "@deepseek-ai/dsh-fs";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolExecution } from "@deepseek-ai/dsh-tools";
 import { DecodeError, UnmappableError } from "./encoding-state.js";
+import { normalizeEncoding, SUPPORTED_ENCODINGS_TEXT } from "./encoding.js";
 import { readFile, writeFile } from "./io.js";
 import { toLF } from "./line-endings.js";
 import { WRITE_DESCRIPTION } from "./prompts.js";
@@ -29,7 +30,11 @@ ${operation === "create" ? "Created" : "Updated"} file
 }
 
 /** Parse and validate the write arguments. */
-function parseArgs(args: Record<string, unknown>): { path: string; content: string } {
+function parseArgs(args: Record<string, unknown>): {
+  path: string;
+  content: string;
+  encoding: string | undefined;
+} {
   const path = args["file_path"] ?? args["path"];
   if (typeof path !== "string" || path.length === 0) {
     throw new Error('[E_BAD_PAYLOAD] write: "file_path" must be a non-empty string.');
@@ -38,7 +43,20 @@ function parseArgs(args: Record<string, unknown>): { path: string; content: stri
   if (typeof content !== "string") {
     throw new Error('[E_BAD_PAYLOAD] write: "content" must be a string.');
   }
-  return { path, content };
+  const rawEncoding = args["encoding"];
+  if (rawEncoding === undefined || rawEncoding === null) {
+    return { path, content, encoding: undefined };
+  }
+  if (typeof rawEncoding !== "string" || rawEncoding.trim().length === 0) {
+    throw new Error('[E_BAD_PAYLOAD] write: "encoding" must be a non-empty string.');
+  }
+  const encoding = normalizeEncoding(rawEncoding);
+  if (encoding === undefined) {
+    throw new Error(
+      `[E_BAD_ENCODING] Unknown encoding: ${rawEncoding}. Supported: ${SUPPORTED_ENCODINGS_TEXT}`,
+    );
+  }
+  return { path, content, encoding };
 }
 
 /**
@@ -61,6 +79,13 @@ export function buildWriteTool(ctx: Context, sandbox: EncodingSandbox) {
         type: "string",
         required: true,
         description: "Full text content to write.",
+      },
+      encoding: {
+        type: "string",
+        description:
+          "Encoding for a NEW file (gbk, big5, shift_jis, utf16le, ...). Only valid " +
+          "when the file does not exist yet; an existing file keeps its own encoding, " +
+          "so passing this for one is an error. Defaults to UTF-8 without a BOM.",
       },
       ...(sandbox.escalationModes.length > 0 ? sandbox.schemaFields() : {}),
     },
@@ -110,11 +135,57 @@ export function buildWriteTool(ctx: Context, sandbox: EncodingSandbox) {
       const existing = await ctx.fs.stat(target, exec.signal).catch(() => undefined);
       const operation: "create" | "update" = existing === undefined ? "create" : "update";
 
+      // `encoding` names the encoding of a file that does not exist yet. On an
+      // existing file it is refused rather than ignored, and refused BEFORE any
+      // read or write: silently accepting it would let a model believe it had
+      // converted a file when the plugin had preserved the original encoding
+      // instead, and the two outcomes are indistinguishable from the reply.
+      //
+      // The alternative — treating it as "convert this file" — is deliberately
+      // not offered. Preserving a file's encoding across a write is this plugin's
+      // core contract, and a conversion is not something to trigger by adding an
+      // argument to an unrelated call: it would rewrite every character of a file
+      // the model only meant to save, and the model cannot see the difference.
+      //
+      // The message deliberately does NOT suggest deleting the file to get the
+      // conversion. That advice is actively harmful, and it used to be here:
+      // deleting is the one action that bypasses the read-before-write gate, so a
+      // file this session had never read could be destroyed and recreated with
+      // the reply reporting `operation: "create"` / `before: null` — identical to
+      // creating a brand-new file, with the old content unrecoverable and
+      // invisible. And when the session HAD read the file (the common case, since
+      // the gate requires a read), the deletion left the observation policy
+      // holding `present@old-version` while the plugin could no longer emit
+      // `absent` for a path that does not exist, so every later write failed
+      // `FS_STALE_VERSION` and the path was unwritable for the rest of the
+      // session. There is no in-session recovery from that, so the advice must
+      // not be given. A genuine conversion needs a purpose-built tool that reads
+      // first and carries the version guard; it is not a side effect of `write`.
+      if (input.encoding !== undefined && operation === "update") {
+        throw new Error(
+          `[E_ENCODING_NOT_APPLICABLE] "${input.path}" already exists, so it keeps its own ` +
+            `encoding — the "encoding" argument only applies to a new file. ` +
+            `Write without it to save the content while preserving the existing encoding. ` +
+            `This plugin does not convert an existing file's encoding; if you need a copy in ` +
+            `${input.encoding}, write it to a NEW path instead.`,
+        );
+      }
+
       // Capture the previous content for the diff card, in the file's own
       // encoding, so the card shows what actually changed. This read is for
       // presentation only and must NOT arm the read-before-write gate: the
       // model never saw this content, and letting it count would let a blind
       // overwrite pass as if the file had been read.
+      //
+      // It must not record the encoding either. `observe: false` only suppresses
+      // the `fs/observed` event; without `recordState: false` this read would
+      // still write whatever encoding it guessed into the session's record. After
+      // an eviction that guess becomes the answer the coming save inverts, and
+      // the write guard — which refuses a file whose encoding the session no
+      // longer knows — would see a record and stand down. Measured before this
+      // flag existed: a windows-1252 file's euro sign (0x80) was silently
+      // rewritten as windows-1251's 0x88, and a GBK file whose bytes also form
+      // valid UTF-8 was converted to UTF-8 outright.
       let before: string | null = null;
       if (operation === "update") {
         try {
@@ -122,6 +193,7 @@ export function buildWriteTool(ctx: Context, sandbox: EncodingSandbox) {
             ...(exec.signal === undefined ? {} : { signal: exec.signal }),
             exec,
             observe: false,
+            recordState: false,
           });
           before = toLF(previous.text);
         } catch {
@@ -133,7 +205,13 @@ export function buildWriteTool(ctx: Context, sandbox: EncodingSandbox) {
         await writeFile(
           ctx,
           sandbox,
-          { target, content: input.content, exec, policy },
+          {
+            target,
+            content: input.content,
+            exec,
+            policy,
+            ...(input.encoding === undefined ? {} : { newFileEncoding: input.encoding }),
+          },
           "write",
         );
       } catch (error) {

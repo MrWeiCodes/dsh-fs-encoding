@@ -21,6 +21,7 @@ import {
   encodeForSave,
   getEncodingState,
   invalidateIfStale,
+  openStateFor,
   recordOpenState,
   sessionKeyOf,
   type FileEncodingState,
@@ -125,6 +126,21 @@ export async function readFile(
      * they cannot silently satisfy a gate the model never did.
      */
     observe?: boolean | undefined;
+    /**
+     * Whether to store the encoding this read derived as the session's record
+     * for the file. Defaults to `true`.
+     *
+     * Separate from {@link observe} because the two answer different questions
+     * and the dangerous case is the one where they disagree. A presentation-only
+     * read (a diff baseline) passes `observe: false` so it cannot arm the gate —
+     * but if it still WROTE the encoding record, it would replace the session's
+     * knowledge with whatever this read guessed, and that guess would then
+     * authorize the coming save. After an eviction that is precisely the silent
+     * re-encode the write guard refuses; the guard sees a record and stands
+     * down. A read that is not allowed to speak for the session must not leave
+     * a record behind either.
+     */
+    recordState?: boolean | undefined;
   } = {},
 ): Promise<ReadOutcome> {
   const fs: FileSystem = ctx.fs;
@@ -139,7 +155,29 @@ export async function readFile(
       ...(opts.signal === undefined ? {} : { signal: opts.signal }),
     });
     info = await fs.stat(target, opts.signal);
-    if (info === undefined) throw new FsError(`cannot read "${path}": no such file`, "FS_NOT_FOUND");
+    if (info === undefined) {
+      // Report the absence to the observation gate before failing, exactly as the
+      // built-in `read` does. Without this the policy keeps whatever it last knew
+      // — normally `present@old-version` — and every later write to this path
+      // fails `FS_STALE_VERSION` ("file no longer exists") for the rest of the
+      // session, with nothing able to clear it: a file the model deleted can
+      // never be recreated, and the refusal names a cause the caller cannot act
+      // on. A read is the one moment the plugin learns a file is gone, so it is
+      // the moment to say so. Suppressed for a presentation-only read, which must
+      // not move the gate in either direction.
+      if (opts.observe !== false) {
+        try {
+          ctx.emit("fs/observed", target, { kind: "absent" }, opts.exec);
+        } catch (error) {
+          ctx.logger.warn(
+            `dsh-fs-encoding: fs/observed (absent) emission failed for ${path}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      }
+      throw new FsError(`cannot read "${path}": no such file`, "FS_NOT_FOUND");
+    }
     if (info.type !== "file") {
       throw new FsError(`cannot read "${path}": not a regular file`, "FS_NOT_REGULAR_FILE");
     }
@@ -169,7 +207,15 @@ export async function readFile(
     displayPath: path,
     ...(hint === undefined ? {} : { encodingHint: hint }),
   });
-  const state = recordOpenState(sessionKey, key, decoded, version);
+  // A read that may not speak for the session still needs a state to RETURN (the
+  // caller reports on it), but it must not store one. `openStateFor` builds it
+  // without recording, so the memo keeps whatever the session actually decided —
+  // or stays empty, which is what makes the write guard refuse an evicted file
+  // instead of inverting a guess made for a diff card.
+  const state =
+    opts.recordState === false
+      ? openStateFor(decoded, version)
+      : recordOpenState(sessionKey, key, decoded, version);
 
   // Reuse the recorded guess provenance when this read went through the memo
   // rather than through admission. The hint path produces no footer of its own,
@@ -212,6 +258,14 @@ export interface WriteRequest {
   exec: ToolExecution;
   /** The policy resolved for this call, or `undefined` on an unsandboxed backend. */
   policy: SandboxExecutionPolicy | undefined;
+  /**
+   * The encoding to CREATE the file in, when the caller named one.
+   *
+   * Only consulted for a file that does not exist. An existing file's recorded
+   * encoding always wins, and the calling tool refuses the argument outright in
+   * that case, so the two rules cannot disagree — see `tool-write`.
+   */
+  newFileEncoding?: string | undefined;
 }
 
 /** What a governed write produced. */
@@ -326,8 +380,67 @@ export async function writeFile(
     }
 
     // 3) Encode (fails before anything is published).
+    //
+    // `newFileEncoding` is passed through unconditionally; `encodeForSave` decides
+    // whether it applies, and it only does so when there is no recorded state —
+    // i.e. the file is being created. An existing file's encoding wins, which the
+    // calling tool has already enforced by refusing the argument outright.
     const state = getEncodingState(sessionKey, key);
-    const encoded = encodeForSave(content, state, { normalizeToUtf8: config.normalizeToUtf8 });
+
+    // A file that EXISTS but has no recorded encoding must not be written. The
+    // record is bounded (see `MAX_SESSIONS` / `MAX_FILES_PER_SESSION`), so it can
+    // be evicted while the file itself stays on disk — and `encodeForSave` reads a
+    // missing record as "new file", which means UTF-8. For a GBK or Big5 file
+    // that silently replaces every non-ASCII byte, and the reply shows nothing:
+    // measured, the whole-file diff comes back as `before: null`.
+    //
+    // The observation policy cannot catch this. It records "was this read?" in an
+    // unbounded WeakMap, so after an eviction the two records disagree in the
+    // dangerous direction: the policy still says `replaceIfVersion` (the write is
+    // allowed) while the plugin has forgotten the encoding. Refusing here is the
+    // only place the two can be reconciled, and `current` — the stat already taken
+    // in step 2 — is exactly the fact needed to tell an evicted record from a
+    // genuinely new file.
+    //
+    // Deliberately NOT exempting a caller-named encoding here. `tool-write`
+    // refuses `encoding` on an existing file before it ever calls this function,
+    // so by the time `newFileEncoding` is set the target is known to be absent —
+    // and if it appeared in the meantime, the `createIfAbsent` guard above
+    // rejects it. Measured: both paths (a file deleted after being read, and a
+    // file appearing between the tool's stat and this call) are refused by an
+    // earlier guard, so an exemption here would never change an outcome.
+    //
+    // This fires in two reachable situations, and the reply must not pretend they
+    // are one. (a) The record was evicted, or (b) the policy learned of the file
+    // from a tool this plugin does not own — `read_image` emits `fs/observed` for
+    // the bytes it attached, so a PNG the session "read" leaves the policy saying
+    // `replaceIfVersion` while the plugin holds nothing.
+    //
+    // The code stays `FS_NOT_OBSERVED`, the closest term in `dsh-fs`'s closed
+    // vocabulary (that set is the harness's, not this plugin's, so inventing a
+    // code here would put a name in a model-facing error that no other component
+    // understands). What the message must not do is repeat the old wording's two
+    // errors: it claimed the session had never read the file — untrue in case (b),
+    // where it read the bytes through another tool — and it advised "read the file
+    // again", which cannot be done for a binary file because this plugin's `read`
+    // refuses it with `E_NOT_TEXT`. The message therefore names what is actually
+    // missing (the ENCODING record) and states the condition under which the
+    // advice works.
+    if (state === undefined && current !== undefined) {
+      throw new FsError(
+        `cannot write "${checked.displayPath}": this session has no encoding record for it, ` +
+          `so the write would re-encode the whole file as UTF-8 and silently replace its ` +
+          `bytes. If it is a text file, read it first so the plugin learns its encoding, ` +
+          `then write. If it is not text, this plugin cannot rewrite it — use the tool that ` +
+          `handles its type.`,
+        "FS_NOT_OBSERVED",
+      );
+    }
+
+    const encoded = encodeForSave(content, state, {
+      normalizeToUtf8: config.normalizeToUtf8,
+      ...(req.newFileEncoding === undefined ? {} : { newFileEncoding: req.newFileEncoding }),
+    });
 
     // 4) Publish.
     await writeBytesAtomic(ctx.fs.processPath(checked), encoded.bytes);
