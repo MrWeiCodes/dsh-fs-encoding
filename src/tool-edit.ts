@@ -1,4 +1,4 @@
-/**
+﻿/**
  * The encoding-governed `edit` tool.
  *
  * Contract-compatible with the built-in `edit` (same `file_path` /
@@ -16,6 +16,7 @@ import { FsError } from "@deepseek-ai/dsh-fs";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolExecution } from "@deepseek-ai/dsh-tools";
 import { DecodeError, UnmappableError } from "./encoding-state.js";
+import { diffForResult, formatLineChangeSummary } from "./diff-hunks.js";
 import { readFile, writeFile } from "./io.js";
 import { toLF } from "./line-endings.js";
 import { EDIT_DESCRIPTION } from "./prompts.js";
@@ -110,15 +111,36 @@ export function buildEditTool(ctx: Context, sandbox: EncodingSandbox) {
         },
       },
       render: (args, value) => {
-        const v = value as { path: string };
+        const v = value as { path: string; before: string; after: string };
         const a = args as { replace_all?: boolean };
-        return [{ type: "text" as const, text: formatEditOutput(v.path, a.replace_all ?? false) }];
+        // The built-in message plus the size of the change, so the model can see
+        // how much it actually edited without re-reading the file. The counts are
+        // the REAL changed lines — context excluded — which is why they come from
+        // the shared analysis and not from the diff regions the UI renders.
+        //
+        // `diffForResult` is shared with `presentationMeta` below: the harness
+        // calls both for one result, and each would otherwise diff the whole file.
+        const summary = formatLineChangeSummary(
+          diffForResult(v, v.path, v.before, v.after).count,
+        );
+        return [
+          { type: "text" as const, text: `${formatEditOutput(v.path, a.replace_all ?? false)}${summary}` },
+        ];
       },
       presentationMeta: (args, value) => {
-        const v = value as { before: string; after: string };
-        const a = args as { file_path?: string };
+        const v = value as { path: string; before: string; after: string };
+        // Report the CHANGED REGIONS, not the whole file. The card counts every
+        // line of `oldText` as removed and every line of `newText` as added, so
+        // handing it the full texts made a one-line edit read as "changed 2,400
+        // lines" — which reads as the plugin having rewritten the file. See
+        // `computeHunkDiffs`.
+        //
+        // The path comes from the RESULT, not from `args.file_path`: the result
+        // is the path the edit actually ran against (it resolves the `path`
+        // alias too), and it is what `render` above stamps, so the card and the
+        // message cannot disagree.
         return {
-          diffs: [{ path: a.file_path ?? "", oldText: v.before, newText: v.after }],
+          diffs: diffForResult(v, v.path, v.before, v.after).diffs,
         };
       },
     },

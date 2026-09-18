@@ -1,4 +1,4 @@
-/**
+﻿/**
  * The encoding-governed `write` tool.
  *
  * Contract-compatible with the built-in `write` (same `file_path` / `content`
@@ -14,6 +14,7 @@ import { FsError } from "@deepseek-ai/dsh-fs";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolExecution } from "@deepseek-ai/dsh-tools";
 import { DecodeError, UnmappableError } from "./encoding-state.js";
+import { diffForResult, countLines, formatChangeParenthetical } from "./diff-hunks.js";
 import { normalizeEncoding, SUPPORTED_ENCODINGS_TEXT } from "./encoding.js";
 import { readFile, writeFile } from "./io.js";
 import { toLF } from "./line-endings.js";
@@ -21,11 +22,28 @@ import { WRITE_DESCRIPTION } from "./prompts.js";
 import type { EncodingSandbox, FsEscalationArgs } from "./sandbox.js";
 import { execCwd } from "./workspace-context.js";
 
-function formatWriteOutput(displayPath: string, operation: string): string {
+/**
+ * The built-in `write` result block, plus how much was written.
+ *
+ * The summary goes INSIDE the `<content>` element, which is what that element is
+ * for — appending it after `</content>` left it outside the block the built-in
+ * defines, which reads as stray text rather than part of the result.
+ *
+ * A creation reports a total and an update reports a delta, so the two are
+ * phrased differently on purpose: there is no before-side to subtract from for a
+ * file that did not exist, and "added 100, removed 0" would describe a diff that
+ * never happened.
+ *
+ * @param displayPath - the path as the model wrote it.
+ * @param operation - whether the file was created or replaced.
+ * @param summary - the line-count phrase, or `""` when there is nothing to add.
+ */
+function formatWriteOutput(displayPath: string, operation: string, summary: string): string {
+  const verb = operation === "create" ? "Created" : "Updated";
   return `<path>${displayPath}</path>
 <type>file</type>
 <content>
-${operation === "create" ? "Created" : "Updated"} file
+${verb} file${summary}
 </content>`;
 }
 
@@ -101,15 +119,38 @@ export function buildWriteTool(ctx: Context, sandbox: EncodingSandbox) {
         },
       },
       render: (_args, value) => {
-        const v = value as { path: string; operation: string };
-        return [{ type: "text" as const, text: formatWriteOutput(v.path, v.operation) }];
+        const v = value as { path: string; operation: string; before: string | null; after: string };
+        // The size of what was written, so the model can confirm its own edit
+        // without re-reading the file. A creation reports a total (there is no
+        // before-side to diff against); an update reports real changed lines,
+        // context excluded — see `diffForResult`.
+        //
+        // `before === null` means the presentation read of the previous content
+        // failed, NOT that the file was empty: `operation` is `"update"`, so the
+        // file exists (the tool stat'ed it). Diffing against `""` there would
+        // report the whole file as added and zero lines removed — a claim about
+        // content the tool never saw. It falls back to the creation wording, which
+        // says how much was written without asserting anything about the old side.
+        const summary =
+          v.operation === "create" || v.before === null
+            ? ` (${countLines(v.after)} line(s))`
+            : formatChangeParenthetical(diffForResult(v, v.path, v.before, v.after).count);
+        return [
+          { type: "text" as const, text: formatWriteOutput(v.path, v.operation, summary) },
+        ];
       },
-      presentationMeta: (args, value) => {
-        const v = value as { before: string | null; after: string };
-        const a = args as { file_path?: string };
+      presentationMeta: (_args, value) => {
+        const v = value as { path: string; before: string | null; after: string };
+        // A creation has nothing to diff against. `before === null` on an update
+        // is the failed-baseline case above: the previous content is unknown, so
+        // there is no honest diff to show and the card stays empty rather than
+        // claiming the whole file was added.
         if (v.before === null) return { diffs: [] };
+        // Changed regions only — the card counts every reported line, so the full
+        // texts would make any edit read as a whole-file rewrite. The path comes
+        // from the RESULT so the card and the message above cannot disagree.
         return {
-          diffs: [{ path: a.file_path ?? "", oldText: v.before, newText: v.after }],
+          diffs: diffForResult(v, v.path, v.before, v.after).diffs,
         };
       },
     },
