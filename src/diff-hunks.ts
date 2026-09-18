@@ -6,8 +6,8 @@
  * Reporting the whole file — which is what passing `before`/`after` straight
  * through does — makes a one-line edit read as "changed 2,400 lines", and the
  * user reasonably concludes the plugin rewrote their file. It did not; only the
- * card was wrong. This module produces the shape the built-ins produce, so the
- * count matches what actually changed.
+ * card was wrong. This module produces one hunk per changed region, so the count
+ * matches what actually changed.
  *
  * The harness uses the `diff` package's `structuredPatch`. This is a
  * self-contained equivalent for the one thing the cards need. Deliberately not
@@ -25,6 +25,12 @@
  * reported +97/-97 where the harness reports +21/-21 — the original complaint,
  * unfixed. Separating changes requires the actual LCS, so this computes one with
  * the Myers algorithm over lines.
+ *
+ * ## No context lines, unlike the harness — see {@link DIFF_CONTEXT}
+ *
+ * The harness emits 3 context lines per hunk. Copying that made every unchanged
+ * line render as BOTH a deletion and an addition, because `FileDiff` cannot mark
+ * a line as context. This module emits the changed lines only.
  *
  * ## The trailing newline belongs to the last line
  *
@@ -47,8 +53,34 @@
  * @module dsh-fs-encoding/diff-hunks
  */
 
-/** Context lines kept on each side of a change, matching the built-ins. */
-export const DIFF_CONTEXT = 3;
+/**
+ * Context lines kept on each side of a change. Deliberately ZERO.
+ *
+ * The harness's own `DIFF_CONTEXT` is 3, and copying that number is what this
+ * module did first. It is wrong HERE, because the harness's context lines are
+ * never rendered as context: `FileDiff` carries only `oldText` and `newText`, and
+ * the UI's `diffRows` pushes every line of `oldText` as a `del` row and every
+ * line of `newText` as an `add` row, with no per-line alignment and no notion of
+ * an unchanged line. So each context line is shown TWICE — once as removed, once
+ * as added — and a one-line edit renders as "deleted 7, added 7".
+ *
+ * Measured on the real card: editing one line of a 9,441-line file with
+ * `DIFF_CONTEXT = 3` displayed six unchanged lines under `-` and the same six
+ * again under `+`, with the card totalling `+7 -7` while the message said
+ * `Added 1 line(s), removed 1 line(s)`.
+ *
+ * Zero is also what the harness's own CALL-time presenter does: `presentCall`
+ * puts `old_string`/`new_string` straight into `oldText`/`newText` — pure changed
+ * lines, no context — which is the semantics this structure actually has. The
+ * harness's `computeHunkDiffs` added context for the result card without the UI
+ * ever learning to render it, so the two disagree; this module follows the
+ * structure rather than the mismatch.
+ *
+ * The cost is real and accepted: the card no longer shows the neighbourhood of a
+ * change. The counts are now honest and match the message, which is what a reader
+ * checks first, and the surrounding lines are one `read` away.
+ */
+export const DIFF_CONTEXT = 0;
 
 /**
  * Largest edit distance this module will search for.
@@ -116,6 +148,59 @@ export interface FileDiff {
  */
 function toCardLine(line: string): string {
   return line.endsWith("\n") ? line.slice(0, -1) : line;
+}
+
+/**
+ * Join a region's lines into the text the card carries.
+ *
+ * `join("\n")` alone is not reversible by the UI's splitter, which reads a
+ * trailing newline as the terminator of the line before it rather than as a line
+ * of its own: `(t.endsWith("\n") ? t.slice(0, -1) : t).split("\n")`. A region
+ * that ENDS in a blank line therefore comes back one line short, and a region
+ * that is nothing BUT a blank line comes back as zero lines — `""` splits into no
+ * lines at all.
+ *
+ * This used to be rare rather than impossible: a region carried context lines, so
+ * it usually held a non-blank line, but an edit that only removed blank lines
+ * could already come back one row short. With {@link DIFF_CONTEXT} at 0 a region
+ * is exactly the changed lines, so a blank line is an ordinary region — and an edit
+ * that only inserts one reached the card as `{ oldText: null, newText: "" }`: a card
+ * with no body reading `+0 -0` while the message said `Added 1 line(s)`. Writing the
+ * trailing newline out explicitly makes the round trip exact, so the card counts the
+ * same lines the message reports.
+ *
+ * @param lines - the region's lines, without their newlines.
+ * @returns the region's text; `""` only for an empty region.
+ */
+function joinRegion(lines: readonly string[]): string {
+  if (lines.length === 0) return "";
+  const text = lines.join("\n");
+  // A blank last line is invisible in `text` itself: `["a", ""]` joins to `"a\n"`,
+  // which the card splits back into one line. The extra newline is what makes that
+  // blank line a line again.
+  return lines[lines.length - 1] === "" ? `${text}\n` : text;
+}
+
+/**
+ * A whole-file region for the degraded path, measured the way {@link countLines}
+ * measures the same text.
+ *
+ * The counts on this path ARE `countLines`, so the region has to render exactly
+ * that many rows or the card and the message disagree. `joinRegion` already makes a
+ * region round-trip through the card's splitter, which leaves one gap: text that is
+ * nothing but a single newline. `countLines("\n")` is 0 — the same rule that makes
+ * `read` report `totalLines: 0` — while the splitter sees one blank row in it.
+ * Reporting the region as `null` for that case keeps the card at `+0/-0`, matching
+ * the message; every other text (`"\n\n"` is 2 lines to both) passes through as it
+ * is. `null` is the shape that already means "no lines on this side", which is what
+ * a pure insertion uses and what the UI reads as "nothing was removed".
+ *
+ * @param lines - the side's lines as {@link toLines} produced them.
+ * @returns the region's text, or `null` when `countLines` sees no lines in it.
+ */
+function countedRegion(lines: readonly string[]): string | null {
+  const text = joinRegion(lines.map(toCardLine));
+  return countLines(text) > 0 ? text : null;
 }
 
 /**
@@ -319,12 +404,15 @@ function analyze(path: string, before: string, after: string): DiffResult {
       // `write` result block, but `toLines` sees one line carrying that newline).
       // Reporting the raw array length here would make a rewrite of such a file
       // claim one removed line where every other path says zero.
+      //
+      // The regions follow the same rule — see {@link countedRegion} — so the card
+      // and the message agree on this text too.
       count: { added: countLines(after), removed: countLines(before) },
       diffs: [
         {
           path,
-          oldText: oldLines.length > 0 ? oldLines.map(toCardLine).join("\n") : null,
-          newText: newLines.map(toCardLine).join("\n"),
+          oldText: countedRegion(oldLines),
+          newText: countedRegion(newLines) ?? "",
         },
       ],
     };
@@ -333,8 +421,11 @@ function analyze(path: string, before: string, after: string): DiffResult {
   let added = 0;
   let removed = 0;
 
-  // Group the script into runs of changes separated by more than 2*CONTEXT
-  // unchanged lines. `script` is in file order, so a single pass suffices.
+  // Group the script into runs of changes separated by unchanged lines. With
+  // {@link DIFF_CONTEXT} at 0 that is simply "one region per changed run", but the
+  // grouping stays written in terms of the constant so the rule is visible rather
+  // than implied; see the constant for why it is 0 and what restoring context
+  // would mean.
   const diffs: FileDiff[] = [];
   let i = 0;
   while (i < script.length) {
@@ -343,7 +434,11 @@ function analyze(path: string, before: string, after: string): DiffResult {
       continue;
     }
 
-    // Start of a changed region. Take CONTEXT lines of leading context.
+    // Start of a changed region. Take CONTEXT lines of leading context — none of
+    // the expressions below move while `DIFF_CONTEXT` is 0, which is the intended
+    // behaviour and not an oversight: `regionStart` is `i`, `leading` is empty and
+    // the trailing slice takes nothing. They are kept as written so the constant
+    // remains the one place the policy lives.
     const regionStart = Math.max(0, i - DIFF_CONTEXT);
     const leading = script.slice(regionStart, i);
 
@@ -394,8 +489,14 @@ function analyze(path: string, before: string, after: string): DiffResult {
 
     diffs.push({
       path,
-      oldText: oldRegion.length > 0 ? oldRegion.join("\n") : null,
-      newText: newRegion.join("\n"),
+      // `joinRegion`, not `countedRegion`: these lines ARE the change, so an edit
+      // that only inserts a blank line has to reach the card as that blank line.
+      // Dropping it would leave the card at `+0 -0` beside a message saying
+      // `Added 1 line(s)`. The degraded path above filters instead because its counts
+      // are `countLines`, which reports no lines at all for text that is a single
+      // newline — a rule this path's edit-script counts do not share.
+      oldText: oldRegion.length > 0 ? joinRegion(oldRegion) : null,
+      newText: joinRegion(newRegion),
     });
     i = j;
   }
@@ -406,9 +507,10 @@ function analyze(path: string, before: string, after: string): DiffResult {
 /**
  * Compute one {@link FileDiff} per changed region between `before` and `after`.
  *
- * Regions separated by more than {@link DIFF_CONTEXT} unchanged lines become
- * separate diffs, matching the built-ins; a region carries the changed lines plus
- * up to {@link DIFF_CONTEXT} unchanged lines on each side.
+ * With {@link DIFF_CONTEXT} at 0 that is one region per run of changed lines —
+ * deliberately NOT the built-ins' shape, which keeps 3 context lines per hunk and
+ * which the card cannot render as context (see the constant). Regions carry the
+ * changed lines only, so the card counts exactly the lines the message reports.
  *
  * A change whose edit distance exceeds {@link MAX_EDIT_DISTANCE} is reported as a
  * single whole-file diff. That is the honest answer — the file really was
@@ -435,12 +537,13 @@ export interface LineChangeCount {
 /**
  * Count the lines a change actually added and removed.
  *
- * Deliberately separate from {@link computeHunkDiffs}: that returns the regions
- * the UI renders, and every region carries up to {@link DIFF_CONTEXT} unchanged
- * lines on each side for readability. Counting THOSE lines would report a
- * one-line edit as "added 7, removed 7" — the same class of inflation as the
- * whole-file diff bug, just smaller. The number reported to the model has to be
- * the real edit, so this counts the edit script's inserts and removes only.
+ * Kept separate from {@link computeHunkDiffs} because the two answer different
+ * questions — this one counts the edit script's inserts and removes, that one
+ * returns the regions to render — and not because the numbers differ: with
+ * {@link DIFF_CONTEXT} at 0 a region holds exactly the changed lines, so both
+ * surfaces report the same totals. Counting the regions would have inflated a
+ * one-line edit to "added 7, removed 7" back when they carried context lines, the
+ * same class of inflation as the whole-file diff bug, just smaller.
  *
  * A line that changed in place counts once on each side, which is what a reader
  * expects from "added 1, removed 1" for a one-line edit.
@@ -513,7 +616,7 @@ export function countLines(text: string): number {
 export interface DiffResult {
   /** The real added/removed counts, context excluded. */
   count: LineChangeCount;
-  /** The changed regions the card renders, context included. */
+  /** The changed regions the card renders — the changed lines only, no context. */
   diffs: FileDiff[];
 }
 

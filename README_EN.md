@@ -83,11 +83,17 @@ The accepted names are the same as `read`'s, and aliases and case are insensitiv
 >
 > Note: the built-in `read` / `write` / `edit` live on an outer host/preset layer and are **not** a conflict — shadowing them on the agent's own layer is exactly what this plugin does, matching how the native tools shadow each other.
 
-### Option 1: let the AI install (easiest)
+### Option 1: install from the plugin market (dsh-market, recommended)
+
+If you already have [dsh-market](https://github.com/dsh-market/dsh-market) (the DSH plugin market): open **Settings → Plugin Market**, search for `dsh-fs-encoding`, click **Install** on the card and confirm, then restart `dsh web`.
+
+Market card: <https://awesome-dsh-plugin.com/p/MrWeiCodes/dsh-fs-encoding/>
+
+### Option 2: let the AI install (easiest)
 
 Just give your DSH AI assistant the repository URL, e.g. "install the plugin https://github.com/MrWeiCodes/dsh-fs-encoding". The AI handles plugin loading, dependencies and the patch for you; then restart `dsh web`.
 
-### Option 2: install from npm (recommended)
+### Option 3: install from npm (recommended)
 
 ```powershell
 dsh plugin --profile web add dsh-fs-encoding
@@ -95,17 +101,17 @@ dsh plugin --profile web add dsh-fs-encoding
 
 **Why this is the recommended path**: the npm package already ships the compiled `lib/`, so the install runs no build scripts at all — unaffected by pnpm's build-script gate, and independent of your local build environment. Then restart `dsh web`.
 
-### Option 3: install from GitHub
+### Option 4: install from GitHub
 
 ```powershell
 dsh plugin --profile web add -w github:MrWeiCodes/dsh-fs-encoding
 ```
 
-A GitHub install fetches the sources, so `lib/` is compiled on the spot by the `prepare` script — which means **you may need to allow build scripts** in the profile's `pnpm-workspace.yaml` (pnpm 10 and later blocks dependency build scripts by default; paste the line it prints and re-run). **If you would rather skip that, use Option 2** — the npm package already contains the compiled output and has no such step.
+A GitHub install fetches the sources, so `lib/` is compiled on the spot by the `prepare` script — which means **you may need to allow build scripts** in the profile's `pnpm-workspace.yaml` (pnpm 10 and later blocks dependency build scripts by default; paste the line it prints and re-run). **If you would rather skip that, use Option 3** — the npm package already contains the compiled output and has no such step.
 
-> **Known issue with local-directory installs**: on Windows, if the plugin directory and the profile are on **different drives** (e.g. plugin on `G:\`, profile on `C:\`), pnpm mis-resolves the `file:` dependency to `C:\Users\<username>\...` and the install fails. Use **Option 4** instead.
+> **Known issue with local-directory installs**: on Windows, if the plugin directory and the profile are on **different drives** (e.g. plugin on `G:\`, profile on `C:\`), pnpm mis-resolves the `file:` dependency to `C:\Users\<username>\...` and the install fails. Use **Option 5** instead.
 
-### Option 4: manual installation
+### Option 5: manual installation
 
 Fallback for environments without pnpm or for offline use:
 
@@ -126,13 +132,14 @@ Fallback for environments without pnpm or for offline use:
 
 ## Updating
 
-- **Installed via Option 1 (AI)**: just tell your AI assistant "update the dsh-fs-encoding plugin".
-- **Installed via Option 2 (npm)**:
+- **Installed via Option 1 (plugin market)**: update from the plugin market card.
+- **Installed via Option 2 (AI)**: just tell your AI assistant "update the dsh-fs-encoding plugin".
+- **Installed via Option 3 (npm)**:
   ```powershell
   dsh plugin --profile web add dsh-fs-encoding@latest
   ```
   Then restart `dsh web`. The npm path involves no build step either.
-- **Installed via Option 3 (GitHub)**:
+- **Installed via Option 4 (GitHub)**:
   ```powershell
   dsh plugin --profile web add -w github:MrWeiCodes/dsh-fs-encoding
   ```
@@ -141,8 +148,8 @@ Fallback for environments without pnpm or for offline use:
   dsh plugin --profile web remove dsh-fs-encoding
   dsh plugin --profile web add -w github:MrWeiCodes/dsh-fs-encoding
   ```
-  Then restart `dsh web`. **The commit hash changes with the new commit**, so if pnpm asks you to allow build scripts again, redo the step described under Option 3.
-- **Installed via Option 4 (manual)**:
+  Then restart `dsh web`. **The commit hash changes with the new commit**, so if pnpm asks you to allow build scripts again, redo the step described under Option 4.
+- **Installed via Option 5 (manual)**:
   ```powershell
   cd "$HOME\.dsh\profiles\web\packages\dsh-fs-encoding"
   git pull            # or re-copy the new version over the old files
@@ -154,11 +161,15 @@ Your configuration (`$DSH_HOME/plugins/dsh-fs-encoding/config.yaml`) is preserve
 
 ## Uninstallation
 
-### Installed via Option 1 (AI): let the AI uninstall
+### Installed via Option 1 (plugin market): uninstall from the plugin market
+
+Open **Settings → Plugin Market**, click **Uninstall** on the dsh-fs-encoding card (two-step confirmation); the plugin is removed immediately.
+
+### Installed via Option 2 (AI): let the AI uninstall
 
 Just tell your AI assistant "uninstall the dsh-fs-encoding plugin"; the AI removes the plugin and cleans up the patch and dependencies.
 
-### Installed via Option 2 (npm) / Option 3 (GitHub)
+### Installed via Option 3 (npm) / Option 4 (GitHub)
 
 ```powershell
 dsh plugin --profile web remove dsh-fs-encoding
@@ -166,7 +177,7 @@ dsh plugin --profile web remove dsh-fs-encoding
 
 Then restart `dsh web`. The built-in `read` / `write` / `edit` come back immediately — nothing else to do.
 
-### Installed via Option 4 (manual)
+### Installed via Option 5 (manual)
 
 1. Remove this plugin's `insert` row from your profile's `cordis.patch.yml`.
 2. Remove `"dsh-fs-encoding": ...` from the `dependencies` of the profile's `package.json`.
@@ -175,8 +186,8 @@ Then restart `dsh web`. The built-in `read` / `write` / `edit` come back immedia
 ### Leftover locations (cleanup checklist for the AI)
 
 - **Config directory**: `$DSH_HOME/plugins/dsh-fs-encoding/` — `$DSH_HOME` defaults to `~/.dsh` (`C:\Users\<username>\.dsh` on Windows); the plugin's `config.yaml` lives here. Uninstallation does not delete it automatically; delete the whole directory manually for a complete cleanup.
-- **Plugin directory** (Option 4 installs): `$DSH_HOME/profiles/<profile>/packages/dsh-fs-encoding/`.
-- **Dependency & patch** (Option 4 installs): the `"dsh-fs-encoding": ...` dependency in the profile's `package.json`, and the `insert` row in `cordis.patch.yml`.
+- **Plugin directory** (Option 5 installs): `$DSH_HOME/profiles/<profile>/packages/dsh-fs-encoding/`.
+- **Dependency & patch** (Option 5 installs): the `"dsh-fs-encoding": ...` dependency in the profile's `package.json`, and the `insert` row in `cordis.patch.yml`.
 - No global registry, npm global packages, or system-level writes; the plugin writes no events of its own into session logs.
 
 ## Configuration

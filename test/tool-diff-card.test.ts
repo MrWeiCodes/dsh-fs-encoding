@@ -64,10 +64,24 @@ describe("tool presentationMeta reports changed regions only", () => {
     );
 
     const { added, removed } = uiCount(diffs);
-    // The regression: this used to be 2400/2400.
-    expect(removed).toBe(7);
-    expect(added).toBe(7);
+    // Two regressions in one number: the whole file (2400/2400) and the context
+    // lines (7/7) are both gone. The card now shows the changed line only.
+    expect(removed).toBe(1);
+    expect(added).toBe(1);
     expect(diffs[0]!.path).toBe("WeiPicSc.h");
+  });
+
+  it("edit: an unchanged line never reaches the card", () => {
+    // `FileDiff` cannot mark a line as context, so any context line would render
+    // as a deletion AND an addition. The card must contain only changed lines.
+    const { edit } = makeTools();
+    const before = mk(2400);
+    const after = before.replace("line 1200", "LINE 1200");
+
+    const diffs = metaOf(edit, { file_path: "f.txt" }, { path: "f.txt", before, after });
+
+    expect(diffs[0]!.oldText).toBe("line 1200");
+    expect(diffs[0]!.newText).toBe("LINE 1200");
   });
 
   it("write: a one-line change in a long file is not a whole-file diff", () => {
@@ -81,7 +95,7 @@ describe("tool presentationMeta reports changed regions only", () => {
       { path: "WeiPicSc.h", operation: "update", before, after },
     );
 
-    expect(uiCount(diffs)).toEqual({ added: 7, removed: 7 });
+    expect(uiCount(diffs)).toEqual({ added: 1, removed: 1 });
   });
 
   it("write: a created file reports no diffs", () => {
@@ -105,7 +119,7 @@ describe("tool presentationMeta reports changed regions only", () => {
     const diffs = metaOf(edit, { file_path: "f.txt" }, { path: "f.txt", before, after });
 
     expect(diffs).toHaveLength(3);
-    expect(uiCount(diffs)).toEqual({ added: 21, removed: 21 });
+    expect(uiCount(diffs)).toEqual({ added: 3, removed: 3 });
   });
 
   it("edit: an unchanged file reports no diffs", () => {
@@ -136,8 +150,9 @@ describe("the message the model sees carries the size of the change", () => {
     );
   });
 
-  it("edit: counts the real edit, not the context the card renders", () => {
-    // The number must NOT match the UI card's line count, which includes context.
+  it("edit: the card and the message report the same number", () => {
+    // The whole point of dropping context: both surfaces now describe the same
+    // change, so a reader never sees "Added 1 line(s)" beside a card claiming 7.
     const { edit } = makeTools();
     const before = mk(2400);
     const after = before.replace("line 1200", "LINE 1200");
@@ -147,7 +162,7 @@ describe("the message the model sees carries the size of the change", () => {
     const cardLines = diffs[0]!.oldText!.split("\n").length;
 
     expect(text).toContain("Added 1 line(s), removed 1 line(s).");
-    expect(cardLines).toBe(7);
+    expect(cardLines).toBe(1);
   });
 
   it("edit: preserves the replace_all wording", () => {
@@ -257,6 +272,7 @@ describe("the card and the message share one diff", () => {
     // The harness calls `render` then `presentationMeta` for one result. Deriving
     // them from two independent diffs is both wasted work and a chance for the
     // card and the message to disagree; `diffForResult` memoizes per result.
+    // With no context lines the two numbers are now the same one.
     const { edit } = makeTools();
     const before = mk(400);
     const after = before.replace("line 200", "LINE 200");
@@ -266,7 +282,7 @@ describe("the card and the message share one diff", () => {
     const diffs = metaOf(edit, { file_path: "f.txt" }, value);
 
     expect(text).toContain("Added 1 line(s), removed 1 line(s).");
-    expect(uiCount(diffs)).toEqual({ added: 7, removed: 7 });
+    expect(uiCount(diffs)).toEqual({ added: 1, removed: 1 });
   });
 
   it("edit: the card is stamped with the path the edit ran against", () => {

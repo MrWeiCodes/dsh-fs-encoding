@@ -2,12 +2,13 @@
  * `countLineChanges` / `formatLineChangeSummary` / `countLines` — the numbers
  * reported to the MODEL.
  *
- * These are deliberately separate from the numbers the UI renders. A diff region
- * carries up to `DIFF_CONTEXT` unchanged lines on each side so a human can read
- * it; counting those would report a one-line edit as "added 7, removed 7". The
- * model's summary has to be the real edit, so it is counted from the edit script
- * with the context excluded. The tests below pin that distinction: the same input
- * produces 7 lines in the UI card and 1 added / 1 removed in the message.
+ * A diff region now carries the changed lines only, so the card and the message
+ * report the same totals; the tests below pin that agreement. (Regions used to
+ * carry `DIFF_CONTEXT` unchanged lines on each side so a human could read the
+ * change in place, which made the same input produce 7 lines in the UI card and
+ * 1 added / 1 removed in the message. `FileDiff` cannot mark a line as context, so
+ * the card rendered those lines as a deletion AND an addition — see
+ * `src/diff-hunks.ts`.)
  */
 
 import { describe, expect, it } from "vitest";
@@ -23,15 +24,15 @@ const mk = (n: number) => Array.from({ length: n }, (_, i) => `line ${i + 1}`).j
 
 describe("countLineChanges", () => {
   it("counts a one-line replacement as one added and one removed", () => {
-    // The distinction that matters: the UI card shows 7 lines for this input
-    // (the change plus context), the message must say 1 and 1.
+    // The card and the message must agree on this input: 1 added, 1 removed.
     const before = mk(2400);
     const after = before.replace("line 1200", "LINE 1200");
 
     expect(countLineChanges(before, after)).toEqual({ added: 1, removed: 1 });
 
+    // The card carries the same single line — no context — so the two agree.
     const cardLines = computeHunkDiffs("f.txt", before, after)[0]!;
-    expect(cardLines.oldText!.split("\n")).toHaveLength(7);
+    expect(cardLines.oldText!.split("\n")).toHaveLength(1);
   });
 
   it("reports nothing for identical texts", () => {

@@ -83,11 +83,17 @@ write({ file_path: "run.bat", content: "echo 中文\r\n", encoding: "gbk" })
 >
 > 注意：内建 `read` / `write` / `edit` 位于更外层的宿主／preset 层，**不构成冲突**——本插件正是要在 agent 自己的层上覆盖它们，这与原生工具的 shadow 机制一致。
 
-### 方式一：让 AI 安装（最简单）
+### 方式一：插件市场安装（dsh-market，推荐）
+
+已安装 [dsh-market](https://github.com/dsh-market/dsh-market)（DSH 插件市场）的用户：打开 **设置 → 插件市场（Plugin Market）**，搜索 `dsh-fs-encoding`，点卡片上的「安装」并按提示确认，安装完成后**重启 `dsh web`**。
+
+市场卡片：<https://awesome-dsh-plugin.com/p/MrWeiCodes/dsh-fs-encoding/>
+
+### 方式二：让 AI 安装（最简单）
 
 把本仓库地址告诉 DSH 的 AI 助手即可，例如：「安装 https://github.com/MrWeiCodes/dsh-fs-encoding 这个插件」。AI 会替你完成插件装载、依赖与补丁处理；之后重启 `dsh web`。
 
-### 方式二：从 npm 安装（推荐）
+### 方式三：从 npm 安装（推荐）
 
 ```powershell
 dsh plugin --profile web add dsh-fs-encoding
@@ -95,17 +101,17 @@ dsh plugin --profile web add dsh-fs-encoding
 
 **推荐这条路径的原因**：npm 包里已包含编译好的 `lib/`，安装时不执行任何构建脚本——不受 pnpm 构建授权限制的影响，也不依赖你本地的编译环境。之后重启 `dsh web`。
 
-### 方式三：从 GitHub 安装
+### 方式四：从 GitHub 安装
 
 ```powershell
 dsh plugin --profile web add -w github:MrWeiCodes/dsh-fs-encoding
 ```
 
-从 GitHub 装的是源码，`lib/` 由 `prepare` 脚本现场编译，所以**装完可能需要在 profile 的 `pnpm-workspace.yaml` 里放行构建脚本**（pnpm 10 起默认阻止依赖执行构建脚本，按它打印的提示把那一行粘进去再重跑即可）。**不想处理这一步就用「方式二」**——npm 包已包含编译产物，没有这个环节。
+从 GitHub 装的是源码，`lib/` 由 `prepare` 脚本现场编译，所以**装完可能需要在 profile 的 `pnpm-workspace.yaml` 里放行构建脚本**（pnpm 10 起默认阻止依赖执行构建脚本，按它打印的提示把那一行粘进去再重跑即可）。**不想处理这一步就用「方式三」**——npm 包已包含编译产物，没有这个环节。
 
-> **从本地目录安装的已知问题**：Windows 上若插件目录与 profile **不在同一个盘符**（例如插件在 `G:\`、profile 在 `C:\`），pnpm 会把 `file:` 依赖错误解析成 `C:\Users\<用户名>\...` 而安装失败。此时请改用「方式四」。
+> **从本地目录安装的已知问题**：Windows 上若插件目录与 profile **不在同一个盘符**（例如插件在 `G:\`、profile 在 `C:\`），pnpm 会把 `file:` 依赖错误解析成 `C:\Users\<用户名>\...` 而安装失败。此时请改用「方式五」。
 
-### 方式四：手动安装
+### 方式五：手动安装
 
 无 pnpm 或离线环境时的备选路径：
 
@@ -126,13 +132,14 @@ dsh plugin --profile web add -w github:MrWeiCodes/dsh-fs-encoding
 
 ## 更新
 
-- **方式一（AI 安装）的**：直接告诉 AI「更新 dsh-fs-encoding 插件」即可。
-- **方式二（npm 安装）的**：
+- **方式一（插件市场安装）的**：在插件市场里点更新即可。
+- **方式二（AI 安装）的**：直接告诉 AI「更新 dsh-fs-encoding 插件」即可。
+- **方式三（npm 安装）的**：
   ```powershell
   dsh plugin --profile web add dsh-fs-encoding@latest
   ```
   然后重启 `dsh web`。npm 路径同样不涉及构建步骤。
-- **方式三（GitHub 安装）的**：
+- **方式四（GitHub 安装）的**：
   ```powershell
   dsh plugin --profile web add -w github:MrWeiCodes/dsh-fs-encoding
   ```
@@ -141,8 +148,8 @@ dsh plugin --profile web add -w github:MrWeiCodes/dsh-fs-encoding
   dsh plugin --profile web remove dsh-fs-encoding
   dsh plugin --profile web add -w github:MrWeiCodes/dsh-fs-encoding
   ```
-  然后重启 `dsh web`。**更新到新提交后 commit 号会变**，若 pnpm 再次要求放行构建，按方式三的说明重做一次即可。
-- **方式四（手动）安装的**：
+  然后重启 `dsh web`。**更新到新提交后 commit 号会变**，若 pnpm 再次要求放行构建，按方式四的说明重做一次即可。
+- **方式五（手动）安装的**：
   ```powershell
   cd "$HOME\.dsh\profiles\web\packages\dsh-fs-encoding"
   git pull            # 或重新拷贝新版本覆盖
@@ -154,11 +161,15 @@ dsh plugin --profile web add -w github:MrWeiCodes/dsh-fs-encoding
 
 ## 卸载
 
-### 方式一（AI 安装）的：让 AI 卸载
+### 方式一（插件市场安装）的：插件市场卸载
+
+打开 **设置 → 插件市场**，在 dsh-fs-encoding 卡片上点「卸载」（两步确认），本会话安装的插件会即时移除。
+
+### 方式二（AI 安装）的：让 AI 卸载
 
 直接告诉 AI 助手「卸载 dsh-fs-encoding 插件」，AI 会移除插件、清理补丁与依赖。
 
-### 方式二（npm）／方式三（GitHub）安装的
+### 方式三（npm）／方式四（GitHub）安装的
 
 ```powershell
 dsh plugin --profile web remove dsh-fs-encoding
@@ -166,7 +177,7 @@ dsh plugin --profile web remove dsh-fs-encoding
 
 然后重启 `dsh web`。原生的 `read` / `write` / `edit` 会立刻恢复，无需任何额外操作。
 
-### 方式四（手动）安装的
+### 方式五（手动）安装的
 
 1. 从 profile 的 `cordis.patch.yml` 中删除本插件的 `insert` 行。
 2. 从 profile 的 `package.json` 的 `dependencies` 中删除 `"dsh-fs-encoding": ...`。
@@ -175,8 +186,8 @@ dsh plugin --profile web remove dsh-fs-encoding
 ### 残留位置清单（AI 卸载时按此清理）
 
 - **配置目录**：`$DSH_HOME/plugins/dsh-fs-encoding/`——`$DSH_HOME` 默认是 `~/.dsh`（Windows 下 `C:\Users\<用户名>\.dsh`），插件的 `config.yaml` 保存在这里。卸载不会自动删除，如需彻底清理请手动删除整个目录。
-- **插件目录**（方式四安装时）：`$DSH_HOME/profiles/<profile>/packages/dsh-fs-encoding/`。
-- **依赖与补丁**（方式四安装时）：profile 的 `package.json` 中的 `"dsh-fs-encoding": ...` 依赖、`cordis.patch.yml` 中的 `insert` 行。
+- **插件目录**（方式五安装时）：`$DSH_HOME/profiles/<profile>/packages/dsh-fs-encoding/`。
+- **依赖与补丁**（方式五安装时）：profile 的 `package.json` 中的 `"dsh-fs-encoding": ...` 依赖、`cordis.patch.yml` 中的 `insert` 行。
 - 无全局注册表、npm 全局包或系统级写入；插件不在会话日志里写入任何自有事件。
 
 ## 配置
