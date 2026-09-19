@@ -18,6 +18,7 @@ import type { ToolExecution } from "@deepseek-ai/dsh-tools";
 import { DecodeError, UnmappableError } from "./encoding-state.js";
 import { diffForResult, formatLineChangeSummary } from "./diff-hunks.js";
 import { readFile, writeFile } from "./io.js";
+import { countOccurrences } from "./line-edit.js";
 import { toLF } from "./line-endings.js";
 import { EDIT_DESCRIPTION } from "./prompts.js";
 import type { EncodingSandbox, FsEscalationArgs } from "./sandbox.js";
@@ -53,18 +54,6 @@ function parseArgs(args: Record<string, unknown>): {
     throw new Error('[E_BAD_PAYLOAD] edit: "replace_all" must be a boolean.');
   }
   return { path, oldString, newString, replaceAll: rawReplaceAll === true };
-}
-
-function countOccurrences(haystack: string, needle: string): number {
-  if (needle.length === 0) return 0;
-  let count = 0;
-  let from = 0;
-  for (;;) {
-    const at = haystack.indexOf(needle, from);
-    if (at === -1) return count;
-    count += 1;
-    from = at + needle.length;
-  }
 }
 
 /**

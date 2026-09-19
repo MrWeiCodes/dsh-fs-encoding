@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Assembly tests: the plugin's `apply()` and its per-agent install.
  *
  * The tool bodies are covered by `roundtrip.test.ts`; this file covers what
@@ -23,6 +23,22 @@ import { bindScopeParent, createScope, scopeOf } from "@deepseek-ai/dsh-scope";
 import { CANONICAL_ENCODINGS, normalizeEncoding } from "../src/encoding.js";
 import { DecodeError, decodeForOpen } from "../src/encoding-state.js";
 import { apply, inject, name } from "../src/index.js";
+
+/**
+ * Every tool name one install registers, sorted.
+ *
+ * Kept in one place so adding a tool updates one line instead of five
+ * assertions. The first three shadow the built-ins; `insert` has no built-in
+ * counterpart, and `str_replace_editor` is mounted only by the headless / SDK /
+ * ACP profiles, so in a web profile it is a new name too.
+ */
+const REGISTERED_TOOL_NAMES = [
+  "edit",
+  "insert",
+  "read",
+  "str_replace_editor",
+  "write",
+];
 
 interface Harness {
   /** The agent-shaped object `agent/session-start` carries. */
@@ -176,7 +192,7 @@ describe("apply", () => {
 
     root.emit("agent/session-start", { agent: h.agent } as never);
 
-    expect(h.registeredNames().sort()).toEqual(["edit", "read", "write"]);
+    expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
     // And they are visible through the same registry the model's list comes
     // from — read through the agent's scope, since a per-agent shadow is
     // deliberately invisible in the global view.
@@ -196,7 +212,7 @@ describe("apply", () => {
     // registry rejects outright — so this emit must be a no-op, not a throw.
     expect(() => root.emit("agent/session-start", { agent: h.agent } as never)).not.toThrow();
 
-    expect(h.registeredNames().sort()).toEqual(["edit", "read", "write"]);
+    expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
   });
 
   it("installs for a second agent without disturbing the first", () => {
@@ -237,7 +253,7 @@ describe("apply", () => {
     const h = makeAgent(root, "agent-1", { presetKey });
     root.emit("agent/session-start", { agent: h.agent } as never);
 
-    expect(h.registeredNames().sort()).toEqual(["edit", "read", "write"]);
+    expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
     expect(logger.error).not.toHaveBeenCalled();
     // And the agent resolves OUR definitions, not the inherited ones.
     expect(paramsOf(h.agent.ctx, "read")["encoding"]).toBeDefined();
@@ -260,7 +276,7 @@ describe("apply", () => {
     const h = makeAgent(root);
     root.emit("agent/session-start", { agent: h.agent } as never);
 
-    expect(h.registeredNames().sort()).toEqual(["edit", "read", "write"]);
+    expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
     expect(logger.error).not.toHaveBeenCalled();
   });
 
@@ -403,7 +419,42 @@ describe("apply", () => {
     const h = makeAgent(root);
     root.emit("agent/session-start", { agent: h.agent } as never);
 
-    expect(h.registeredNames().sort()).toEqual(["edit", "read", "write"]);
+    expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
+  });
+
+  it("refuses the install when another plugin holds str_replace_editor", () => {
+    // The added names participate in the conflict check exactly like the
+    // shadowed ones: registering a name twice on a layer throws, whoever wants it.
+    const root = makeHost();
+    apply(root);
+    const h = makeAgent(root);
+    h.agent.ctx.tools.register(stubTool("str_replace_editor", "someone else's"));
+
+    const logger = { error: vi.fn(), warn: vi.fn() };
+    (root as unknown as { logger: unknown }).logger = logger;
+
+    root.emit("agent/session-start", { agent: h.agent } as never);
+
+    // Only the foreign tool remains — ours were rolled back.
+    expect(h.registeredNames().sort()).toEqual(["str_replace_editor"]);
+    expect(logger.error).toHaveBeenCalledOnce();
+    expect(logger.error.mock.calls[0]![0] as string).toContain('"str_replace_editor"');
+  });
+
+  it("refuses the install when another plugin holds insert", () => {
+    const root = makeHost();
+    apply(root);
+    const h = makeAgent(root);
+    h.agent.ctx.tools.register(stubTool("insert", "someone else's"));
+
+    const logger = { error: vi.fn(), warn: vi.fn() };
+    (root as unknown as { logger: unknown }).logger = logger;
+
+    root.emit("agent/session-start", { agent: h.agent } as never);
+
+    expect(h.registeredNames().sort()).toEqual(["insert"]);
+    expect(logger.error).toHaveBeenCalledOnce();
+    expect(logger.error.mock.calls[0]![0] as string).toContain('"insert"');
   });
 
   it("does not need any inventory service to detect the conflict", () => {

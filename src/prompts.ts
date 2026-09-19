@@ -56,6 +56,72 @@ export const EDIT_DESCRIPTION =
   "encoding and line endings exactly. By default `old_string` must appear exactly " +
   "once; set `replace_all` to replace every occurrence.";
 
+export const INSERT_DESCRIPTION =
+  "Insert line(s) into an existing text file at a line number, preserving the " +
+  "file's encoding and line endings exactly. `insert_line` names the line to insert " +
+  "AFTER: 0 inserts at the very top, and the file's line count appends. Line numbers " +
+  "match what `read` shows.";
+
+export const STR_REPLACE_EDITOR_DESCRIPTION =
+  "View, create and edit text files by exact string match, preserving each file's " +
+  "encoding and line endings. Commands: `view` {path, view_range?} shows numbered " +
+  "lines, or lists a directory two levels deep; `str_replace` {path, old_str, " +
+  "new_str} replaces the unique occurrence of old_str (set `replace_all` to allow " +
+  "several); `insert` {path, insert_line, new_str} inserts AFTER insert_line (0 is " +
+  "the top, the line count appends); `create` {path, file_text} creates a new file " +
+  "and fails if it exists. `undo_edit` is not supported.";
+
+/**
+ * The read result envelope, shared by `read` and by `str_replace_editor`'s `view`.
+ *
+ * Both tools show the same files to the same model, so they must agree on the
+ * output shape AND on the line numbering — a model that read a file with one tool
+ * and edits it with the other must not be working from two numbering schemes.
+ * The window caps live here too, for the same reason: a file too large for one
+ * entry point must not be unbounded through the other.
+ */
+
+/** Default line cap, matching the built-in read tool. */
+export const DEFAULT_LIMIT = 2000;
+
+/** Per-line character cap, matching the built-in read tool. */
+const MAX_LINE_LENGTH = 2000;
+
+/** Clip one over-long line the way the built-in read does. */
+export function clipLine(line: string): string {
+  return line.length > MAX_LINE_LENGTH ? `${line.slice(0, MAX_LINE_LENGTH)}…` : line;
+}
+
+/**
+ * Render a read window as the harness's `<path>/<type>/<content>` envelope.
+ *
+ * @param displayPath - the path as the model wrote it.
+ * @param lines - the window's lines, each keeping its file line number.
+ * @param offset - the 1-based first line of the window.
+ * @param totalLines - the file's total line count.
+ */
+export function formatReadOutput(
+  displayPath: string,
+  lines: ReadonlyArray<{ number: number; text: string }>,
+  offset: number,
+  totalLines: number,
+): string {
+  const endLine = lines.at(-1)?.number ?? Math.max(0, offset - 1);
+  const footer =
+    endLine < totalLines
+      ? `(Showing lines ${offset}-${endLine} of ${totalLines}. Use offset=${endLine + 1} to continue.)`
+      : `(End of file - total ${totalLines} lines)`;
+  const body =
+    lines.length > 0
+      ? `${lines.map((line) => `${line.number}: ${line.text}`).join("\n")}\n\n${footer}`
+      : footer;
+  return `<path>${displayPath}</path>
+<type>file</type>
+<content>
+${body}
+</content>`;
+}
+
 export function readSectionText(): string {
   return (
     "Use the read tool to view a file's contents. It decodes UTF-8, UTF-16, UTF-32 and " +

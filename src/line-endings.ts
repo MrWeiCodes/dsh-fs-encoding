@@ -72,8 +72,11 @@ export function stripBOM(content: string): { bom: string; text: string } {
 }
 
 /**
- * Count lines the way the model-facing tools report them: a trailing newline
- * does not open a new line.
+ * Split text into the lines the model sees: a trailing newline does not open a
+ * line.
+ *
+ * Only `""` and a lone `"\n"` collapse to a single empty entry; a longer run of
+ * terminators is one empty entry per terminator, so `"\n\n"` is two entries.
  *
  * @param text - the text to split.
  * @returns one entry per visible line.

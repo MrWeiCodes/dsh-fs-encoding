@@ -59,7 +59,9 @@ import {
 } from "./prompts.js";
 import { EncodingSandbox } from "./sandbox.js";
 import { buildEditTool } from "./tool-edit.js";
+import { buildInsertTool } from "./tool-insert.js";
 import { buildReadTool } from "./tool-read.js";
+import { buildStrReplaceEditorTool } from "./tool-str-replace-editor.js";
 import { buildWriteTool } from "./tool-write.js";
 
 /** Cordis plugin name used by loader diagnostics. */
@@ -75,8 +77,19 @@ export const name = "dsh-fs-encoding";
  */
 export const inject = ["tools", "systemPrompt", "fs"];
 
-/** Names of the tools this plugin owns. */
-const OWNED_TOOLS = ["read", "write", "edit"] as const;
+/**
+ * Names of the tools this plugin owns.
+ *
+ * The first three shadow the built-ins on the agent's layer. The last two are
+ * ADDITIONS rather than shadows: `insert` has no built-in counterpart, and
+ * `str_replace_editor` is only mounted by the headless / SDK / ACP profiles, not
+ * by `dsh-base`, so in a web profile it is a new name too.
+ *
+ * All five are listed because all five are registered, and a name this plugin
+ * registers is a name it can collide on — the conflict check is about the layer,
+ * not about who the other plugin is.
+ */
+const OWNED_TOOLS = ["read", "write", "edit", "insert", "str_replace_editor"] as const;
 
 /**
  * The operator-facing message for a detected conflict.
@@ -142,11 +155,15 @@ function installAgentTools(rootCtx: Context, agent: Agent): void {
     const readTool = buildReadTool(rootCtx);
     const writeTool = buildWriteTool(rootCtx, sandbox);
     const editTool = buildEditTool(rootCtx, sandbox);
+    const insertTool = buildInsertTool(rootCtx, sandbox);
+    const strReplaceEditorTool = buildStrReplaceEditorTool(rootCtx, sandbox);
 
     try {
       disposers.push(agent.ctx.tools.register(readTool));
       disposers.push(agent.ctx.tools.register(writeTool));
       disposers.push(agent.ctx.tools.register(editTool));
+      disposers.push(agent.ctx.tools.register(insertTool));
+      disposers.push(agent.ctx.tools.register(strReplaceEditorTool));
     } catch (error) {
       // Roll back whatever landed before the failure, so the agent runs a
       // coherent tool set (the built-ins) rather than a half-shadowed one.

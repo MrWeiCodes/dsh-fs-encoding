@@ -73,7 +73,7 @@ describe("countLineChanges", () => {
 });
 
 describe("formatLineChangeSummary", () => {
-  it("formats the counts in the shape dsh-better-edit uses", () => {
+  it("formats the counts as a sentence fragment the caller appends", () => {
     expect(formatLineChangeSummary({ added: 3, removed: 2 })).toBe(
       " Added 3 line(s), removed 2 line(s).",
     );

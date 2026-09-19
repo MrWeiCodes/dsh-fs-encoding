@@ -16,41 +16,10 @@ import type { ToolExecution } from "@deepseek-ai/dsh-tools";
 import { normalizeEncoding, SUPPORTED_ENCODINGS_TEXT } from "./encoding.js";
 import { DecodeError } from "./encoding-state.js";
 import { readFile } from "./io.js";
-import { READ_DESCRIPTION } from "./prompts.js";
+import { READ_DESCRIPTION, DEFAULT_LIMIT, clipLine, formatReadOutput } from "./prompts.js";
+import { countVisibleLines } from "./line-edit.js";
 import { splitLines } from "./line-endings.js";
 import { execCwd } from "./workspace-context.js";
-
-/** Default line cap, matching the built-in read tool. */
-const DEFAULT_LIMIT = 2000;
-
-/** Per-line character cap, matching the built-in read tool. */
-const MAX_LINE_LENGTH = 2000;
-
-function clipLine(line: string): string {
-  return line.length > MAX_LINE_LENGTH ? `${line.slice(0, MAX_LINE_LENGTH)}…` : line;
-}
-
-function formatReadOutput(
-  displayPath: string,
-  lines: Array<{ number: number; text: string }>,
-  offset: number,
-  totalLines: number,
-): string {
-  const endLine = lines.at(-1)?.number ?? Math.max(0, offset - 1);
-  const footer =
-    endLine < totalLines
-      ? `(Showing lines ${offset}-${endLine} of ${totalLines}. Use offset=${endLine + 1} to continue.)`
-      : `(End of file - total ${totalLines} lines)`;
-  const body =
-    lines.length > 0
-      ? `${lines.map((line) => `${line.number}: ${line.text}`).join("\n")}\n\n${footer}`
-      : footer;
-  return `<path>${displayPath}</path>
-<type>file</type>
-<content>
-${body}
-</content>`;
-}
 
 /** Parse and validate the read arguments, returning a stable shape. */
 function parseArgs(args: Record<string, unknown>): {
@@ -203,7 +172,9 @@ export function buildReadTool(ctx: Context) {
       }
 
       const all = splitLines(outcome.text);
-      const totalLines = all.length === 1 && all[0] === "" ? 0 : all.length;
+      // `read` and `str_replace_editor`'s `view` must report one total for one
+      // file, so both go through `countVisibleLines` rather than each deriving it.
+      const totalLines = countVisibleLines(outcome.text);
       const start = Math.min(input.offset, Math.max(totalLines, 1));
       const window = all.slice(start - 1, start - 1 + input.limit);
       const lines = window.map((text, i) => ({ number: start + i, text: clipLine(text) }));

@@ -27,6 +27,7 @@ import {
   type FileEncodingState,
 } from "./encoding-state.js";
 import type { EncodingSandbox } from "./sandbox.js";
+import { detectEnding } from "./line-endings.js";
 
 /** A decoded file plus everything a caller needs to report on it. */
 export interface ReadOutcome {
@@ -453,6 +454,21 @@ export async function writeFile(
     //    differs from the recorded one when migration converted a legacy file
     //    to UTF-8. Recording the pre-migration encoding here would make the
     //    session's next read decode UTF-8 bytes as the old code page.
+    //
+    //    The line ending follows the same rule, and for the same reason: an
+    //    existing file's recorded ending is what the caller's text was normalized
+    //    from, so it must be kept. A file being CREATED has no record, and the
+    //    content is published verbatim — so the record must describe the endings
+    //    that text actually carries. Defaulting to LF there made the record
+    //    disagree with the bytes on disk, and the next edit inverted the wrong
+    //    ending: a file created with CRLF was silently converted to LF by its
+    //    first subsequent edit.
+    //
+    //    `detectEnding` reports the DOMINANT terminator, so a file created with
+    //    mixed endings is recorded as its first one and a later edit normalizes the
+    //    file to it. That is the same rule an existing mixed-ending file already
+    //    followed on its first read, so the create path is consistent with the rest
+    //    of the plugin rather than a special case.
     if (after?.version !== undefined) {
       recordOpenState(
         sessionKey,
@@ -461,7 +477,7 @@ export async function writeFile(
           text: content,
           encoding: encoded.encoding,
           hasBOM: encoded.hasBOM,
-          lineEnding: state?.lineEnding ?? "\n",
+          lineEnding: state?.lineEnding ?? detectEnding(content),
           candidates: [],
           // A write does not re-derive the encoding, so it must not erase the
           // provenance the read established: the file was decoded from a GUESS,

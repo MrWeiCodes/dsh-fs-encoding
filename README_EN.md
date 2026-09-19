@@ -26,13 +26,14 @@ This plugin takes over those three tools and, while **preserving every existing 
 - **No silent corruption**: if the target encoding cannot represent the new content (an emoji in a GBK file), the plugin **refuses the write** and explains why, leaving the file untouched — instead of filling it with `?` and destroying it.
 - **It tells you what to do when it cannot read**: for a non-UTF-8 file, the plugin lists the most likely encodings with a sample decode of each, so the AI (or you) can pick one and re-read — like VS Code's "Reopen with Encoding".
 - **Nineteen encodings**: UTF-8 (with BOM), UTF-16, UTF-32, plus GBK, Big5, Shift-JIS, EUC-KR and the full Windows-125x family (Western, Central European, Cyrillic, Greek, Turkish, Hebrew, Arabic, Baltic).
-- **Zero learning curve**: arguments and output format are identical to the built-ins — these are **drop-in replacements**, so existing prompts and habits keep working; `read` and `write` each gain one optional `encoding` argument (the one on `write` applies to new files only, see below).
+- **Zero learning curve**: `read` / `write` / `edit` take the same arguments and return the same shapes as the built-ins — **drop-in replacements**, so existing prompts and habits keep working; `read` and `write` each gain one optional `encoding` argument (the one on `write` applies to new files only, see below).
 - **Create files in a chosen encoding**: one `encoding` argument on `write` produces a GBK, Shift-JIS or other legacy-encoded file directly — no writing UTF-8 and converting afterwards.
+- **Two further tools**: `insert` (insert at a line number, which the built-ins cannot do) and `str_replace_editor` (a compatibility layer for its four commands, also encoding-governed). See "Two further tools" below.
 - **Simple configuration**: one YAML file with a few switches, all overridable by environment variables.
 
 ## Usage
 
-The three tools work exactly as the built-ins; `read` and `write` each gain one optional argument:
+`read` / `write` / `edit` work exactly as the built-ins; `read` and `write` each gain one optional argument:
 
 ```
 read({ file_path: "legacy.txt", encoding: "gbk" })
@@ -69,11 +70,37 @@ The accepted names are the same as `read`'s, and aliases and case are insensitiv
 
 > **`encoding` applies to new files only.** Passing it for an existing file fails with `E_ENCODING_NOT_APPLICABLE` instead of converting — preserving a file's encoding is this plugin's core promise, and a conversion rewrites every character of the file in a way the AI cannot see from the reply. **Do not delete the file to force a conversion**: deleting bypasses the read-before-write gate, so content the session never read disappears silently behind a `before: null`, and if the session *had* read the file, every later write fails `FS_STALE_VERSION` and the path cannot be recreated for the rest of the session. This plugin does not convert encodings; when you need a copy in another encoding, write it to a **new path**.
 
+### Two further tools
+
+Beyond the three above, the plugin registers two more tools, both encoding-governed (a save lands in the file's own encoding).
+
+**`insert`** — insert at a line number, which the built-ins cannot do. A literal-match edit can only insert where it can quote surrounding text, so "add a line at the top" means reading that line first and reproducing it exactly:
+
+```
+insert({ file_path: "config.ini", insert_line: 0, new_string: "[core]" })
+```
+
+`insert_line` names the line to insert **after**: `0` is the very top, and the file's line count appends. Line numbers match exactly what `read` shows.
+
+**`str_replace_editor`** — a compatibility layer for its four commands, so prompts and habits written for that tool keep working:
+
+| Command | What it does |
+|---|---|
+| `view` | Shows a file with line numbers (narrow with `view_range`); for a directory, lists two levels deep, skipping hidden entries, `node_modules` and `__pycache__` |
+| `create` | Creates a file; refuses one that already exists |
+| `str_replace` | Replaces the unique match; refuses an ambiguous one and names the lines it found |
+| `insert` | Same as the `insert` tool, same `insert_line` semantics |
+| `undo_edit` | **Not supported**, and says so |
+
+> `str_replace` additionally accepts an optional `replace_all`: omit it for the standard behaviour (a unique match is required), pass `true` to replace every occurrence. It is the only argument this plugin adds.
+>
+> The native `str_replace` and `insert` understand UTF-8 only — a GBK file fails outright or gets converted. That is precisely why this plugin takes them over.
+
 ## Installation
 
-> **⚠️ Conflict**: **any** plugin that registers `read` / `write` / `edit` on the same scope layer is mutually exclusive with this one — registering a name twice in a layer throws, so only one such plugin can be enabled.
+> **⚠️ Conflict**: **any** plugin that registers `read` / `write` / `edit` / `insert` / `str_replace_editor` — any one of those names — on the same scope layer is mutually exclusive with this one; registering a name twice in a layer throws.
 >
-> If those three names are already held by another plugin **on the same layer**, the install is refused with the offending tool named, rather than leaving a half-registered tool set. To resolve it, either remove this plugin from the profile or disable the plugin that holds the name:
+> If those names are already held by another plugin **on the same layer**, the install is refused with the offending tool named, rather than leaving a half-registered tool set. To resolve it, either remove this plugin from the profile or disable the plugin that holds the name:
 >
 > ```yaml
 > # in the profile's cordis.patch.yml
@@ -296,7 +323,7 @@ Names are case- and style-insensitive: `Shift-JIS`, `shift_jis` and `SJIS` all m
 
 - **Zero-intrusion**: the plugin only uses DSH's public interfaces to register tools; it does **not** modify native DSH code and does not replace the `ctx.fs` filesystem itself. Uninstalling restores the built-in tools immediately, leaving nothing behind.
 - **Every existing guarantee is kept**: sandbox fence, read-before-write protection, version checking and observation records all behave exactly as before — anything that should be blocked or questioned still is.
-- **Mutually exclusive with any plugin registering the same tool names**: this plugin registers `read` / `write` / `edit` on the scope layer, and registering a name twice in a layer throws, so only one such plugin can be active at a time. The test is whether those three names are already occupied **on that agent's own layer**, regardless of who occupies them — on a collision it refuses to install and names the occupied tool (see Installation above). Built-ins on a host/preset layer are not a collision.
+- **Mutually exclusive with any plugin registering the same tool names**: this plugin registers `read` / `write` / `edit` / `insert` / `str_replace_editor`, and registering a name twice in a layer throws. The test is whether any of those names is already occupied **on that agent's own layer**, regardless of who occupies it — on a collision it refuses to install and names the occupied tool (see Installation above). Built-ins on a host/preset layer are not a collision.
 - **Session state**: encoding information is kept in memory and isolated per session — never written to disk, never polluting your repository. After a DSH restart, the encoding is detected afresh on the first read.
 
 ## Development
@@ -314,7 +341,7 @@ To customize the plugin, use DSH's Creator mode for quick development.
 
 ## Roadmap
 
-Phase 2 (not yet implemented): `undo_last_edit` and `str_replace_editor`.
+Not yet implemented: `undo_last_edit` (revert the previous edit).
 
 ## License
 

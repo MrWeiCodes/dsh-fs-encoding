@@ -563,7 +563,11 @@ export function countLineChanges(before: string, after: string): LineChangeCount
 
 /**
  * The summary appended to a tool's message so the model can see the size of what
- * it just did, in the shape `dsh-better-edit` uses.
+ * it just did.
+ *
+ * Phrased as a plain sentence appended to the built-in's own wording, so a tool
+ * that already reports "the file was updated" gains the counts without the two
+ * readings as separate statements.
  *
  * @param count - the added/removed counts.
  * @returns the sentence fragment, or `""` when nothing changed.
