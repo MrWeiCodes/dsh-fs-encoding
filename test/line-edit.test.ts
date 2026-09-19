@@ -111,6 +111,35 @@ describe("countInsertedLines", () => {
     expect(countInsertedLines("")).toBe(1);
   });
 
+  it("agrees with the splice for every target, the degenerate one included", () => {
+    // The count and the write are two halves of one message: the number comes from
+    // here, the file comes from `insertAfterLine`. Pinning the count alone lets a
+    // special case report a change that did not happen — or hide one that did. The
+    // empty file with an empty insert is exactly the pair that tempts such a case,
+    // and it really does add the one terminator this count reports.
+    for (const before of ["", "\n", "x", "x\n", "l1\nl2\n"]) {
+      for (const nt of ["", "\n", "x", "a\nb"]) {
+        const after = insertAfterLine(before, 0, nt);
+        const added = countInsertedLines(nt);
+        const beforeLines = splitForEdit(before);
+        const spliced = [
+          ...beforeLines.slice(0, 0),
+          ...insertedLines(nt),
+          ...beforeLines.slice(0),
+        ].join("\n");
+        // An insert into an empty file always ends terminated; otherwise the file's
+        // own trailing-newline state is preserved.
+        const expected = before === "" || before.endsWith("\n") ? `${spliced}\n` : spliced;
+        const where = `before=${JSON.stringify(before)} nt=${JSON.stringify(nt)}`;
+        expect(after, where).toBe(expected);
+        // And the reported count is the size of that splice, so it cannot claim a
+        // no-op for bytes that changed nor lines for bytes that did not.
+        expect(added, where).toBe(insertedLines(nt).length);
+        expect(added === 0, where).toBe(after === before);
+      }
+    }
+  });
+
   it("follows one rule for every text, not a table of special cases", () => {
     // The shared-formula assertions below compare `insertedLines` with itself, so
     // they cannot see a wrong RULE — only a wrong placement. The rule is therefore
@@ -128,7 +157,9 @@ describe("countInsertedLines", () => {
       "x", "x\n", "x\n\n", "\n \n", " \n", "x\n".repeat(200),
     ];
     for (const text of shapes) {
-      expect(countInsertedLines(text), `text=${JSON.stringify(text).slice(0, 30)}`).toBe(rule(text));
+      expect(countInsertedLines(text), `text=${JSON.stringify(text).slice(0, 30)}`).toBe(
+        rule(text),
+      );
     }
     // And the values a reader would check by hand, pinned so the rule cannot drift
     // together with its restatement.
