@@ -325,6 +325,75 @@ Names are case- and style-insensitive: `Shift-JIS`, `shift_jis` and `SJIS` all m
 - **Every existing guarantee is kept**: sandbox fence, read-before-write protection, version checking and observation records all behave exactly as before — anything that should be blocked or questioned still is.
 - **Mutually exclusive with any plugin registering the same tool names**: this plugin registers `read` / `write` / `edit` / `insert` / `str_replace_editor`, and registering a name twice in a layer throws. The test is whether any of those names is already occupied **on that agent's own layer**, regardless of who occupies it — on a collision it refuses to install and names the occupied tool (see Installation above). Built-ins on a host/preset layer are not a collision.
 - **Session state**: encoding information is kept in memory and isolated per session — never written to disk, never polluting your repository. After a DSH restart, the encoding is detected afresh on the first read.
+- **Publishes a service**: once installed, the plugin provides the `fsEncoding` service so other plugins can reuse the same decoding rules (see [For plugin authors](#for-plugin-authors) below).
+
+## For plugin authors
+
+DSH's `ctx.fs` is UTF-8-only: it decodes with a strict `TextDecoder`, so a GBK file is simply `FS_NOT_TEXT` to it. This plugin's tool layer solves reading for the **model**, but **other plugins** that call `ctx.fs` directly to render content (approval previews, diff cards, file viewers) still hit that limit — so they either show an error for a file with perfectly readable content, or reimplement the guess themselves, and two parts of one deployment end up disagreeing about what a file says.
+
+This plugin therefore publishes a service that keeps "what text is in these bytes" in one place:
+
+```js
+// Consumer side: read it with ctx.get — no `inject` needed, and it is
+// `undefined` when the plugin is not installed.
+const fsEncoding = ctx.get("fsEncoding");
+// Careful: when another plugin already owns the name, `ctx.get` returns THAT
+// plugin's object rather than `undefined`, so test for the capability, not just
+// for absence. `isFsEncodingService` checks exactly the two methods used below —
+// if you hand-roll the guard, check BOTH: testing only `tryDecode` lets a
+// `tryDecode`-only object through, and the later `decode` call then throws.
+if (!isFsEncodingService(fsEncoding)) {
+  // Not installed (or the name is taken): fall back to what you did before.
+}
+
+// You own the IO — the sandbox and path resolution are your context.
+const target = await ctx.fs.resolve(path, { cwd });
+// All three arguments are required: `maxBytes` is the only cap `readBytes` has,
+// and omitting it does not fail — it reads the whole file into memory. Both the
+// signal and the cap come from YOUR execution context (you already hold an
+// `exec`, and the cap is yours to choose).
+const bytes = await ctx.fs.readBytes(target, exec?.signal, maxBytes);
+
+const outcome = await fsEncoding.tryDecode(bytes, { displayPath: path });
+if (outcome.ok) {
+  outcome.result.text;      // decoded text, BOM removed
+  outcome.result.encoding;  // e.g. "gbk"
+  outcome.result.decided;   // "bom" | "utf8" | "hint" | "guessed"
+  outcome.result.hasBOM;
+  outcome.result.lineEnding;
+} else {
+  outcome.refusal.message;    // display-ready, same wording as the `read` tool
+  outcome.refusal.candidates; // candidate encodings, for a picker
+  outcome.refusal.ranked;     // whether the order is evidence-based
+  outcome.refusal.adoptable;  // whether the head is credible enough to adopt
+  outcome.refusal.autoGuessEnabled; // "not attempted" vs "attempted and failed"
+}
+```
+
+Three design points:
+
+- **`decided` is the field you must look at.** Only `"bom"` / `"utf8"` / `"hint"` are determined; `"guessed"` is a probabilistic pick. When rendering for a human, say which one you got — presenting a guess as the file's real encoding is exactly the failure this plugin exists to prevent.
+- **Refusal is a value, not an exception.** `tryDecode` throws for no input at all — including an argument error such as a non-string `encoding`, which comes back as a refusal; use `decode` when you want the refusal thrown with the `read` tool's exact wording.
+- **The service does not read files and records nothing.** IO is yours; a decode writes no session encoding record, so a preview cannot count as having "read" a file and thereby authorize a later write.
+
+Other methods: `isUtf8(bytes)` (cheap check for whether these bytes are **valid UTF-8** — note this does NOT mean `ctx.fs.readText` will succeed, since that also rejects content with a NUL byte in the first 8 KiB), `supportedEncodings()` (the set this deployment will actually try — use it for a picker instead of your own list), `knownEncodings()` (every usable encoding name), `autoGuessEnabled()`, `isFsEncodingService(value)` (whether `ctx.get` handed you this service).
+
+`tryDecode` / `decode` accept a `maxBytes` option bounding a single decode, defaulting to this plugin's `maxFileBytes`; an oversized input comes back as a refusal (`E_TOO_LARGE`) instead of being fully ranked. Note there is no "unlimited" spelling: omitting `maxBytes` means this deployment's `maxFileBytes`, while an unusable value (`Infinity`, `NaN`, a non-positive number) is refused with `E_BAD_ENCODING` rather than silently treated as the default — otherwise the error would advise raising an argument that was just ignored.
+
+`tryDecode` throws for no input, and an argument error always comes back as a refusal: a non-string `encoding` or `displayPath`, `bytes` that is not a `Uint8Array`, and an unusable `maxBytes` are all refused.
+
+**A mistyped `opts` is refused too, rather than treated as "not supplied".** Only omitting the argument entirely (or passing `undefined`) means "use the defaults"; `null`, a string, a number and the like are all refused:
+
+```js
+await fsEncoding.tryDecode(bytes);                          // defaults
+await fsEncoding.tryDecode(bytes, {});                      // defaults
+await fsEncoding.tryDecode(bytes, { encoding: "gbk" });     // name an encoding
+
+await fsEncoding.tryDecode(bytes, "gbk");   // refused: the braces were forgotten
+await fsEncoding.tryDecode(bytes, null);    // refused: null is not "not supplied"
+```
+
+This is deliberate. In JavaScript, reading a property off a non-object does **not** throw — it yields `undefined`, exactly as if nothing had been passed. So `tryDecode(bytes, "gbk")` used to **silently drop the encoding the caller named** and fall back to guessing, producing a decoding that could differ from the one requested with nothing to signal it. `null` is refused for the same reason: it is what a missing value looks like in JSON and database rows, so accepting it would hide the caller's bug.
 
 ## Development
 
@@ -342,6 +411,12 @@ To customize the plugin, use DSH's Creator mode for quick development.
 ## Roadmap
 
 Not yet implemented: `undo_last_edit` (revert the previous edit).
+
+## Acknowledgements
+
+The encoding layer began as an extraction from [dsh-better-edit](https://github.com/Rianico/dsh-better-edit/) — BOM fidelity and the byte-exact round-trip of multi-byte encodings come from there. As a standalone plugin it was then rewritten and extended around one goal, "the bytes read back are the bytes written": the full range of Windows ANSI pages, a configurable guess list, evidence-based candidate ranking, and the `ctx.fsEncoding` service. Thanks to that project for the foundation.
+
+Both plugins register `read` / `write` / `edit` on the scope layer, so they cannot be enabled at the same time (see [Compatibility & conflicts](#compatibility--conflicts) above).
 
 ## License
 

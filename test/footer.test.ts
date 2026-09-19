@@ -25,6 +25,9 @@ import { readFile as pluginRead, writeFile as pluginWrite } from "../src/io.js";
 import { EncodingSandbox } from "../src/sandbox.js";
 
 let dir: string;
+/** A throwaway `$DSH_HOME`, so the effective config is the test's, not the developer's. */
+let home: string;
+let savedHome: string | undefined;
 let root: Context;
 let sandbox: EncodingSandbox;
 let policy: SandboxExecutionPolicy;
@@ -40,6 +43,15 @@ async function keyOfPath(path: string): Promise<string> {
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "fs-encoding-footer-"));
+  // Point `$DSH_HOME` at a throwaway directory BEFORE anything reads the config,
+  // so the effective config is the test's rather than the developer's. Without
+  // this a machine that configured `supportedEncodings` or `excludeEncodings`
+  // decides which page the guesser picks, and these assertions (which name `gbk`
+  // explicitly) pass or fail by machine. Same isolation as `config.test.ts`.
+  home = await mkdtemp(join(tmpdir(), "fs-encoding-footer-home-"));
+  savedHome = process.env["DSH_HOME"];
+  process.env["DSH_HOME"] = home;
+  resetConfigCache();
   root = new Context();
   root.provide("sandboxPolicy", {
     defaultMode: "workspace-write",
@@ -59,8 +71,11 @@ beforeEach(async () => {
 
 afterEach(async () => {
   delete process.env["DSH_FS_ENCODING_AUTO_GUESS"];
+  if (savedHome === undefined) delete process.env["DSH_HOME"];
+  else process.env["DSH_HOME"] = savedHome;
   resetConfigCache();
   await rm(dir, { recursive: true, force: true });
+  await rm(home, { recursive: true, force: true });
 });
 
 describe("with autoGuessEncoding on", () => {
@@ -109,6 +124,47 @@ describe("with autoGuessEncoding on", () => {
 
     const after = await pluginRead(root, "gbk.txt", dir, { exec });
     expect(after.footer).toContain("Auto-guessed");
+  });
+
+  it("keeps the recorded provenance a guess across reads and a write", async () => {
+    // `decided` exists so a consumer can tell a determination from a guess, and
+    // its whole reason for surviving a write is that the SECOND read must not
+    // relabel the guess. The trap is the memo: a later read re-decodes with the
+    // memo's encoding as an explicit hint, and the hint path reports "hint" —
+    // which would silently turn this plugin's own guess into "the caller said
+    // so". The value has to match what the footer says at every step.
+    await writeFile(join(dir, "gbk.txt"), Buffer.from(iconv.encode(GBK_TEXT, "gbk")));
+    const key = await keyOfPath(join(dir, "gbk.txt"));
+
+    const first = await pluginRead(root, "gbk.txt", dir, { exec });
+    expect(first.state.decided).toBe("guessed");
+
+    const second = await pluginRead(root, "gbk.txt", dir, { exec });
+    expect(second.state.decided).toBe("guessed");
+    expect(second.footer).toContain("Auto-guessed");
+
+    await pluginWrite(
+      root,
+      sandbox,
+      { target: second.target, content: second.text.replace("世界", "地球"), exec, policy },
+      "write",
+    );
+    expect(getEncodingState("footer-session", key)?.decided).toBe("guessed");
+
+    const third = await pluginRead(root, "gbk.txt", dir, { exec });
+    expect(third.state.decided).toBe("guessed");
+  });
+
+  it("reports a caller's explicit encoding as a determination, not a guess", async () => {
+    // The mirror image: when the CALLER named the encoding, that IS a decision
+    // and must be recorded as one — the memo compensation must not overwrite it
+    // with a stale guess.
+    await writeFile(join(dir, "gbk.txt"), Buffer.from(iconv.encode(GBK_TEXT, "gbk")));
+    const first = await pluginRead(root, "gbk.txt", dir, { exec, encodingHint: "gbk" });
+    expect(first.state.decided).toBe("hint");
+
+    const second = await pluginRead(root, "gbk.txt", dir, { exec });
+    expect(second.state.decided).toBe("hint");
   });
 
   it("drops the guess note once the file is re-read as plain UTF-8", async () => {

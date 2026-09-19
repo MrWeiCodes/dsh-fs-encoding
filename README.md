@@ -325,6 +325,73 @@ excludeEncodings: [windows-1251]
 - **原有保障全部保留**：沙箱围栏、读后写保护、版本校验、观察记录等原生行为一项不少——写入前该拦的照样拦，该问的照样问。
 - **与任何注册同名工具的插件互斥**：本插件在作用域层注册 `read` / `write` / `edit` / `insert` / `str_replace_editor`，而同一层重复注册同名工具会直接报错。判定依据是这些名字在**该 agent 自己的层**上是否已被占用，与对方是谁无关——发现冲突即拒绝安装并指出被占用的工具名（见上方安装说明）。宿主／preset 层的内建工具不属于冲突。
 - **会话状态**：编码信息保存在内存中、按会话隔离，不写入磁盘、不污染仓库。DSH 重启后首次读取会重新识别编码。
+- **对外提供服务**：插件安装后会提供 `fsEncoding` 服务，供其他插件复用同一套编码判定（见下方[给插件开发者](#给插件开发者)）。
+
+## 给插件开发者
+
+DSH 的 `ctx.fs` 只认 UTF-8：它用严格的 `TextDecoder` 解码，所以一个 GBK 文件在它看来是 `FS_NOT_TEXT`。本插件的工具层解决了**模型**读文件的问题，但**其他插件**直接调 `ctx.fs` 渲染内容时（审批预览、差异卡片、文件查看器）仍然会撞上这个限制，于是要么显示一个本该能读的文件的错误，要么自己再实现一套猜测——同一份部署的两处对同一个文件给出不同解读。
+
+本插件因此提供一个服务，把「这些字节是什么文本」这件事收在一处：
+
+```js
+// 消费方：用 ctx.get 读取，无需 inject，插件没装时返回 undefined
+const fsEncoding = ctx.get("fsEncoding");
+// 注意：名字被别的插件占用时，ctx.get 返回的是那个插件的对象而不是 undefined，
+// 所以判"有没有"要按能力判，不能只判 undefined。
+// 下面用的 isFsEncodingService 与守卫等价，它校验的正是 tryDecode 与 decode 两个方法——
+// 手写守卫时两个都要查，只查 tryDecode 会放过"只有 tryDecode"的异物，
+// 于是后面调 decode 时抛 TypeError，守卫就白写了
+if (!isFsEncodingService(fsEncoding)) {
+  // 插件未安装（或服务名被占用）：按原来的方式处理（通常是显示"不是 UTF-8"）
+}
+
+// 自己负责读盘（沙箱、路径解析都是调用方的上下文）
+const target = await ctx.fs.resolve(path, { cwd });
+// 三个参数都是必需的：maxBytes 是 readBytes 唯一的上限，漏传不会报错，
+// 而是把整个文件无界读进内存。signal 与 maxBytes 都取自你自己的执行上下文
+// （例如 ctx.fsEncoding 之外，你手里应当已有 exec 与一个自定的上限）
+const bytes = await ctx.fs.readBytes(target, exec?.signal, maxBytes);
+
+const outcome = await fsEncoding.tryDecode(bytes, { displayPath: path });
+if (outcome.ok) {
+  outcome.result.text;      // 解码后的文本（BOM 已去掉）
+  outcome.result.encoding;  // 例如 "gbk"
+  outcome.result.decided;   // "bom" | "utf8" | "hint" | "guessed"
+  outcome.result.hasBOM;
+  outcome.result.lineEnding;
+} else {
+  outcome.refusal.message;    // 可直接展示的说明（与 read 工具的措辞一致）
+  outcome.refusal.candidates; // 候选编码，可供用户挑选
+  outcome.refusal.ranked;     // 候选是否按证据排序（false 表示顺序无意义）
+  outcome.refusal.adoptable;  // 首位是否可信到可以采用
+  outcome.refusal.autoGuessEnabled; // 是"没尝试猜"还是"猜了但没结果"
+}
+```
+
+三个设计要点：
+
+- **`decided` 是必须看的字段。** 只有 `"bom"` / `"utf8"` / `"hint"` 是确定的，`"guessed"` 是概率性猜测。面向人展示内容时应当说明这一点——把一个猜测当成文件真实编码展示，正是本插件要消除的问题。
+- **拒绝是返回值，不是异常。** `tryDecode` 对任意输入都不会抛错（包括 `encoding` 传了非字符串这类参数错误，会作为拒绝返回）；需要与 `read` 工具完全一致的报错文本时用 `decode`。
+- **服务不读文件、不记录状态。** 读盘由调用方负责；解码不写入会话的编码记录，所以预览不会替你"读过"某个文件、进而授权后续写入。
+
+其他方法：`isUtf8(bytes)`（廉价判断**这些字节是不是合法 UTF-8**——注意这不等于 `ctx.fs.readText` 一定成功，后者还会把前 8 KiB 含 NUL 的内容判为二进制）、`supportedEncodings()`（本部署实际会尝试的集合，做选择器时用它，而不是自己列一份）、`knownEncodings()`（全部可用的编码名）、`autoGuessEnabled()`、`isFsEncodingService(value)`（判断 `ctx.get` 拿到的是不是本服务）。
+
+`tryDecode` / `decode` 接受 `maxBytes` 选项限制单次解码的字节数，默认取本插件的 `maxFileBytes`；超限会以拒绝（`E_TOO_LARGE`）返回，而不是对超大输入做全量候选排序。注意没有「无上限」的写法：省略 `maxBytes` 表示用本部署的 `maxFileBytes`，而 `Infinity` / `NaN` / 非正数这类不可用的值会以 `E_BAD_ENCODING` 拒绝，不会被静默当成默认值（否则错误信息会建议你调大一个刚被忽略的参数）。
+
+`tryDecode` 对任意输入都不抛错，参数错误一律作为拒绝返回：`encoding` / `displayPath` 传了非字符串、`bytes` 不是 `Uint8Array`、`maxBytes` 不可用，都会拒绝。
+
+**`opts` 本身传错也会拒绝，而不是被当成"没传"。** 只有**整个参数省略**（或传 `undefined`）才表示用默认值；`null`、字符串、数字等一律拒绝：
+
+```js
+await fsEncoding.tryDecode(bytes);                          // 默认值
+await fsEncoding.tryDecode(bytes, {});                      // 默认值
+await fsEncoding.tryDecode(bytes, { encoding: "gbk" });     // 指定编码
+
+await fsEncoding.tryDecode(bytes, "gbk");   // 拒绝：少写了一对花括号
+await fsEncoding.tryDecode(bytes, null);    // 拒绝：null 不算"没传"
+```
+
+这一条是刻意的：在 JavaScript 里读一个非对象的属性**不会报错**，只会得到 `undefined`——和"没传"完全一样。所以 `tryDecode(bytes, "gbk")` 这种漏写花括号的写法，曾经会**静默丢掉你指定的编码**，退回自动猜测，解码结果可能和你要的完全不同却毫无提示。`null` 同样拒绝，因为它是 JSON 和数据库里"缺值"的样子，放行等于把调用方的 bug 藏起来。
 
 ## 开发
 
@@ -342,6 +409,12 @@ npm run build       # src/ → lib/
 ## 路线图
 
 尚未实现：`undo_last_edit`（撤销上一次编辑）。
+
+## 致谢
+
+本插件的编码处理层最初从 [dsh-better-edit](https://github.com/Rianico/dsh-better-edit/) 中抽出——BOM 保真、多字节编码的读写往返等基础能力源自那里。独立成插件后，围绕「读到的字节与写回的字节一致」这一目标重写并扩展：Windows ANSI 全系、可配置的猜测清单、候选排序的证据判定、`ctx.fsEncoding` 服务等。感谢该项目打下的基础。
+
+两者都在作用域层注册 `read` / `write` / `edit`，因此不能同时启用（原因见上方[兼容性与冲突](#兼容性与冲突)）。
 
 ## 许可
 

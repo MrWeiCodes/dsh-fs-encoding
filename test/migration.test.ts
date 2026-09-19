@@ -23,6 +23,9 @@ import { readFile as pluginRead, writeFile as pluginWrite } from "../src/io.js";
 import { EncodingSandbox } from "../src/sandbox.js";
 
 let dir: string;
+/** A throwaway `$DSH_HOME`, so the effective config is the test's, not the developer's. */
+let home: string;
+let savedHome: string | undefined;
 let root: Context;
 let sandbox: EncodingSandbox;
 let policy: SandboxExecutionPolicy;
@@ -47,6 +50,15 @@ async function keyOfPath(path: string): Promise<string> {
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "fs-encoding-migrate-"));
+  // Point `$DSH_HOME` at a throwaway directory BEFORE anything reads the config.
+  // These tests name `gbk` explicitly and assert on what the config decides
+  // (`normalizeToUtf8` gates the whole subject here), so letting the developer's
+  // real `$DSH_HOME/plugins/dsh-fs-encoding/config.yaml` participate makes the
+  // outcome machine-dependent. Same isolation as `config.test.ts`.
+  home = await mkdtemp(join(tmpdir(), "fs-encoding-migrate-home-"));
+  savedHome = process.env["DSH_HOME"];
+  process.env["DSH_HOME"] = home;
+  resetConfigCache();
   root = new Context();
   root.provide("sandboxPolicy", {
     defaultMode: "workspace-write",
@@ -66,8 +78,11 @@ beforeEach(async () => {
 
 afterEach(async () => {
   delete process.env["DSH_FS_ENCODING_NORMALIZE_TO_UTF8"];
+  if (savedHome === undefined) delete process.env["DSH_HOME"];
+  else process.env["DSH_HOME"] = savedHome;
   resetConfigCache();
   await rm(dir, { recursive: true, force: true });
+  await rm(home, { recursive: true, force: true });
 });
 
 describe("encodeForSave reports the encoding it actually used", () => {
@@ -154,6 +169,87 @@ describe("the session's record follows a migration", () => {
     const reread = await pluginRead(root, "gbk.txt", dir, { exec });
     expect(reread.text).toBe("你好，地球\n");
     expect(reread.state.encoding).toBe("utf8");
+  });
+
+  it("does not carry the retired encoding's provenance across a migration", async () => {
+    // Migration is the one write where the old provenance must NOT survive: the
+    // bytes are UTF-8 now, and a strict UTF-8 validation is a DETERMINATION, so
+    // keeping the pre-migration `"hint"`/`"guessed"` would pair `encoding: "utf8"`
+    // with a provenance that only described the retired page — reporting a
+    // settled fact as a guess, and (for a guess) leaving a footer that names a
+    // page the file no longer uses.
+    process.env["DSH_FS_ENCODING_NORMALIZE_TO_UTF8"] = "true";
+    resetConfigCache();
+
+    const p = join(dir, "gbk.txt");
+    await writeFile(p, gbkBytes("你好，世界\n"));
+
+    const read = await pluginRead(root, "gbk.txt", dir, { exec, encodingHint: "gbk" });
+    expect(read.state.decided).toBe("hint");
+
+    await pluginWrite(
+      root,
+      sandbox,
+      { target: read.target, content: read.text.replace("世界", "地球"), exec, policy },
+      "write",
+    );
+
+    const key = await keyOfPath(p);
+    const record = getEncodingState("migrate-session", key);
+    expect(record?.encoding).toBe("utf8");
+    // The determination that actually applies to the bytes now on disk.
+    expect(record?.decided).toBe("utf8");
+    expect(record?.footer).toBeUndefined();
+
+    // And the next read must report the same thing, not the retired provenance.
+    const reread = await pluginRead(root, "gbk.txt", dir, { exec });
+    expect(reread.state.decided).toBe("utf8");
+  });
+
+  it("keeps the provenance when no migration happens", async () => {
+    // The mirror case: an ordinary save of a legacy file leaves the encoding
+    // alone, so the provenance must still describe how that encoding was chosen.
+    const p = join(dir, "gbk.txt");
+    await writeFile(p, gbkBytes("你好，世界\n"));
+
+    const read = await pluginRead(root, "gbk.txt", dir, { exec, encodingHint: "gbk" });
+    await pluginWrite(
+      root,
+      sandbox,
+      { target: read.target, content: read.text.replace("世界", "地球"), exec, policy },
+      "write",
+    );
+
+    const key = await keyOfPath(p);
+    expect(getEncodingState("migrate-session", key)?.encoding).toBe("gbk");
+    expect(getEncodingState("migrate-session", key)?.decided).toBe("hint");
+  });
+
+  it("labels a created file by what actually determined its bytes", async () => {
+    // A created file has no read to inherit from, and leaving the provenance
+    // blank is not neutral: the next read reuses the memo as an explicit hint,
+    // and the hint path reports "hint" — documented as "the CALLER specified
+    // this" — for an encoding the plugin chose by itself. So the create path
+    // must derive the label instead of omitting it.
+    const plain = join(dir, "fresh.txt");
+    const plainTarget = await root.fs.resolve(plain);
+    await pluginWrite(root, sandbox, { target: plainTarget, content: "new\n", exec, policy }, "write");
+    const plainKey = await keyOfPath(plain);
+    expect(getEncodingState("migrate-session", plainKey)?.decided).toBe("utf8");
+    // And the next read must keep saying so, not drift to "hint".
+    const reread = await pluginRead(root, "fresh.txt", dir, { exec });
+    expect(reread.state.decided).toBe("utf8");
+
+    // When the caller DID name an encoding, "hint" is the accurate label.
+    const named = join(dir, "named.txt");
+    const namedTarget = await root.fs.resolve(named);
+    await pluginWrite(
+      root,
+      sandbox,
+      { target: namedTarget, content: "你好\n", exec, policy, newFileEncoding: "gbk" },
+      "write",
+    );
+    expect(getEncodingState("migrate-session", await keyOfPath(named))?.decided).toBe("hint");
   });
 
   it("does not migrate when the option is off", async () => {

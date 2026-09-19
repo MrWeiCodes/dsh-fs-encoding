@@ -46,6 +46,16 @@ export interface FileEncodingState {
    */
   version: string | undefined;
   /**
+   * How this encoding was arrived at, carried forward from the read that
+   * established it.
+   *
+   * A save does not re-derive the encoding — it inverts this record — so the
+   * provenance must survive the write, or the second read of a guessed file
+   * would report the guess as a decision. Optional because a state may be built
+   * by hand (tests, and a caller that only knows the encoding name).
+   */
+  decided?: DecodeProvenance | undefined;
+  /**
    * The provenance note shown with this file's reads ("auto-guessed GBK …"),
    * carried so a later read in the same session can repeat it. A guess must
    * stay visible on every read, not only the one that made it.
@@ -232,12 +242,27 @@ export function encodingStateCount(): number {
   return total;
 }
 
+/**
+ * How an encoding was arrived at, for callers that must not present a guess as
+ * a fact.
+ *
+ * The distinction is the whole point of this field: `hint`, `bom` and `utf8`
+ * are DETERMINED — the caller said so, the bytes said so, or the bytes are
+ * valid UTF-8 — while `guessed` is a probabilistic pick that a later reader may
+ * disagree with. A consumer that renders text for a human (an approval preview,
+ * a diff card) has to say which one it got, because silently presenting a guess
+ * as the file's real encoding is the failure this plugin exists to prevent.
+ */
+export type DecodeProvenance = "hint" | "bom" | "utf8" | "guessed";
+
 /** The outcome of admitting a byte buffer for reading. */
 export interface DecodeForOpenResult {
   /** The decoded text, with any BOM already removed. */
   text: string;
   /** Canonical encoding identifier that produced {@link text}. */
   encoding: string;
+  /** How {@link encoding} was decided. */
+  decided: DecodeProvenance;
   /** Whether the bytes carried a BOM. */
   hasBOM: boolean;
   /** Line terminator style detected in the decoded text. */
@@ -264,11 +289,47 @@ export interface DecodeForOpenOptions {
   displayPath?: string;
 }
 
+/**
+ * The machine-readable half of a refusal, for callers that are not the model.
+ *
+ * The message is written for the model to act on; this is what a programmatic
+ * consumer needs so it does not have to parse that prose. An approval preview,
+ * for instance, wants to offer the candidate list as a chooser — and it cannot
+ * recover the list from a sentence.
+ */
+export interface DecodeErrorDetail {
+  /** Scored candidates, in the order the message lists them. Empty for binary input. */
+  candidates: readonly CandidatePreview[];
+  /** Whether one candidate outranked the others, so the order is meaningful. */
+  ranked: boolean;
+  /**
+   * Whether the head candidate was credible enough to adopt. `false` with
+   * `ranked: true` means the list is offered as candidates rather than as a
+   * decision — the head is present but should not be recommended.
+   */
+  adoptable: boolean;
+  /**
+   * Whether the effective configuration permits guessing at all.
+   *
+   * A consumer that wants to explain the refusal needs this: with guessing off
+   * the remedy is "turn on autoGuessEncoding or re-read with an explicit
+   * encoding", while with guessing on it is "pick from the candidates". The two
+   * are indistinguishable from the message alone.
+   */
+  autoGuessEnabled: boolean;
+}
+
 /** A decode failure the caller must surface verbatim. */
 export class DecodeError extends Error {
   constructor(
     message: string,
     readonly code: string,
+    /**
+     * Structured detail, present on the admission refusals that have candidates
+     * to offer. Absent on the argument-level failures (unknown encoding name,
+     * a wrong explicit encoding), which have nothing to choose between.
+     */
+    readonly detail?: DecodeErrorDetail,
   ) {
     super(message);
     this.name = "DecodeError";
@@ -459,6 +520,7 @@ export async function decodeForOpen(
     return {
       text: decoded,
       encoding: hint,
+      decided: "hint",
       hasBOM: bom !== undefined,
       lineEnding: detectEnding(decoded),
       candidates: [],
@@ -474,6 +536,7 @@ export async function decodeForOpen(
       return {
         text: decoded,
         encoding: bom.encoding,
+        decided: "bom",
         hasBOM: true,
         lineEnding: detectEnding(decoded),
         candidates: [],
@@ -487,6 +550,7 @@ export async function decodeForOpen(
     return {
       text: decoded,
       encoding: "utf8",
+      decided: "utf8",
       hasBOM: false,
       lineEnding: detectEnding(decoded),
       candidates: [],
@@ -517,6 +581,7 @@ export async function decodeForOpen(
         return {
           text: decoded,
           encoding: best.encoding,
+          decided: "guessed",
           hasBOM: false,
           lineEnding: detectEnding(decoded),
           ...(footer === undefined ? {} : { footer }),
@@ -541,7 +606,12 @@ export async function decodeForOpen(
   // the only fallback available (an empty list) renders as "This may be a binary
   // file", which would misdiagnose a perfectly decodable legacy text file.
   const ranked = stepFourRanked ?? (await rankCandidates(bytes, config.supportedEncodings));
-  throw new DecodeError(buildTop3Message(display, ranked), "E_NOT_TEXT");
+  throw new DecodeError(buildTop3Message(display, ranked), "E_NOT_TEXT", {
+    candidates: ranked.candidates,
+    ranked: ranked.ranked,
+    adoptable: ranked.adoptable,
+    autoGuessEnabled: config.autoGuessEncoding,
+  });
 }
 
 /**
@@ -555,17 +625,24 @@ export async function decodeForOpen(
  *
  * @param decoded - the admission result.
  * @param version - the version observed at read time, used for later invalidation.
+ * @param provenance - the real provenance when the decode did not establish it.
+ *   A read that reused the session's own memo passes the recorded value here:
+ *   the hint path reports `"hint"` because a hint is what it was given, but a
+ *   hint this plugin supplied from its own memo is not a caller's decision, and
+ *   re-labelling it would present a guess as a determination.
  * @returns the state, unrecorded.
  */
 export function openStateFor(
   decoded: DecodeForOpenResult,
   version: string | undefined,
+  provenance?: DecodeProvenance | undefined,
 ): FileEncodingState {
   return {
     encoding: decoded.encoding,
     hasBOM: decoded.hasBOM,
     lineEnding: decoded.lineEnding,
     version,
+    decided: provenance ?? decoded.decided,
     ...(decoded.footer === undefined ? {} : { footer: decoded.footer }),
   };
 }
@@ -577,6 +654,8 @@ export function openStateFor(
  * @param targetKey - the resolved target's canonical key.
  * @param decoded - the admission result.
  * @param version - the version observed at read time, used for later invalidation.
+ * @param provenance - see {@link openStateFor}; carried so a memo-reusing read
+ *   does not overwrite the recorded provenance with the `"hint"` it was handed.
  * @returns the recorded state.
  */
 export function recordOpenState(
@@ -584,8 +663,9 @@ export function recordOpenState(
   targetKey: string,
   decoded: DecodeForOpenResult,
   version: string | undefined,
+  provenance?: DecodeProvenance | undefined,
 ): FileEncodingState {
-  const state: FileEncodingState = openStateFor(decoded, version);
+  const state: FileEncodingState = openStateFor(decoded, version, provenance);
   setEncodingState(sessionKey, targetKey, state);
   return state;
 }

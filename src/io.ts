@@ -24,6 +24,8 @@ import {
   openStateFor,
   recordOpenState,
   sessionKeyOf,
+  setEncodingState,
+  type DecodeProvenance,
   type FileEncodingState,
 } from "./encoding-state.js";
 import type { EncodingSandbox } from "./sandbox.js";
@@ -45,6 +47,31 @@ export interface ReadOutcome {
 function keyOf(target: FsTarget): string {
   const key = (target as unknown as { targetKey?: unknown }).targetKey;
   return typeof key === "string" ? key : target.displayPath;
+}
+
+/**
+ * The provenance of a file this session CREATED, from the bytes just written.
+ *
+ * A created file has no read to inherit a provenance from, and leaving the field
+ * blank is not neutral: the next read reuses the memo as an explicit hint, and
+ * the hint path reports `"hint"` — documented as "the CALLER specified this" —
+ * for an encoding the plugin may have chosen on its own. Deriving the label from
+ * what actually determined the bytes avoids that.
+ *
+ * @param encoded - what `encodeForSave` published.
+ * @returns the provenance to record.
+ */
+function createdProvenance(encoded: { encoding: string; hasBOM: boolean }): DecodeProvenance {
+  // A BOM was either asked for by name (`utf8bom`, `utf16le`, …) or came from
+  // the caller's `newFileEncoding`; either way the bytes declare it themselves,
+  // which is what `"bom"` means.
+  if (encoded.hasBOM) return "bom";
+  // UTF-8 with no BOM is the plugin's own default when the caller named nothing.
+  // When the caller DID name an encoding it is recorded as `"hint"` below, but
+  // the two are indistinguishable here, and `"utf8"` is the honest label for
+  // bytes that a strict UTF-8 validation would confirm on the next read anyway.
+  if (encoded.encoding === "utf8") return "utf8";
+  return "hint";
 }
 
 /**
@@ -208,6 +235,25 @@ export async function readFile(
     displayPath: path,
     ...(hint === undefined ? {} : { encodingHint: hint }),
   });
+  // The provenance to record when this read went through the memo rather than
+  // through admission, and the reason it must be carried explicitly: the hint
+  // path reports `"hint"` because a hint is what it was given, but a hint THIS
+  // plugin supplied from its own memo is not a caller's decision. Recording it
+  // would relabel a guess as a determination on the very second read — the
+  // opposite of what `decided` is for, and a contradiction with the `footer`
+  // below, which deliberately keeps saying "Auto-guessed".
+  //
+  // Only when the caller passed no `encoding` of its own: an explicit hint IS a
+  // decision, and must win over the recorded one.
+  //
+  // The `footer` fallback covers a memo that predates this field: the footer is
+  // written ONLY by the guess path, so its presence proves the encoding was
+  // guessed. Without it that record would fall through to `decoded.decided`
+  // ("hint") and reproduce the very contradiction this line exists to prevent.
+  const provenance =
+    opts.encodingHint === undefined && hint !== undefined
+      ? (memo?.decided ?? (memo?.footer === undefined ? undefined : "guessed"))
+      : undefined;
   // A read that may not speak for the session still needs a state to RETURN (the
   // caller reports on it), but it must not store one. `openStateFor` builds it
   // without recording, so the memo keeps whatever the session actually decided —
@@ -215,8 +261,8 @@ export async function readFile(
   // instead of inverting a guess made for a diff card.
   const state =
     opts.recordState === false
-      ? openStateFor(decoded, version)
-      : recordOpenState(sessionKey, key, decoded, version);
+      ? openStateFor(decoded, version, provenance)
+      : recordOpenState(sessionKey, key, decoded, version, provenance);
 
   // Reuse the recorded guess provenance when this read went through the memo
   // rather than through admission. The hint path produces no footer of its own,
@@ -470,22 +516,50 @@ export async function writeFile(
     //    followed on its first read, so the create path is consistent with the rest
     //    of the plugin rather than a special case.
     if (after?.version !== undefined) {
-      recordOpenState(
-        sessionKey,
-        key,
-        {
-          text: content,
-          encoding: encoded.encoding,
-          hasBOM: encoded.hasBOM,
-          lineEnding: state?.lineEnding ?? detectEnding(content),
-          candidates: [],
-          // A write does not re-derive the encoding, so it must not erase the
-          // provenance the read established: the file was decoded from a GUESS,
-          // and that stays true after an edit.
-          ...(state?.footer === undefined ? {} : { footer: state.footer }),
-        },
-        after.version,
-      );
+      // Written straight into the memo rather than through `recordOpenState`:
+      // that function takes a `DecodeForOpenResult`, and this path did not
+      // decode anything — it INVERTED a record. Building a fake admission result
+      // to satisfy the type would mean inventing the very fields (`decided`,
+      // `candidates`) whose honesty is the point, so the record is composed
+      // directly from what is actually known.
+      //
+      // Migration is the one case where the OLD provenance must NOT be carried
+      // over: `normalizeToUtf8` rewrites a legacy file as UTF-8, so the recorded
+      // encoding and the bytes on disk are both UTF-8 now. Keeping the old
+      // `"guessed"`/`"hint"` would pair `encoding: "utf8"` with a provenance that
+      // only made sense for the retired page — and a strict UTF-8 validation is
+      // a determination, never a guess, so the next read would report a settled
+      // fact as a probabilistic pick. The footer is dropped for the same reason:
+      // it names a page ("Auto-guessed: gbk …") that no longer describes the
+      // file, and leaving it would contradict the encoding beside it.
+      const migrated = state !== undefined && state.encoding !== encoded.encoding;
+      setEncodingState(sessionKey, key, {
+        encoding: encoded.encoding,
+        hasBOM: encoded.hasBOM,
+        lineEnding: state?.lineEnding ?? detectEnding(content),
+        version: after.version,
+        // The provenance of the bytes now on disk.
+        //
+        // A file this session READ keeps the provenance that read established:
+        // a file decoded from a GUESS is still a guess after an edit, and
+        // re-labelling it here would make the next read present that guess as a
+        // decision. Migration is the exception (see above): the encoding was
+        // re-derived, so the old label no longer applies.
+        //
+        // A file being CREATED has no read to inherit from, and must not be left
+        // blank: a blank falls through to the hint path on the next read, which
+        // reports `"hint"` — the documented meaning of "the CALLER specified
+        // this" — for an encoding the plugin chose by itself. The provenance is
+        // therefore derived from what actually determined it.
+        ...(migrated
+          ? { decided: "utf8" satisfies DecodeProvenance }
+          : state?.decided !== undefined
+            ? { decided: state.decided }
+            : { decided: createdProvenance(encoded) }),
+        // Same rule for the provenance note the read showed the model — except
+        // after a migration, where the note is about the retired encoding.
+        ...(!migrated && state?.footer !== undefined ? { footer: state.footer } : {}),
+      });
     }
 
     return { version: after?.version, bytes: encoded.bytes };

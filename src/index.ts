@@ -58,6 +58,11 @@ import {
   writeSectionText,
 } from "./prompts.js";
 import { EncodingSandbox } from "./sandbox.js";
+import {
+  FS_ENCODING_SERVICE,
+  isFsEncodingService,
+  provideFsEncoding,
+} from "./service.js";
 import { buildEditTool } from "./tool-edit.js";
 import { buildInsertTool } from "./tool-insert.js";
 import { buildReadTool } from "./tool-read.js";
@@ -214,8 +219,8 @@ function installAgentTools(rootCtx: Context, agent: Agent): void {
 }
 
 /**
- * Mount the bundle: materialize the default config, then install the tools per
- * agent.
+ * Mount the bundle: materialize the default config, publish the decoding
+ * service, then install the tools per agent.
  *
  * @param rootCtx - the host-plane plugin context.
  */
@@ -228,6 +233,45 @@ export function apply(rootCtx: Context): void {
       }`,
     );
   });
+
+  // The decoding rules other plugins need. Provided once, host-plane, at load
+  // time — not per agent — because the rules do not vary by session; what
+  // varies is the recorded encoding, which is deliberately not part of the
+  // service. Wrapped because a second provider of the same name on this scope
+  // throws, and a plugin that cannot publish its service must still install its
+  // tools rather than lose both.
+  //
+  // The message asserts only what this process can actually verify. "Was the
+  // object already there created by us?" is NOT answerable: `instanceof` fails
+  // across two copies of this module (a duplicate mount then looks foreign), and
+  // a process-global registry can be cleared or pre-seeded by any other plugin
+  // (a foreign object then looks like ours). Both mistakes produce a confident
+  // wrong diagnosis, which is worse than a vague right one. What IS verifiable
+  // is what a consumer will receive — `undefined`, an object offering the decode
+  // entry points, or an object that does not — and that is what decides whether
+  // the rules are usable, so that is what the log states and grades on.
+  try {
+    provideFsEncoding(rootCtx);
+  } catch (error) {
+    const existing = rootCtx.get(FS_ENCODING_SERVICE);
+    const detail = error instanceof Error ? error.message : String(error);
+    if (isFsEncodingService(existing)) {
+      rootCtx.logger.warn(
+        `dsh-fs-encoding: the "${FS_ENCODING_SERVICE}" service was already provided on this ` +
+          `scope (${detail}). This mount did not publish its own instance, so consumers get ` +
+          `whichever object is already registered — an object that does provide the decode ` +
+          `entry points (an earlier mount of this plugin, or another plugin using the same ` +
+          `name). The tools are installed as usual.`,
+      );
+    } else {
+      rootCtx.logger.error(
+        `dsh-fs-encoding: could not provide the "${FS_ENCODING_SERVICE}" service: ${detail}. ` +
+          `Consumers calling ctx.get("${FS_ENCODING_SERVICE}") will receive ${
+            existing === undefined ? "undefined" : "an object without the decode entry points"
+          }, so this plugin's decoding rules are NOT available to them. The tools are unaffected.`,
+      );
+    }
+  }
 
   const registered = new WeakSet<Agent>();
   rootCtx.on("agent/session-start", ({ agent }) => {
@@ -260,4 +304,14 @@ export {
   writeSectionText,
   editSectionText,
 } from "./prompts.js";
+export {
+  FS_ENCODING_SERVICE,
+  FsEncodingService,
+  isFsEncodingService,
+  provideFsEncoding,
+  type FsDecodeOptions,
+  type FsDecodeRefusal,
+  type FsDecodeResult,
+} from "./service.js";
+export type { DecodeProvenance } from "./encoding-state.js";
 export type { FileSystem };
