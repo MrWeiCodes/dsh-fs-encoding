@@ -33,13 +33,20 @@ DSH 自带的 `read` / `write` / `edit` 三个文件工具**只认 UTF-8**，遇
 
 ## 使用
 
-`read` / `write` / `edit` 与原版用法完全相同，`read` 和 `write` 各多了一个可选参数：
+### 开箱即用
 
-```
-read({ file_path: "legacy.txt", encoding: "gbk" })
-```
+**装好就能用，不需要任何配置。** 插件没有必填项、没有初始化步骤，也不会改动你的项目——装上之后，AI 照常用 `read` / `write` / `edit`，编码的事插件自己处理：
 
-不带 `encoding` 时插件会自动识别 UTF-8 文件、带 BOM 的 UTF-16 / UTF-32 文件以及 BOM 本身；**只有无 BOM 的非 UTF-8 文件**才会停下来问你，并给出候选：
+- 读 UTF-8 文件（含带 BOM 的）：和原版完全一样，**BOM 不会再被吃掉**。
+- 读带 BOM 的 UTF-16 / UTF-32 文件：自动识别。
+- 改 GBK、Shift-JIS 等老编码文件：**按原编码写回**，不会被悄悄转成 UTF-8。
+- 写新文件：默认 UTF-8，需要别的编码时加一个参数即可。
+
+这些都不需要你做任何事，也不需要 AI 改调用习惯。日常使用中，AI 的调用方式与原版**完全一致**。
+
+### AI 的调用区别
+
+只有一种情况会不一样：**无 BOM 的非 UTF-8 文件**（典型是 GBK / Big5 / Shift-JIS 的老文件）。此时插件不会擅自猜，而是停下来让 AI 用显式编码重读一次：
 
 ```
 [E_NOT_TEXT] legacy.txt is not valid UTF-8. Most likely gbk. Re-read with
@@ -48,11 +55,18 @@ autoGuessEncoding: true in the plugin config to decode automatically.
 Candidates: gbk("你好，世界"), big5("斕疑"), shift_jis("ﾄ羲")
 ```
 
-照着提示里的调用重读一次，编码就从「猜测」变成了「已知事实」，后续写入都会按它进行。
+AI 照着提示里的调用重读一次即可，**它会自己完成**——你不需要介入。重读之后编码就从「猜测」变成了「已知事实」，后续每次写入都按它进行。
+
+`read` 和 `write` 因此各多了一个可选参数：
+
+```
+read({ file_path: "legacy.txt", encoding: "gbk" })
+write({ file_path: "run.bat", content: "echo 中文\r\n", encoding: "gbk" })
+```
 
 > **无 BOM 的 UTF-16 / UTF-32 文件**同理，用 `read({ file_path: "<路径>", encoding: "utf16le" })` 显式指定即可正常读写（这类文件在 Windows 上较少见，且无 BOM 时无法可靠自动区分字节序，因此不做猜测）。
 
-> **为什么默认要问你一下？** GBK、Big5、Shift-JIS 的字节范围在短文本上互相重叠，猜错在界面上是看不出来的——而且会**按错误的编码写回**，把文件彻底弄坏。所以插件默认选择「宁可失败，不可猜错」。如果你更希望它尽力解码，把 `autoGuessEncoding` 设为 `true` 即可。
+> **为什么默认要问一下？** GBK、Big5、Shift-JIS 的字节范围在短文本上互相重叠，猜错在界面上是看不出来的——而且会**按错误的编码写回**，把文件彻底弄坏。所以插件默认选择「宁可失败，不可猜错」。如果你更希望它尽力解码，把 `autoGuessEncoding` 设为 `true` 即可。
 >
 > 即使开了 `autoGuessEncoding`，也有一种情况仍然会报错并列出候选：文件**极短**（几个字节），且两个独立的识别器给出了**不同的**答案。此时没有任何依据能判断谁对——实测这种情况下的首选有约 79% 是错的——插件宁可让你从候选里挑一个，也不替你赌一把。只要两者给出**相同**的答案，就会直接采用；文件稍长一些（几十字节以上）也基本不会再出现这种歧义。
 >

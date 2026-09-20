@@ -33,13 +33,20 @@ This plugin takes over those three tools and, while **preserving every existing 
 
 ## Usage
 
-`read` / `write` / `edit` work exactly as the built-ins; `read` and `write` each gain one optional argument:
+### Works out of the box
 
-```
-read({ file_path: "legacy.txt", encoding: "gbk" })
-```
+**Install it and you are done — no configuration required.** There is nothing to fill in, no initialization step, and nothing is written into your project. The AI keeps using `read` / `write` / `edit` as before, and the plugin handles the encoding:
 
-Without `encoding`, the plugin auto-detects UTF-8 files, UTF-16 / UTF-32 files that carry a BOM, and the BOM itself; **only a non-UTF-8 file without a BOM** makes it stop and ask, listing candidates:
+- Reading a UTF-8 file (with or without a BOM): identical to the built-ins, and the **BOM is no longer swallowed**.
+- Reading a UTF-16 / UTF-32 file that carries a BOM: detected automatically.
+- Editing a GBK, Shift-JIS or other legacy-encoded file: **saved back in its own encoding**, never silently converted to UTF-8.
+- Writing a new file: UTF-8 by default, or any other encoding with one extra argument.
+
+None of this needs anything from you, and the AI needs no change in habits. In everyday use its calls are **exactly the same** as with the built-ins.
+
+### Where the AI's calls differ
+
+One case behaves differently: a **non-UTF-8 file with no BOM** (typically a legacy GBK / Big5 / Shift-JIS file). The plugin does not guess. It stops and has the AI re-read with an explicit encoding:
 
 ```
 [E_NOT_TEXT] legacy.txt is not valid UTF-8. Most likely gbk. Re-read with
@@ -48,7 +55,14 @@ autoGuessEncoding: true in the plugin config to decode automatically.
 Candidates: gbk("你好，世界"), big5("斕疑"), shift_jis("ﾄ羲")
 ```
 
-Re-read with the call shown in the message and the encoding turns from a guess into a known fact that every later save follows.
+The AI re-reads with the call shown in the message and **handles it on its own** — you are not involved. After that re-read the encoding turns from a guess into a known fact that every later save follows.
+
+`read` and `write` therefore each gain one optional argument:
+
+```
+read({ file_path: "legacy.txt", encoding: "gbk" })
+write({ file_path: "run.bat", content: "echo 中文\r\n", encoding: "gbk" })
+```
 
 > **UTF-16 / UTF-32 files without a BOM** work the same way — specify explicitly with `read({ file_path: "<path>", encoding: "utf16le" })`. Such files are rare on Windows, and without a BOM the byte order cannot be reliably detected, so the plugin does not guess.
 
