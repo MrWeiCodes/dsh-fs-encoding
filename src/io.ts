@@ -29,7 +29,8 @@ import {
   type FileEncodingState,
 } from "./encoding-state.js";
 import type { EncodingSandbox } from "./sandbox.js";
-import { detectEnding } from "./line-endings.js";
+import { detectEnding, toLF } from "./line-endings.js";
+import { clearUndoFor, recordUndo } from "./undo-state.js";
 
 /** A decoded file plus everything a caller needs to report on it. */
 export interface ReadOutcome {
@@ -43,8 +44,17 @@ export interface ReadOutcome {
   footer?: string;
 }
 
-/** The canonical key a target's encoding state is memoized under. */
-function keyOf(target: FsTarget): string {
+/**
+ * The canonical key a target's encoding state is memoized under.
+ *
+ * Exported because the undo history is keyed by the same identity: a record
+ * written under one key and looked up under another would silently never match,
+ * and the undo would report "no history" for a file it just edited.
+ *
+ * @param target - the resolved target.
+ * @returns its canonical key.
+ */
+export function keyOf(target: FsTarget): string {
   const key = (target as unknown as { targetKey?: unknown }).targetKey;
   return typeof key === "string" ? key : target.displayPath;
 }
@@ -313,6 +323,32 @@ export interface WriteRequest {
    * that case, so the two rules cannot disagree — see `tool-write`.
    */
   newFileEncoding?: string | undefined;
+  /**
+   * The text this write REPLACES, LF-normalized and BOM-free, when the caller
+   * already has it. Providing it is what makes the write undoable.
+   *
+   * Optional because two callers legitimately lack it: a file being created has
+   * no previous content, and a caller that could not read the old bytes (a
+   * binary file, a permission failure) must not fabricate them. Absent means
+   * "no undo point", which is the honest answer rather than a guess.
+   */
+  previousText?: string | undefined;
+  /**
+   * The encoding state to RESTORE, when this write is an undo.
+   *
+   * Used instead of the session's recorded state, and it disables
+   * `normalizeToUtf8` for this call. Both halves matter:
+   *
+   * - The record may describe the bytes this write is replacing rather than the
+   *   ones it must restore. With `normalizeToUtf8` on, the edit being undone
+   *   migrated a legacy file to UTF-8, so the session's record says `utf8` while
+   *   the file must go back to `gbk`. Encoding the undo from that record would
+   *   leave the file as UTF-8 — the content reverted, the encoding not.
+   * - Re-applying the migration would do the same thing by a different route:
+   *   the migration is part of the edit being undone, so running it again would
+   *   immediately re-convert what the undo just restored.
+   */
+  restoreState?: FileEncodingState | undefined;
 }
 
 /** What a governed write produced. */
@@ -432,7 +468,7 @@ export async function writeFile(
     // whether it applies, and it only does so when there is no recorded state —
     // i.e. the file is being created. An existing file's encoding wins, which the
     // calling tool has already enforced by refusing the argument outright.
-    const state = getEncodingState(sessionKey, key);
+    const state = req.restoreState ?? getEncodingState(sessionKey, key);
 
     // A file that EXISTS but has no recorded encoding must not be written. The
     // record is bounded (see `MAX_SESSIONS` / `MAX_FILES_PER_SESSION`), so it can
@@ -485,7 +521,10 @@ export async function writeFile(
     }
 
     const encoded = encodeForSave(content, state, {
-      normalizeToUtf8: config.normalizeToUtf8,
+      // An undo supplies the exact state to restore, so the migration toggle does
+      // not apply: the migration being undone is part of the edit, and running it
+      // again would re-convert what this write just put back. See `restoreState`.
+      normalizeToUtf8: req.restoreState === undefined && config.normalizeToUtf8,
       ...(req.newFileEncoding === undefined ? {} : { newFileEncoding: req.newFileEncoding }),
     });
 
@@ -559,6 +598,47 @@ export async function writeFile(
         // Same rule for the provenance note the read showed the model — except
         // after a migration, where the note is about the retired encoding.
         ...(!migrated && state?.footer !== undefined ? { footer: state.footer } : {}),
+      });
+    }
+
+    // 7) Record what this write replaced, so the NEXT write on this file can be
+    //    undone — or, when this write IS an undo, so the spent history is gone.
+    //
+    //    Here rather than in each tool for the reason `service.ts` gives about
+    //    its own single funnel: one recording point means a new tool cannot
+    //    forget to add one. And it is AFTER the publish, so a write that failed
+    //    leaves no undo point claiming an edit that never happened.
+    //
+    //    `previousText` is normalized here, not by the callers. They do not
+    //    agree on the form — `edit` / `insert` pass LF-normalized text while
+    //    `write` passes the caller's content verbatim (CRLF intact) — and the
+    //    undo compares this text against a freshly normalized read, so the two
+    //    sides must be in the same form or every CRLF file would look modified.
+    if (req.restoreState !== undefined) {
+      // This write consumed the history: undoing an undo is a redo, which the
+      // tool does not offer.
+      clearUndoFor(sessionKey, key);
+    } else if (req.previousText !== undefined && state !== undefined) {
+      recordUndo(sessionKey, key, {
+        previousText: toLF(req.previousText),
+        nextText: toLF(content),
+        // The state as it was BEFORE this write. `state` is exactly that: the
+        // record this call read to encode with, which `restoreState` may have
+        // overridden for an undo (handled above). A created file has no prior
+        // state and is not undoable, which the `state !== undefined` guard
+        // enforces.
+        previousState: state,
+        // The version this write produced, which the undo compares against the
+        // file's version before reverting. Without it a change the text cannot
+        // show — converted line endings, an added or removed BOM, a re-encoded
+        // file — would compare equal and be silently overwritten.
+        nextVersion: after?.version,
+        // The encoding these bytes were ACTUALLY written in, which is what the
+        // undo must decode them as. `encoded.encoding` rather than
+        // `state.encoding`: a migration makes the two differ, and the undo's
+        // read needs the one describing what is on disk.
+        nextEncoding: encoded.encoding,
+        mode,
       });
     }
 

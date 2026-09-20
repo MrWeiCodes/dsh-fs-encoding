@@ -180,7 +180,10 @@ export function buildEditTool(ctx: Context, sandbox: EncodingSandbox) {
         await writeFile(
           ctx,
           sandbox,
-          { target, content: next, exec, policy },
+          // `previousText` makes the edit undoable; it is the same LF-normalized
+          // text the match ran against, so the undo's staleness check compares
+          // like with like.
+          { target, content: next, exec, policy, previousText: current },
           "edit",
         );
       } catch (error) {

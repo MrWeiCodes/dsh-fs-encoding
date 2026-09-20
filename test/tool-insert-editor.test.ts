@@ -603,12 +603,59 @@ describe("str_replace_editor — ambiguity message stays bounded", () => {
 });
 
 describe("str_replace_editor — unsupported and invalid commands", () => {
-  it("explains that undo_edit is unsupported", async () => {
-    // Listed in the enum precisely so this sentence is reachable.
+  it("forwards undo_edit to the shared undo, reporting no history", async () => {
+    // `undo_edit` used to answer "[E_UNSUPPORTED] ... keeps no edit history".
+    // That sentence became false once `undo_last_edit` existed, so the command
+    // now forwards to the same implementation. A file nothing edited has no
+    // history, which is an ANSWER rather than a failure — so this resolves with
+    // an explanation instead of rejecting.
     await writeFile(join(dir, "u.txt"), utf8("x\n"));
-    await expect(
-      editor.execute({ command: "undo_edit", path: "u.txt" }, exec),
-    ).rejects.toThrow(/undo_edit is not supported/);
+    const result = (await editor.execute({ command: "undo_edit", path: "u.txt" }, exec)) as {
+      command: string;
+      text: string;
+      before: string;
+      after: string;
+    };
+    expect(result.command).toBe("undo_edit");
+    expect(result.text).toContain("No undo history");
+    // Nothing was reverted, so the diff the card renders is empty by
+    // construction — the two sides are present and equal rather than absent.
+    // Asserted as the exact empty string, not as `before === after`: the latter
+    // also passes for `undefined` or for two equal non-empty values, so it would
+    // not pin the contract this test claims to cover.
+    expect(result).toHaveProperty("before");
+    expect(result).toHaveProperty("after");
+    expect(result.before).toBe("");
+    expect(result.after).toBe("");
+  });
+
+  it("reverts a str_replace through undo_edit, encoding included", async () => {
+    // The command must do real work, not merely explain itself: a GBK file
+    // edited through `str_replace` and reverted through `undo_edit` has to come
+    // back byte-for-byte.
+    //
+    // The file is read first because guessing is off by default and this tool has
+    // no `encoding` argument — that read is what teaches the session the file's
+    // encoding, exactly as it would in a real session. Without it the edit itself
+    // fails `E_NOT_TEXT`, which is the plugin working as designed.
+    const text = "你好，世界\n";
+    const path = join(dir, "u-gbk.txt");
+    await writeFile(path, gbkBytes(text));
+    const { readFile: pluginRead } = await import("../src/io.js");
+    await pluginRead(root, "u-gbk.txt", dir, { exec, encodingHint: "gbk" });
+
+    await editor.execute(
+      { command: "str_replace", path: "u-gbk.txt", old_str: "世界", new_str: "地球" },
+      exec,
+    );
+    const result = (await editor.execute(
+      { command: "undo_edit", path: "u-gbk.txt" },
+      exec,
+    )) as { text: string };
+    expect(result.text).toContain("Reverted");
+
+    const after = await readFile(path);
+    expect(after.equals(gbkBytes(text)), "the file must be GBK again, byte for byte").toBe(true);
   });
 
   it("names the valid commands for an unknown one", async () => {

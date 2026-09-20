@@ -28,7 +28,7 @@ This plugin takes over those three tools and, while **preserving every existing 
 - **Nineteen encodings**: UTF-8 (with BOM), UTF-16, UTF-32, plus GBK, Big5, Shift-JIS, EUC-KR and the full Windows-125x family (Western, Central European, Cyrillic, Greek, Turkish, Hebrew, Arabic, Baltic).
 - **Zero learning curve**: `read` / `write` / `edit` take the same arguments and return the same shapes as the built-ins — **drop-in replacements**, so existing prompts and habits keep working; `read` and `write` each gain one optional `encoding` argument (the one on `write` applies to new files only, see below).
 - **Create files in a chosen encoding**: one `encoding` argument on `write` produces a GBK, Shift-JIS or other legacy-encoded file directly — no writing UTF-8 and converting afterwards.
-- **Two further tools**: `insert` (insert at a line number, which the built-ins cannot do) and `str_replace_editor` (a compatibility layer for its four commands, also encoding-governed). See "Two further tools" below.
+- **Three further tools**: `insert` (insert at a line number, which the built-ins cannot do), `undo_last_edit` (revert the last edit, content and encoding together) and `str_replace_editor` (a compatibility layer for its four commands, also encoding-governed). See "Three further tools" below.
 - **Simple configuration**: one YAML file with a few switches, all overridable by environment variables.
 
 ## Usage
@@ -84,9 +84,9 @@ The accepted names are the same as `read`'s, and aliases and case are insensitiv
 
 > **`encoding` applies to new files only.** Passing it for an existing file fails with `E_ENCODING_NOT_APPLICABLE` instead of converting — preserving a file's encoding is this plugin's core promise, and a conversion rewrites every character of the file in a way the AI cannot see from the reply. **Do not delete the file to force a conversion**: deleting bypasses the read-before-write gate, so content the session never read disappears silently behind a `before: null`, and if the session *had* read the file, every later write fails `FS_STALE_VERSION` and the path cannot be recreated for the rest of the session. This plugin does not convert encodings; when you need a copy in another encoding, write it to a **new path**.
 
-### Two further tools
+### Three further tools
 
-Beyond the three above, the plugin registers two more tools, both encoding-governed (a save lands in the file's own encoding).
+Beyond the three above, the plugin registers three more tools, all encoding-governed (a save lands in the file's own encoding).
 
 **`insert`** — insert at a line number, which the built-ins cannot do. A literal-match edit can only insert where it can quote surrounding text, so "add a line at the top" means reading that line first and reproducing it exactly:
 
@@ -96,6 +96,20 @@ insert({ file_path: "config.ini", insert_line: 0, new_string: "[core]" })
 
 `insert_line` names the line to insert **after**: `0` is the very top, and the file's line count appends. Line numbers match exactly what `read` shows.
 
+**`undo_last_edit`** — revert a file's **most recent edit**, restoring the content and the encoding together:
+
+```
+undo_last_edit({ file_path: "config.ini" })
+```
+
+Use it when an edit produced the wrong result, or when the AI notices its own last change was mistaken. The points that matter:
+
+- **Only the most recent edit is kept.** Edit a file twice and only the second is undoable; undo once and the history is spent (there is no redo).
+- **The encoding is restored too.** If that edit converted a GBK file to UTF-8 (see `normalizeToUtf8`), the undo turns it **back into GBK** — not merely the characters.
+- **A changed file is refused.** Before reverting, the plugin checks the file still matches what that edit wrote; if anything changed it since — you, another tool, another session — the undo is **refused with an explanation** rather than overwriting those changes.
+- **In memory only.** Nothing is written to disk and no repository is polluted, so **an undo does not survive a DSH restart** — the tool says it has no history rather than pretending to succeed.
+- Creating a file leaves no undo point: "undo a creation" means deleting the file, which is too destructive. Delete it directly instead.
+
 **`str_replace_editor`** — a compatibility layer for its four commands, so prompts and habits written for that tool keep working:
 
 | Command | What it does |
@@ -104,7 +118,7 @@ insert({ file_path: "config.ini", insert_line: 0, new_string: "[core]" })
 | `create` | Creates a file; refuses one that already exists |
 | `str_replace` | Replaces the unique match; refuses an ambiguous one and names the lines it found |
 | `insert` | Same as the `insert` tool, same `insert_line` semantics |
-| `undo_edit` | **Not supported**, and says so |
+| `undo_edit` | Same as `undo_last_edit` — reverts the last edit |
 
 > `str_replace` additionally accepts an optional `replace_all`: omit it for the standard behaviour (a unique match is required), pass `true` to replace every occurrence. It is the only argument this plugin adds.
 >
@@ -112,7 +126,7 @@ insert({ file_path: "config.ini", insert_line: 0, new_string: "[core]" })
 
 ## Installation
 
-> **⚠️ Conflict**: **any** plugin that registers `read` / `write` / `edit` / `insert` / `str_replace_editor` — any one of those names — on the same scope layer is mutually exclusive with this one; registering a name twice in a layer throws.
+> **⚠️ Conflict**: **any** plugin that registers `read` / `write` / `edit` / `insert` / `str_replace_editor` / `undo_last_edit` — any one of those names — on the same scope layer is mutually exclusive with this one; registering a name twice in a layer throws.
 >
 > If those names are already held by another plugin **on the same layer**, the install is refused with the offending tool named, rather than leaving a half-registered tool set. To resolve it, either remove this plugin from the profile or disable the plugin that holds the name:
 >
@@ -337,7 +351,7 @@ Names are case- and style-insensitive: `Shift-JIS`, `shift_jis` and `SJIS` all m
 
 - **Zero-intrusion**: the plugin only uses DSH's public interfaces to register tools; it does **not** modify native DSH code and does not replace the `ctx.fs` filesystem itself. Uninstalling restores the built-in tools immediately, leaving nothing behind.
 - **Every existing guarantee is kept**: sandbox fence, read-before-write protection, version checking and observation records all behave exactly as before — anything that should be blocked or questioned still is.
-- **Mutually exclusive with any plugin registering the same tool names**: this plugin registers `read` / `write` / `edit` / `insert` / `str_replace_editor`, and registering a name twice in a layer throws. The test is whether any of those names is already occupied **on that agent's own layer**, regardless of who occupies it — on a collision it refuses to install and names the occupied tool (see Installation above). Built-ins on a host/preset layer are not a collision.
+- **Mutually exclusive with any plugin registering the same tool names**: this plugin registers `read` / `write` / `edit` / `insert` / `str_replace_editor` / `undo_last_edit`, and registering a name twice in a layer throws. The test is whether any of those names is already occupied **on that agent's own layer**, regardless of who occupies it — on a collision it refuses to install and names the occupied tool (see Installation above). Built-ins on a host/preset layer are not a collision.
 - **Session state**: encoding information is kept in memory and isolated per session — never written to disk, never polluting your repository. After a DSH restart, the encoding is detected afresh on the first read.
 - **Publishes a service**: once installed, the plugin provides the `fsEncoding` service so other plugins can reuse the same decoding rules (see [For plugin authors](#for-plugin-authors) below).
 
@@ -421,10 +435,6 @@ npm run build       # src/ → lib/
 The suite covers the encoding algorithms themselves and drives the real filesystem and sandbox components for integration cases, including byte-exact round-trips for every supported encoding, BOM / CRLF fidelity, unmappable-character refusal, stale-write rejection and the sandbox fence.
 
 To customize the plugin, use DSH's Creator mode for quick development.
-
-## Roadmap
-
-Not yet implemented: `undo_last_edit` (revert the previous edit).
 
 ## Acknowledgements
 

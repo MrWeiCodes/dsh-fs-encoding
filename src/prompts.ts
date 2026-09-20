@@ -69,7 +69,15 @@ export const STR_REPLACE_EDITOR_DESCRIPTION =
   "new_str} replaces the unique occurrence of old_str (set `replace_all` to allow " +
   "several); `insert` {path, insert_line, new_str} inserts AFTER insert_line (0 is " +
   "the top, the line count appends); `create` {path, file_text} creates a new file " +
-  "and fails if it exists. `undo_edit` is not supported.";
+  "and fails if it exists; `undo_edit` {path} reverts the last edit, exactly like " +
+  "`undo_last_edit`.";
+
+export const UNDO_DESCRIPTION =
+  "Revert a file to the content and the encoding it had before its most recent " +
+  "edit. Use when an edit produced the wrong result. Only the LAST edit can be " +
+  "reverted, and only while the file still matches what that edit wrote — if the " +
+  "file changed since, the undo is refused rather than overwriting those changes. " +
+  "The history is held in memory, so it does not survive a restart.";
 
 /**
  * The read result envelope, shared by `read` and by `str_replace_editor`'s `view`.

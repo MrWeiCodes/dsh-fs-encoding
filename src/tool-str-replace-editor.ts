@@ -17,9 +17,9 @@
  * - `create` refuses an existing file rather than overwriting it.
  * - `view` lists a directory (2 levels, hidden entries skipped) or shows a file
  *   with line numbers.
- * - `undo_edit` is NOT supported. It is listed so a caller that sends it gets a
- *   sentence saying so, rather than a schema error that names no command; the
- *   harness dropped it too (Anthropic exposes it only on Claude 3.5 and earlier).
+ * - `undo_edit` forwards to `undo_last_edit`'s implementation. The arguments are
+ *   identical (`{path}`), so a second implementation of "undo" would only be a
+ *   way for the two to disagree about what is undoable.
  *
  * @module dsh-fs-encoding/tool-str-replace-editor
  */
@@ -43,6 +43,7 @@ import {
   splitForEdit,
 } from "./line-edit.js";
 import { toLF } from "./line-endings.js";
+import { parseUndoArgs, performUndo } from "./tool-undo.js";
 import { STR_REPLACE_EDITOR_DESCRIPTION, DEFAULT_LIMIT, clipLine, formatReadOutput } from "./prompts.js";
 import type { EncodingSandbox, FsEscalationArgs } from "./sandbox.js";
 import { execCwd } from "./workspace-context.js";
@@ -237,12 +238,38 @@ export function buildStrReplaceEditorTool(ctx: Context, sandbox: EncodingSandbox
       }
 
       if (command === "undo_edit") {
-        // Listed in the enum so this sentence is reachable. The harness has no
-        // undo_edit either; Anthropic exposes it only on Claude 3.5 and earlier.
-        throw new Error(
-          "[E_UNSUPPORTED] str_replace_editor: undo_edit is not supported — this plugin keeps " +
-            "no edit history. Re-apply the previous content with `str_replace` or `write` instead.",
+        // Forwarded rather than reimplemented: the arguments are identical to
+        // `undo_last_edit`'s, and two implementations of "undo" would eventually
+        // disagree about what is undoable. The `path` is validated by the shared
+        // parser, so this runs before the tool's own argument checks below. The
+        // escalation fields ride along, so an approved one-shot escalation
+        // reaches the fence here exactly as it does for every other write.
+        const undoInput = parseUndoArgs(rec, "str_replace_editor");
+        const outcome = await performUndo(
+          ctx,
+          sandbox,
+          undoInput.path,
+          exec,
+          "str_replace_editor",
+          rec as FsEscalationArgs,
         );
+        // Narrowed to this tool's own result shape (`additionalProperties: false`
+        // forbids carrying `undone`/`note` through). The `text` field carries the
+        // explanation, and `before`/`after` are set even when nothing was
+        // reverted — equal, so the card stays empty without a special case.
+        //
+        // The change summary is deliberately NOT appended here: this tool's
+        // `render` adds it (see below), and `formatUndoOutput` already appended
+        // one — which printed the same sentence twice, and computed the whole
+        // file diff a second time under a key the render-side memo could never
+        // match.
+        return {
+          path: outcome.path,
+          command,
+          text: outcome.note,
+          before: outcome.before,
+          after: outcome.after,
+        };
       }
 
       const path = requireString(rec, "path");
@@ -562,7 +589,15 @@ export function buildStrReplaceEditorTool(ctx: Context, sandbox: EncodingSandbox
       }
 
       try {
-        await writeFile(ctx, sandbox, { target, content: next, exec, policy }, "edit");
+        // One write for both `str_replace` and `insert`, so one undo point too.
+        // `previousText` is the LF-normalized text both commands computed from,
+        // which is the form the undo's staleness check compares against.
+        await writeFile(
+          ctx,
+          sandbox,
+          { target, content: next, exec, policy, previousText: current },
+          "edit",
+        );
       } catch (error) {
         if (error instanceof UnmappableError || error instanceof DecodeError) {
           throw new Error(error.message);

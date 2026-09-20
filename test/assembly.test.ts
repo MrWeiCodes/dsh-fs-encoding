@@ -28,15 +28,17 @@ import { apply, inject, name } from "../src/index.js";
  * Every tool name one install registers, sorted.
  *
  * Kept in one place so adding a tool updates one line instead of five
- * assertions. The first three shadow the built-ins; `insert` has no built-in
- * counterpart, and `str_replace_editor` is mounted only by the headless / SDK /
- * ACP profiles, so in a web profile it is a new name too.
+ * assertions. The first three shadow the built-ins; `insert` and
+ * `undo_last_edit` have no built-in counterpart, and `str_replace_editor` is
+ * mounted only by the headless / SDK / ACP profiles, so in a web profile it is a
+ * new name too.
  */
 const REGISTERED_TOOL_NAMES = [
   "edit",
   "insert",
   "read",
   "str_replace_editor",
+  "undo_last_edit",
   "write",
 ];
 

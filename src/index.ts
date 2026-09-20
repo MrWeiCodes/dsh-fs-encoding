@@ -46,6 +46,7 @@ import type { Agent } from "@deepseek-ai/dsh-agent";
 import type { FileSystem } from "@deepseek-ai/dsh-fs";
 import { ensureDefaultConfig } from "./config.js";
 import { clearSession } from "./encoding-state.js";
+import { clearSessionUndo } from "./undo-state.js";
 import {
   editSectionText,
   ORDER_EDIT,
@@ -67,6 +68,7 @@ import { buildEditTool } from "./tool-edit.js";
 import { buildInsertTool } from "./tool-insert.js";
 import { buildReadTool } from "./tool-read.js";
 import { buildStrReplaceEditorTool } from "./tool-str-replace-editor.js";
+import { buildUndoTool } from "./tool-undo.js";
 import { buildWriteTool } from "./tool-write.js";
 
 /** Cordis plugin name used by loader diagnostics. */
@@ -85,16 +87,23 @@ export const inject = ["tools", "systemPrompt", "fs"];
 /**
  * Names of the tools this plugin owns.
  *
- * The first three shadow the built-ins on the agent's layer. The last two are
- * ADDITIONS rather than shadows: `insert` has no built-in counterpart, and
- * `str_replace_editor` is only mounted by the headless / SDK / ACP profiles, not
- * by `dsh-base`, so in a web profile it is a new name too.
+ * The first three shadow the built-ins on the agent's layer. The last three are
+ * ADDITIONS rather than shadows: `insert` and `undo_last_edit` have no built-in
+ * counterpart, and `str_replace_editor` is only mounted by the headless / SDK /
+ * ACP profiles, not by `dsh-base`, so in a web profile it is a new name too.
  *
- * All five are listed because all five are registered, and a name this plugin
+ * All six are listed because all six are registered, and a name this plugin
  * registers is a name it can collide on — the conflict check is about the layer,
  * not about who the other plugin is.
  */
-const OWNED_TOOLS = ["read", "write", "edit", "insert", "str_replace_editor"] as const;
+const OWNED_TOOLS = [
+  "read",
+  "write",
+  "edit",
+  "insert",
+  "str_replace_editor",
+  "undo_last_edit",
+] as const;
 
 /**
  * The operator-facing message for a detected conflict.
@@ -162,6 +171,7 @@ function installAgentTools(rootCtx: Context, agent: Agent): void {
     const editTool = buildEditTool(rootCtx, sandbox);
     const insertTool = buildInsertTool(rootCtx, sandbox);
     const strReplaceEditorTool = buildStrReplaceEditorTool(rootCtx, sandbox);
+    const undoTool = buildUndoTool(rootCtx, sandbox);
 
     try {
       disposers.push(agent.ctx.tools.register(readTool));
@@ -169,6 +179,7 @@ function installAgentTools(rootCtx: Context, agent: Agent): void {
       disposers.push(agent.ctx.tools.register(editTool));
       disposers.push(agent.ctx.tools.register(insertTool));
       disposers.push(agent.ctx.tools.register(strReplaceEditorTool));
+      disposers.push(agent.ctx.tools.register(undoTool));
     } catch (error) {
       // Roll back whatever landed before the failure, so the agent runs a
       // coherent tool set (the built-ins) rather than a half-shadowed one.
@@ -288,11 +299,14 @@ export function apply(rootCtx: Context): void {
     }
   });
 
-  // Release the encoding records a finished session owned. Without this a
-  // long-lived process keeps one bucket per session that ever ran; the bound in
-  // `encoding-state` is the backstop, this is the precise release.
+  // Release the per-session records a finished session owned. Without this a
+  // long-lived process keeps one bucket per session that ever ran; the bounds in
+  // `encoding-state` and `undo-state` are the backstop, this is the precise
+  // release. The undo records matter more here: each holds whole files, so a
+  // leaked bucket is measured in megabytes rather than bytes.
   rootCtx.on("agent/disposed", ({ agent }) => {
     clearSession(agent.id);
+    clearSessionUndo(agent.id);
   });
 }
 

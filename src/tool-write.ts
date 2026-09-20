@@ -227,6 +227,12 @@ export function buildWriteTool(ctx: Context, sandbox: EncodingSandbox) {
       // flag existed: a windows-1252 file's euro sign (0x80) was silently
       // rewritten as windows-1251's 0x88, and a GBK file whose bytes also form
       // valid UTF-8 was converted to UTF-8 outright.
+      //
+      // The same text is what makes this write UNDOABLE, so the capture runs for
+      // any overwrite rather than only when a card is being built. A capture that
+      // fails leaves `before` null, which the write path reads as "no undo
+      // point" — the honest answer, since the old bytes are genuinely unknown and
+      // a fabricated record would revert the file to something it never was.
       let before: string | null = null;
       if (operation === "update") {
         try {
@@ -252,6 +258,7 @@ export function buildWriteTool(ctx: Context, sandbox: EncodingSandbox) {
             exec,
             policy,
             ...(input.encoding === undefined ? {} : { newFileEncoding: input.encoding }),
+            ...(before === null ? {} : { previousText: before }),
           },
           "write",
         );

@@ -184,7 +184,12 @@ export function buildInsertTool(ctx: Context, sandbox: EncodingSandbox) {
       }
 
       try {
-        await writeFile(ctx, sandbox, { target, content: next, exec, policy }, "edit");
+        await writeFile(
+          ctx,
+          sandbox,
+          { target, content: next, exec, policy, previousText: current },
+          "edit",
+        );
       } catch (error) {
         if (error instanceof UnmappableError || error instanceof DecodeError) {
           throw new Error(error.message);
