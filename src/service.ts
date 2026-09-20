@@ -313,15 +313,43 @@ export class FsEncodingService {
         "E_BAD_ENCODING",
       );
     }
-    if (opts.encoding !== undefined && typeof opts.encoding !== "string") {
+    // The OPTION half of "a read may throw". Every field below is read through
+    // `readOption`, never as `opts.field`: a getter (or a Proxy's `get` trap) may
+    // throw, and a bare read would let that throw escape `tryDecode`, which
+    // documents that it never throws — the same promise the type checks below
+    // exist to keep. A plain data property cannot throw, so this costs nothing
+    // on the path every real caller takes. The `bytes` argument needs the same
+    // guard and gets it further down, where the view is normalized.
+    const encoding = readOption(opts, "encoding");
+    const displayPath = readOption(opts, "displayPath");
+    const maxBytes = readOption(opts, "maxBytes");
+    if (encoding === THREW) {
       throw new DecodeError(
-        `[E_BAD_ENCODING] encoding must be a string, got ${typeof opts.encoding}. Supported: ${SUPPORTED_ENCODINGS_TEXT}`,
+        `[E_BAD_ENCODING] opts.encoding could not be read: its getter threw. Pass a plain { encoding: "..." } object.`,
         "E_BAD_ENCODING",
       );
     }
-    if (opts.displayPath !== undefined && typeof opts.displayPath !== "string") {
+    if (displayPath === THREW) {
       throw new DecodeError(
-        `[E_BAD_ENCODING] displayPath must be a string, got ${typeof opts.displayPath}.`,
+        `[E_BAD_ENCODING] opts.displayPath could not be read: its getter threw. Pass a plain { displayPath: "..." } object.`,
+        "E_BAD_ENCODING",
+      );
+    }
+    if (maxBytes === THREW) {
+      throw new DecodeError(
+        `[E_BAD_ENCODING] opts.maxBytes could not be read: its getter threw. Pass a plain { maxBytes: <number> } object.`,
+        "E_BAD_ENCODING",
+      );
+    }
+    if (encoding !== undefined && typeof encoding !== "string") {
+      throw new DecodeError(
+        `[E_BAD_ENCODING] encoding must be a string, got ${typeof encoding}. Supported: ${SUPPORTED_ENCODINGS_TEXT}`,
+        "E_BAD_ENCODING",
+      );
+    }
+    if (displayPath !== undefined && typeof displayPath !== "string") {
+      throw new DecodeError(
+        `[E_BAD_ENCODING] displayPath must be a string, got ${typeof displayPath}.`,
         "E_BAD_ENCODING",
       );
     }
@@ -337,21 +365,20 @@ export class FsEncodingService {
     // message telling the caller to raise the very argument just ignored. An
     // unusable value is therefore refused, not reinterpreted.
     let cap = config.maxFileBytes;
-    if (opts.maxBytes !== undefined) {
-      if (!Number.isSafeInteger(opts.maxBytes) || opts.maxBytes <= 0) {
+    if (maxBytes !== undefined) {
+      if (!Number.isSafeInteger(maxBytes) || (maxBytes as number) <= 0) {
         // `String(value)` is NOT safe here: the value failed the integer check
         // precisely because it may be a Symbol (String() is fine) or an object
         // whose `toString` throws — and that throw would escape `tryDecode`,
         // breaking the one promise this validation exists to keep. Numbers are
         // reported by value (the useful case); everything else by type.
-        const shown =
-          typeof opts.maxBytes === "number" ? String(opts.maxBytes) : typeof opts.maxBytes;
+        const shown = typeof maxBytes === "number" ? String(maxBytes) : typeof maxBytes;
         throw new DecodeError(
           `[E_BAD_ENCODING] maxBytes must be a positive safe integer, got ${shown}. Omit it to use this deployment's maxFileBytes (${config.maxFileBytes}); there is no "unlimited" value.`,
           "E_BAD_ENCODING",
         );
       }
-      cap = opts.maxBytes;
+      cap = maxBytes as number;
     }
     // Normalized rather than merely checked, so everything below operates on a
     // genuine `Uint8Array` and the type is not a claim the value fails to keep.
@@ -359,32 +386,88 @@ export class FsEncodingService {
     // The cap is enforced BEFORE normalization, because normalization copies a
     // cross-realm or signed view: checking afterwards would duplicate an
     // arbitrarily large buffer first — the memory amplification the cap exists
-    // to prevent. The length is therefore read from the caller's value, which is
-    // safe for every type that reaches here (all of them are ArrayBuffer views,
-    // and their `byteLength` is a plain data property).
-    const declared = viewByteLength(bytes);
-    if (declared !== undefined && declared > cap) {
+    // to prevent. The length is therefore read from the caller's value.
+    //
+    // The `bytes` half of the same threat the option reads above defend against,
+    // and it needs the same guard. `ArrayBuffer.isView` proves the internal slot
+    // is present, but says nothing about who owns the PROPERTIES: a `Uint8Array`
+    // subclass — or `Object.defineProperty` on a plain instance — may carry its
+    // own `BYTES_PER_ELEMENT`, `buffer`, `byteOffset` or `byteLength` accessor,
+    // and such a getter may throw. A bare read would let that throw escape
+    // `tryDecode`, which documents that it never throws for ANY input — and
+    // `bytes` is the argument a caller passes most often. The reads are wrapped
+    // together rather than one at a time, because they are one failure and
+    // scattering the guard is how one of them gets forgotten.
+    //
+    // The guard alone would not be enough, and a `try` is not even the point:
+    // `toByteArray` deliberately returns a same-realm `Uint8Array` UNTOUCHED, so
+    // `raw` could still be the caller's own object — one whose `length` or
+    // `subarray` a subclass may have shadowed, which admission below reads. It is
+    // re-viewed once, here, into a PLAIN `Uint8Array` over the same bytes, so
+    // nothing downstream consults the caller's object at all.
+    //
+    // The re-view is built from the INTERNAL SLOTS, never from `normalized`'s own
+    // properties. Reading them would be the very mistake this guard exists to
+    // prevent, one level down: a shadowed `buffer`/`byteOffset`/`byteLength` that
+    // RETURNS (rather than throws) would decide which bytes get decoded, turning
+    // a hostile view into a silent mis-decode of a different range — and an
+    // under-reported `byteLength` would walk an oversized view past the cap. The
+    // slots cannot be shadowed and cannot lie. It costs NO data copy: the view
+    // aliases the same bytes.
+    let declared: number | undefined;
+    let raw: Uint8Array | undefined;
+    let rawLength = 0;
+    try {
+      declared = viewByteLength(bytes);
+      // Inside the same `try`, and BEFORE normalization: the cap has to hold
+      // before the copy that normalization may perform, or an over-limit view is
+      // duplicated first — the memory amplification the cap exists to prevent.
+      // Re-thrown as-is by the `catch` below, which only converts the failures
+      // that are not already refusals.
+      if (declared !== undefined && declared > cap) {
+        throw new DecodeError(
+          `[E_TOO_LARGE] ${displayPath ?? "(unknown path)"} is ${declared} bytes, over the ${cap}-byte cap for a decode. Raise maxBytes (or the plugin's maxFileBytes) to decode it.`,
+          "E_TOO_LARGE",
+        );
+      }
+      const normalized = toByteArray(bytes);
+      if (normalized !== undefined) {
+        raw = new Uint8Array(
+          SLOT_BUFFER.call(normalized),
+          SLOT_BYTE_OFFSET.call(normalized),
+          SLOT_BYTE_LENGTH.call(normalized),
+        );
+        rawLength = SLOT_BYTE_LENGTH.call(raw);
+      }
+    } catch (error) {
+      if (error instanceof DecodeError) throw error;
+      // The only read that can still reach a caller's code is the element-size
+      // declaration (`BYTES_PER_ELEMENT` has no internal slot, so it has to be
+      // read off the value), and a Proxy reporting an endless prototype chain
+      // makes even the native lookup throw. Everything about the byte LAYOUT is
+      // read through the prototype accessors above, which never touch the
+      // caller's accessors at all — so this message names the declaration rather
+      // than claiming a layout property threw.
       throw new DecodeError(
-        `[E_TOO_LARGE] ${opts.displayPath ?? "(unknown path)"} is ${declared} bytes, over the ${cap}-byte cap for a decode. Raise maxBytes (or the plugin's maxFileBytes) to decode it.`,
-        "E_TOO_LARGE",
+        `[E_BAD_ENCODING] bytes could not be read: reading this view's BYTES_PER_ELEMENT threw. Pass a plain Uint8Array.`,
+        "E_BAD_ENCODING",
       );
     }
-    const raw = toByteArray(bytes);
     if (raw === undefined) {
       throw new DecodeError(
         `[E_BAD_ENCODING] bytes must be a Uint8Array (or another one-byte view), got ${typeof bytes}.`,
         "E_BAD_ENCODING",
       );
     }
-    if (raw.length > cap) {
+    if (rawLength > cap) {
       throw new DecodeError(
-        `[E_TOO_LARGE] ${opts.displayPath ?? "(unknown path)"} is ${raw.length} bytes, over the ${cap}-byte cap for a decode. Raise maxBytes (or the plugin's maxFileBytes) to decode it.`,
+        `[E_TOO_LARGE] ${displayPath ?? "(unknown path)"} is ${rawLength} bytes, over the ${cap}-byte cap for a decode. Raise maxBytes (or the plugin's maxFileBytes) to decode it.`,
         "E_TOO_LARGE",
       );
     }
     return decodeForOpen(raw, config, {
-      ...(opts.encoding === undefined ? {} : { encodingHint: opts.encoding }),
-      ...(opts.displayPath === undefined ? {} : { displayPath: opts.displayPath }),
+      ...(encoding === undefined ? {} : { encodingHint: encoding as string }),
+      ...(displayPath === undefined ? {} : { displayPath: displayPath as string }),
     });
   }
 
@@ -431,6 +514,113 @@ function refusalOf(error: DecodeError): FsDecodeRefusal {
 }
 
 /**
+ * Sentinel for "reading this option threw", distinct from every real value.
+ *
+ * A module-private symbol cannot be produced by a caller, so it cannot be
+ * confused with a legitimate `undefined` (not supplied) or with any value a
+ * getter might return.
+ */
+const THREW: unique symbol = Symbol("dsh-fs-encoding.option-threw");
+
+/**
+ * Read one option field without letting a getter's throw escape.
+ *
+ * `opts.field` is not a safe read: a getter — or a Proxy's `get` trap — may
+ * throw, and that throw would leave `tryDecode` as an exception even though it
+ * documents that it never throws for any input. Reading through here turns that
+ * into a value the caller can refuse on. A plain data property never throws, so
+ * the `try` costs nothing on the path every real caller takes.
+ *
+ * @param opts - the validated options object.
+ * @param key - the field to read.
+ * @returns the value, `undefined` when absent, or {@link THREW}.
+ */
+function readOption(
+  opts: FsDecodeOptions,
+  key: keyof FsDecodeOptions,
+): unknown | typeof THREW {
+  try {
+    return (opts as Record<string, unknown>)[key];
+  } catch {
+    return THREW;
+  }
+}
+
+/**
+ * The TypedArray internal-slot accessors, captured once at module load.
+ *
+ * A view's own properties are NOT a safe read even when they do not throw: a
+ * subclass field or a `defineProperty` accessor SHADOWS the prototype getter and
+ * can answer with a LIE, and a lie about which buffer, or where inside it, is a
+ * silent mis-decode — the exact failure this plugin exists to prevent. A lie
+ * about the length is worse: an under-reported `byteLength` walks an oversized
+ * view straight past the cap.
+ *
+ * The prototype's own getter reads the internal slot, so it cannot be shadowed,
+ * cannot be lied to, and never invokes the caller's accessor at all. That is why
+ * every byte-layout read below goes through here rather than through the view.
+ */
+const TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype) as object;
+
+/**
+ * Capture one internal-slot accessor off the TypedArray prototype.
+ *
+ * @param key - the accessor to capture.
+ * @returns the prototype's own getter.
+ * @throws when the prototype does not carry that accessor. Unreachable unless
+ *   the language itself changed, and failing loud at load is better than
+ *   silently falling back to the shadowable instance read.
+ */
+function slotAccessor<T>(key: string): (this: unknown) => T {
+  const descriptor = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTOTYPE, key);
+  if (descriptor?.get === undefined) {
+    throw new Error(`dsh-fs-encoding: TypedArray.prototype.${key} is not an accessor`);
+  }
+  return descriptor.get as (this: unknown) => T;
+}
+
+const SLOT_BUFFER = slotAccessor<ArrayBufferLike>("buffer");
+const SLOT_BYTE_OFFSET = slotAccessor<number>("byteOffset");
+const SLOT_BYTE_LENGTH = slotAccessor<number>("byteLength");
+const SLOT_LENGTH = slotAccessor<number>("length");
+
+/**
+ * Whether this view is one BYTE per element, decided without trusting the view.
+ *
+ * `BYTES_PER_ELEMENT` is a DATA property of each concrete prototype
+ * (`Uint8Array.prototype`, `Int16Array.prototype`, …), not an internal slot, so
+ * it has no accessor to capture — but reading it off the value would consult the
+ * INSTANCE first and honour a shadowing field or accessor, which either throws or
+ * answers `1` for a `Uint16Array` and lets a wider view be decoded as bytes.
+ *
+ * The declared value is therefore only a cheap first gate; the decision is made
+ * by the internal slots: a one-byte view has exactly as many bytes as elements.
+ * `length` and `byteLength` are read through the prototype accessors, so they
+ * cannot be shadowed and cannot lie, and a view whose declaration disagrees with
+ * its own slots is refused rather than believed.
+ *
+ * The prototype chain is deliberately NOT walked. A `Proxy` can report an
+ * endless chain of prototypes (its `getPrototypeOf` trap may return a fresh proxy
+ * each time), which would spin this function forever and block the host event
+ * loop for every session — the native lookup below is guarded by the engine and
+ * terminates.
+ *
+ * @param value - a value that already passed `ArrayBuffer.isView`.
+ * @returns whether the view is byte-sized.
+ */
+function isByteSizedView(value: object): boolean {
+  // Native lookup, so a Proxy reporting an infinite prototype chain cannot hang
+  // this. A getter that throws is not caught here: the caller wraps this read,
+  // so the throw becomes a refusal rather than an escape.
+  if ((value as { BYTES_PER_ELEMENT?: unknown }).BYTES_PER_ELEMENT !== 1) return false;
+  const bytes = SLOT_BYTE_LENGTH.call(value);
+  const elements = SLOT_LENGTH.call(value);
+  // `0 === 0` for an empty view of any element size, so the declared `1` above is
+  // what decides that case; for a non-empty view the two must agree exactly.
+  return elements === 0 ? bytes === 0 : bytes === elements;
+}
+
+/**
  * The byte length of a candidate buffer, when it is one at all.
  *
  * Read before normalization so an over-limit buffer can be refused without first
@@ -443,9 +633,14 @@ function refusalOf(error: DecodeError): FsDecodeRefusal {
  */
 function viewByteLength(value: unknown): number | undefined {
   if (!ArrayBuffer.isView(value)) return undefined;
-  if ((value as { BYTES_PER_ELEMENT?: unknown }).BYTES_PER_ELEMENT !== 1) return undefined;
-  if ((value as { buffer?: { detached?: unknown } }).buffer?.detached === true) return undefined;
-  return (value as ArrayBufferView).byteLength;
+  if (!isByteSizedView(value)) return undefined;
+  // The internal slot, never the instance property: a shadowing accessor could
+  // otherwise report a small length and walk an oversized view past the cap.
+  const buffer = SLOT_BUFFER.call(value);
+  // `SharedArrayBuffer` has no `detached` property, so it reads `undefined` here
+  // and is unaffected.
+  if ((buffer as { detached?: unknown }).detached === true) return undefined;
+  return SLOT_BYTE_LENGTH.call(value);
 }
 
 /**
@@ -486,7 +681,7 @@ function toByteArray(value: unknown): Uint8Array | undefined {
   // Testing it first is what keeps the refusal a value instead of a TypeError
   // escaping into the caller.
   if (!ArrayBuffer.isView(value)) return undefined;
-  if ((value as { BYTES_PER_ELEMENT?: unknown }).BYTES_PER_ELEMENT !== 1) return undefined;
+  if (!isByteSizedView(value)) return undefined;
   // A detached buffer must be refused, and the check has to come before either
   // branch below. Its view still passes `isView` and reports `byteLength === 0`,
   // so without this it takes one of two wrong paths: a `Uint8Array` is returned
@@ -494,16 +689,22 @@ function toByteArray(value: unknown): Uint8Array | undefined {
   // misread of a buffer whose bytes are gone), while a signed or clamped view
   // reaches `slice` and throws "Cannot perform ... on a detached ArrayBuffer" —
   // a TypeError escaping `tryDecode`, which documents that it never throws.
+  // The internal slot is read rather than the instance property, so a shadowing
+  // accessor cannot claim a healthy buffer for a detached one (or the reverse).
   // `SharedArrayBuffer` has no `detached` property, so it reads `undefined` here
   // and is unaffected.
-  if ((value as { buffer?: { detached?: unknown } }).buffer?.detached === true) return undefined;
+  const buffer = SLOT_BUFFER.call(value);
+  if ((buffer as { detached?: unknown }).detached === true) return undefined;
   // A genuine same-realm Uint8Array is returned as-is (no copy on the common
   // path). Everything else that reached this point is a signed, clamped or
   // cross-realm one-byte view, which shares the byte layout but not the element
   // semantics, so it is copied into a real Uint8Array rather than cast.
   if (value instanceof Uint8Array) return value;
-  const view = value as ArrayBufferView;
-  return new Uint8Array(view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength));
+  // Copied from the internal slots, not from the instance properties: the
+  // offsets below decide WHICH bytes are copied, so a shadowed `byteOffset` or
+  // `byteLength` would silently copy a different range than the view denotes.
+  const offset = SLOT_BYTE_OFFSET.call(value);
+  return new Uint8Array(buffer.slice(offset, offset + SLOT_BYTE_LENGTH.call(value)));
 }
 
 /**

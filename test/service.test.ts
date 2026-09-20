@@ -492,6 +492,278 @@ describe("refusal is a value a consumer can act on", () => {
     }
   });
 
+  it("refuses an option whose getter throws, instead of letting it escape", async () => {
+    // The option half of the hole. Every FIELD was validated, but the reads
+    // themselves were bare `opts.field` accesses — and a getter, or a Proxy's
+    // `get` trap, may throw. That turned a documented "never throws" into a
+    // rejected promise for an `opts` that passes the object check, which is
+    // precisely the shape a consumer skips its own `try` for. (The `bytes`
+    // argument is the other half, and is covered by its own test below.)
+    for (const key of ["encoding", "displayPath", "maxBytes"] as const) {
+      const hostile = {
+        get [key]() {
+          throw new Error(`${key} getter boom`);
+        },
+      };
+      const r = await service.tryDecode(utf8("x"), hostile as never);
+      expect(r.ok, `a throwing ${key} getter should refuse`).toBe(false);
+      if (r.ok) throw new Error("expected a refusal");
+      expect(r.refusal.code).toBe("E_BAD_ENCODING");
+      expect(r.refusal.message).toContain(`${key} could not be read`);
+    }
+
+    // A Proxy whose `get` trap throws is the same hole with no getter written.
+    const proxied = new Proxy({}, {
+      get() {
+        throw new Error("proxy get boom");
+      },
+    });
+    const viaProxy = await service.tryDecode(utf8("x"), proxied as never);
+    expect(viaProxy.ok).toBe(false);
+
+    // `decode` must report the same thing as a `DecodeError`, not a TypeError.
+    await expect(
+      service.decode(utf8("x"), {
+        get encoding() {
+          throw new Error("boom");
+        },
+      } as never),
+    ).rejects.toThrow(/could not be read/);
+  });
+
+  it("reads the view's own bytes, never the view's own properties", async () => {
+    // `ArrayBuffer.isView` proves the internal slot is present but says nothing
+    // about who owns the PROPERTIES: a subclass — or `defineProperty` on a plain
+    // instance — can shadow `buffer`, `byteOffset`, `byteLength` or `length` with
+    // an accessor that throws, or with one that LIES. The byte layout is
+    // therefore read through the prototype's own accessors (which read the
+    // internal slots, cannot be shadowed and cannot lie), so a caller's accessors
+    // are not consulted at all: a hostile view can neither redirect the decode
+    // nor make it throw.
+    //
+    // `BYTES_PER_ELEMENT` is the exception, and only because it has no accessor
+    // to capture: it is a data property of each concrete prototype, so the read
+    // has to go through the value and a throwing accessor there IS reached. That
+    // is still safe — it is refused rather than escaping — which is what the two
+    // groups below pin down.
+    for (const prop of ["buffer", "byteOffset", "byteLength", "length"] as const) {
+      // Throwing accessor: never invoked, so this decodes rather than escaping.
+      const throwing = new Uint8Array([0x61, 0x62, 0x63]);
+      Object.defineProperty(throwing, prop, {
+        get() {
+          throw new Error(`${prop} boom`);
+        },
+      });
+      const r = await service.tryDecode(throwing, { encoding: "utf8" });
+      expect(r.ok, `a throwing ${prop} accessor must not escape`).toBe(true);
+      if (!r.ok) throw new Error("expected a decode");
+      expect(r.result.text, prop).toBe("abc");
+    }
+    // The element-size read cannot avoid the value, so a throw there becomes a
+    // refusal. The point is that it does NOT escape `tryDecode`.
+    const throwingElementSize = new Uint8Array([0x61, 0x62, 0x63]);
+    Object.defineProperty(throwingElementSize, "BYTES_PER_ELEMENT", {
+      get() {
+        throw new Error("BYTES_PER_ELEMENT boom");
+      },
+    });
+    const refusedElementSize = await service.tryDecode(throwingElementSize);
+    expect(refusedElementSize.ok, "a throwing element-size accessor must refuse, not escape").toBe(false);
+    if (refusedElementSize.ok) throw new Error("expected a refusal");
+    expect(refusedElementSize.refusal.code).toBe("E_BAD_ENCODING");
+
+    // A LYING accessor is the dangerous shape, and the reason the slots are read
+    // instead of the properties: a guard that merely wrapped these reads in a
+    // `try` would still have honoured the lie, silently decoding a different
+    // range than the view denotes. Each of these lies about a different part of
+    // the byte layout, and every one must be ignored.
+    const backing = new Uint8Array([0x41, 0x42, 0x61, 0x62, 0x63]); // "ABabc"
+    const lies: Array<[string, () => unknown]> = [
+      ["buffer", () => new Uint8Array([0x58, 0x59, 0x5a]).buffer], // "XYZ"
+      ["buffer", () => 4096], // not even a buffer
+      ["byteOffset", () => 0], // would decode "ABa"
+      ["byteLength", () => 1], // would decode "a"
+      ["length", () => 999], // would decode past the view
+    ];
+    for (const [prop, lie] of lies) {
+      const lying = backing.subarray(2);
+      Object.defineProperty(lying, prop, { get: lie });
+      const r = await service.tryDecode(lying, { encoding: "utf8" });
+      expect(r.ok, `a lying ${prop} accessor must not redirect the decode`).toBe(true);
+      if (!r.ok) throw new Error("expected a decode");
+      expect(r.result.text, `the lie about ${prop} must be ignored`).toBe("abc");
+    }
+
+    // A class field is the accidental version of the same shadow — no malice,
+    // just a name collision with a prototype getter. (Declared through
+    // `defineProperty` rather than a class field because TypeScript refuses the
+    // field outright: the shadow is a type error at the declaration site, which
+    // is exactly why the runtime path still has to cope with it.)
+    class CachedBuffer extends Uint8Array {}
+    const cachedView = new CachedBuffer([0x61, 0x62, 0x63]);
+    Object.defineProperty(cachedView, "buffer", { value: 8, writable: true });
+    const cached = await service.tryDecode(cachedView, { encoding: "utf8" });
+    expect(cached.ok).toBe(true);
+    if (!cached.ok) throw new Error("expected a decode");
+    expect(cached.result.text, "a shadowing class field must be ignored").toBe("abc");
+
+    // The element size is what decides whether a view may be decoded as BYTES,
+    // so a wider view claiming `BYTES_PER_ELEMENT === 1` must stay refused, or
+    // the same buffer would be silently reinterpreted. The declaration is only a
+    // first gate; the internal slots are what settle it (a one-byte view has as
+    // many bytes as elements), which is why a lying declaration cannot pass.
+    for (const lie of [
+      () => 1,
+      () => "1",
+      () => true,
+    ]) {
+      const wider = new Uint16Array([0x6261]);
+      Object.defineProperty(wider, "BYTES_PER_ELEMENT", { get: lie });
+      const refusedWide = await service.tryDecode(wider as never);
+      expect(refusedWide.ok, "a wider view must not pass by shadowing its element size").toBe(false);
+      if (refusedWide.ok) throw new Error("expected a refusal");
+      expect(refusedWide.refusal.code).toBe("E_BAD_ENCODING");
+    }
+    // A DATA shadow (not an accessor) is the same lie told without a getter.
+    const widerData = new Uint16Array([0x6261]);
+    Object.defineProperty(widerData, "BYTES_PER_ELEMENT", { value: 1, writable: true });
+    expect((await service.tryDecode(widerData as never)).ok).toBe(false);
+
+    // An empty wider view is the case a slot-only ratio cannot settle on its own
+    // (`0 === 0` for every element size), so the declaration decides it: an empty
+    // `Uint16Array` is still not a byte view and must stay refused.
+    expect((await service.tryDecode(new Uint16Array(0) as never)).ok).toBe(false);
+
+    // The detached check must also read the slot: a view over a transferred
+    // buffer must stay refused no matter what its properties claim.
+    const detached = new Uint8Array([0x61, 0x62, 0x63]);
+    structuredClone(detached.buffer, { transfer: [detached.buffer] });
+    Object.defineProperty(detached, "buffer", { get: () => new ArrayBuffer(3) });
+    const refusedDetached = await service.tryDecode(detached);
+    expect(refusedDetached.ok, "a detached buffer must stay refused").toBe(false);
+    if (refusedDetached.ok) throw new Error("expected a refusal");
+    expect(refusedDetached.refusal.code).toBe("E_BAD_ENCODING");
+  });
+
+  it("refuses a Proxy reporting an endless prototype chain, without hanging", async () => {
+    // The element-size check must not walk the prototype chain by hand. A Proxy
+    // whose `getPrototypeOf` trap returns a fresh proxy each time describes an
+    // ENDLESS chain, and a hand-written walk would spin on it forever —
+    // synchronously, blocking the host event loop for every session, which is a
+    // worse failure than the throw this guard exists to stop. The native lookup
+    // is guarded by the engine and terminates, so the read stays bounded.
+    const endless: ProxyHandler<object> = {
+      getOwnPropertyDescriptor: () => undefined,
+      getPrototypeOf: () => new Proxy({}, endless),
+    };
+    const view = new Uint8Array([0x61, 0x62, 0x63]);
+    Object.setPrototypeOf(view, new Proxy({}, endless));
+
+    const r = await service.tryDecode(view);
+    expect(r.ok, "an endless prototype chain must refuse, not hang").toBe(false);
+    if (r.ok) throw new Error("expected a refusal");
+    expect(r.refusal.code).toBe("E_BAD_ENCODING");
+
+    // And it must not become a way past the element-size gate either: a wider
+    // view that lies about its element size stays refused even when its
+    // prototype chain cannot be enumerated.
+    const wider = new Uint16Array([0x6261]);
+    Object.defineProperty(wider, "BYTES_PER_ELEMENT", { value: 1 });
+    Object.setPrototypeOf(wider, new Proxy({}, endless));
+    expect((await service.tryDecode(wider as never)).ok).toBe(false);
+  });
+
+  it("still enforces the cap when the view lies about its size", async () => {
+    // The cap has to be read from the slot too. An under-reported `byteLength` is
+    // the shape that matters: it would otherwise walk an oversized view straight
+    // past the cap and into the full candidate ranking the cap exists to prevent.
+    const big = new Uint8Array(4096);
+    Object.defineProperty(big, "byteLength", { get: () => 8 });
+    const r = await service.tryDecode(big, { maxBytes: 16 });
+    expect(r.ok, "an under-reported byteLength must not defeat the cap").toBe(false);
+    if (r.ok) throw new Error("expected a refusal");
+    expect(r.refusal.code).toBe("E_TOO_LARGE");
+
+    // And an over-reported one must not refuse a view that is actually small.
+    const small = new Uint8Array([0x61, 0x62, 0x63]);
+    Object.defineProperty(small, "byteLength", { get: () => 1 << 20 });
+    const allowed = await service.tryDecode(small, { maxBytes: 16, encoding: "utf8" });
+    expect(allowed.ok, "an over-reported byteLength must not refuse a small view").toBe(true);
+
+    // Both properties lied about at once. This is the combination that matters:
+    // the cap is checked against the DECLARED length first, so a view that
+    // under-reports `byteLength` walks past that gate — and if the second check
+    // (on the view actually decoded) read the caller's `length` instead of the
+    // slot, it would agree with the lie and the oversized buffer would be
+    // decoded whole. Verified against the pre-change build, where this exact
+    // input decoded all 4096 bytes under a 16-byte cap.
+    const doubleLiar = new Uint8Array(4096);
+    Object.defineProperty(doubleLiar, "byteLength", { get: () => 8 });
+    Object.defineProperty(doubleLiar, "length", { get: () => 8 });
+    const both = await service.tryDecode(doubleLiar, { maxBytes: 16 });
+    expect(both.ok, "two agreeing lies must not defeat the cap").toBe(false);
+    if (both.ok) throw new Error("expected a refusal");
+    expect(both.refusal.code).toBe("E_TOO_LARGE");
+  });
+
+  it("decodes a view it had to re-view, honouring the view's own offset", async () => {
+    // The guard re-views the caller's value so admission never touches the
+    // caller's own accessors. That must stay a VIEW over the same bytes, with
+    // the offset and length of the ORIGINAL view: rebuilding it as
+    // `new Uint8Array(normalized.buffer)` would silently decode the whole
+    // backing buffer — here four leading zero bytes the caller excluded.
+    const gbkBytes = gbk("你好，世界");
+    const padded = new Uint8Array(gbkBytes.length + 8);
+    padded.set(gbkBytes, 4);
+    const slice = padded.subarray(4, 4 + gbkBytes.length);
+    expect(slice.byteOffset).toBe(4);
+
+    const r = await service.tryDecode(slice, { encoding: "gbk" });
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error("expected a decode");
+    expect(r.result.encoding).toBe("gbk");
+    expect(r.result.text, "the excluded padding must not reach the decode").toBe("你好，世界");
+
+    // And the view is not narrowed by the re-view either: a subarray of the
+    // result must still address the caller's bytes, not a private copy.
+    const whole = new Uint8Array(gbkBytes.length + 8);
+    whole.set(gbkBytes, 4);
+    const middle = whole.subarray(4, 4 + gbkBytes.length);
+    const decoded = await service.tryDecode(middle, { encoding: "gbk" });
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) throw new Error("expected a decode");
+    expect(decoded.result.text).toBe("你好，世界");
+  });
+
+  it("still accepts every legitimate shape of opts after the guard", async () => {
+    // The guard reads through an index signature, so the shapes that must keep
+    // working are pinned here: an object with no prototype and a frozen object
+    // both take the same path as a plain literal, and `encoding` must still
+    // reach admission rather than being swallowed by the guard.
+    const gbkBytes = gbk("你好，世界");
+    for (const [name, opts] of [
+      ["plain literal", { encoding: "gbk" }],
+      ["frozen", Object.freeze({ encoding: "gbk" })],
+      ["null-prototype", Object.assign(Object.create(null), { encoding: "gbk" })],
+      ["all three fields", { encoding: "gbk", displayPath: "x.txt", maxBytes: 4096 }],
+    ] as Array<[string, unknown]>) {
+      const r = await service.tryDecode(gbkBytes, opts as never);
+      expect(r.ok, `${name} should decode`).toBe(true);
+      if (!r.ok) throw new Error("expected a decode");
+      expect(r.result.encoding, name).toBe("gbk");
+    }
+    // And a getter that RETURNS a usable value is fine — the guard is about
+    // throws, not about refusing accessors.
+    const viaGetter = await service.tryDecode(gbkBytes, {
+      get encoding() {
+        return "gbk";
+      },
+    } as never);
+    expect(viaGetter.ok).toBe(true);
+    if (!viaGetter.ok) throw new Error("expected a decode");
+    expect(viaGetter.result.encoding).toBe("gbk");
+  });
+
   it("answers the only question the lookup can actually settle", () => {
     // The mount's log needs to say what a CONSUMER will get, because that is
     // what decides whether the decoding rules are usable. "Was this object
