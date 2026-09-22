@@ -18,6 +18,12 @@
  * `fs/observed` observation — using only public seams, so the built-in tools
  * keep working against the same state.
  *
+ * INSTALL POINT: the per-agent install hangs off BOTH `agent/created` and
+ * `agent/session-start`, because `agent/session-start` is absent from the
+ * `0.1.6-alpha` line onward while `agent/created` exists on every supported
+ * line — see {@link onAgentEvent}. Whichever fires first installs; the other is
+ * a no-op.
+ *
  * CONFLICT: any plugin that shadows `read` / `write` / `edit` on the same layer
  * collides with this one, because registering a name twice in a layer throws.
  * The conflict is detected by letting the registry answer — the registration is
@@ -113,16 +119,25 @@ const OWNED_TOOLS = [
  * which one owns the layer. Naming a specific project would be wrong as soon as
  * a different one collides, and would read as a complaint about that project.
  *
+ * The two collisions this plugin can hit are reported apart, because they point
+ * at different things to look for: a TOOL name taken on the layer, or a PROMPT
+ * SECTION name taken there. Both surface as "already registered", so telling
+ * them apart is what keeps the message from sending the operator after the
+ * wrong occupant.
+ *
  * @param taken - the tool name the registry rejected, when the error named one.
+ * @param section - the prompt section name that was rejected, when the error named one.
  */
-function conflictMessage(taken?: string): string {
+function conflictMessage(taken?: string, section?: string): string {
   const who =
-    taken === undefined
-      ? `another plugin already provides ${OWNED_TOOLS.join(" / ")} on this scope layer`
-      : `the tool "${taken}" is already registered on this scope layer by another plugin`;
+    section !== undefined
+      ? `the prompt section "${section}" is already registered on this scope layer by another plugin`
+      : taken === undefined
+        ? `another plugin already provides ${OWNED_TOOLS.join(" / ")} on this scope layer`
+        : `the tool "${taken}" is already registered on this scope layer by another plugin`;
 
   return (
-    `dsh-fs-encoding: refusing to install — ${who}. Only one plugin can own a tool ` +
+    `dsh-fs-encoding: refusing to install — ${who}. Only one plugin can own a ` +
     `name on a layer, so enable either that plugin or this one: remove this plugin ` +
     `from the profile, or disable the other one in the profile's cordis.patch.yml ` +
     `with:\n  - id: <the other plugin's id>\n    disabled: true`
@@ -145,13 +160,71 @@ function duplicateToolName(error: unknown): string | undefined {
 }
 
 /**
+ * The prompt section name a duplicate-registration error refers to, when it
+ * names one.
+ *
+ * Kept apart from {@link duplicateToolName} on purpose: both rejections say
+ * "already registered", and only the wording tells the operator whether a tool
+ * name or a prompt section name is the one already taken.
+ *
+ * @param error - the rejection thrown by the system-prompt registry.
+ */
+function duplicateSectionName(error: unknown): string | undefined {
+  if (!(error instanceof Error)) return undefined;
+  return error.message.match(/section "([^"]+)" is already registered/)?.[1];
+}
+
+/**
+ * Subscribe to one agent-lifecycle event by NAME, across a DSH version skew.
+ *
+ * The two events this plugin needs are not both present on every supported
+ * release: `agent/created` exists on every line, while `agent/session-start`
+ * exists on the `0.1.5-rc` line only and is GONE from `0.1.6-alpha` onward,
+ * where `agent/created` is the sole per-agent installation point. On the rc
+ * line BOTH fire for one agent, `agent/created` first. A plugin that subscribes
+ * to only one of them either never installs on the other line or, worse, fails
+ * invisibly — cordis's `ctx.on` does NOT validate the event name: it lazily
+ * creates a listener bucket under any string, so a name nothing emits registers
+ * successfully and simply never fires. There is no error to catch and no log
+ * line; the session just quietly runs the built-ins.
+ *
+ * So both names are subscribed on every version. Where both exist (the rc
+ * line) the second delivery is a no-op because the caller records the agent
+ * after the first successful install.
+ *
+ * The cast is the price of that skew, and it is deliberately narrow: the
+ * handler is fully typed and the event name is the ONLY thing being asserted,
+ * because the name is exactly what differs between the two versions. Typing it
+ * honestly would require depending on one version's `Events` map and would
+ * fail to compile against the other's.
+ *
+ * @param rootCtx - the host-plane plugin context.
+ * @param eventName - the lifecycle event to subscribe to.
+ * @param handler - called with the agent whose session began.
+ */
+function onAgentEvent(
+  rootCtx: Context,
+  eventName: "agent/created" | "agent/session-start",
+  handler: (agent: Agent) => void,
+): void {
+  const subscribe = rootCtx.on as unknown as (
+    name: string,
+    listener: (payload: { agent: Agent }) => void,
+  ) => () => void;
+  subscribe.call(rootCtx, eventName, ({ agent }) => {
+    handler(agent);
+  });
+}
+
+/**
  * One per-agent registration bundle, disposed with the agent.
  *
  * Registration is where the conflict is settled, and it is wrapped: a plugin
  * that already owns one of these names on the agent's layer makes the registry
  * reject the duplicate, and that rejection is turned into the actionable
- * message instead of a raw registry error. Tools that landed before the failure
- * are rolled back, so a conflict never leaves a partially installed set.
+ * message instead of a raw registry error. Everything that landed before the
+ * failure — tools AND prompt sections — is rolled back, so a conflict never
+ * leaves a partially installed set.
  *
  * The check cannot be hoisted into a pre-flight occupancy probe: the only
  * scope-blind read (`ctx.tools.get(name)`) answers for the GLOBAL layer, which
@@ -180,9 +253,40 @@ function installAgentTools(rootCtx: Context, agent: Agent): void {
       disposers.push(agent.ctx.tools.register(insertTool));
       disposers.push(agent.ctx.tools.register(strReplaceEditorTool));
       disposers.push(agent.ctx.tools.register(undoTool));
+
+      // Same section names as the built-ins on the agent's own layer, so the
+      // encoding-aware contract replaces the UTF-8-only text. Registered inside
+      // the SAME try as the tools on purpose: a section name already taken on
+      // this layer throws right here, and the rollback below must undo the
+      // tools as well. Left outside, a section collision would strand a
+      // shadowed tool set with no encoding contract beside it, and the retry
+      // from the other lifecycle event would then misreport this plugin's own
+      // leftovers as another plugin's tool conflict.
+      disposers.push(
+        agent.ctx.systemPrompt.section({
+          name: SECTION_READ,
+          order: ORDER_READ,
+          text: () => readSectionText(),
+        }),
+      );
+      disposers.push(
+        agent.ctx.systemPrompt.section({
+          name: SECTION_WRITE,
+          order: ORDER_WRITE,
+          text: () => writeSectionText(),
+        }),
+      );
+      disposers.push(
+        agent.ctx.systemPrompt.section({
+          name: SECTION_EDIT,
+          order: ORDER_EDIT,
+          text: () => editSectionText(),
+        }),
+      );
     } catch (error) {
-      // Roll back whatever landed before the failure, so the agent runs a
-      // coherent tool set (the built-ins) rather than a half-shadowed one.
+      // Roll back whatever landed before the failure — tools and prompt
+      // sections alike — so the agent runs a coherent tool set (the built-ins)
+      // rather than a half-installed one.
       for (const dispose of disposers) {
         try {
           dispose();
@@ -191,37 +295,15 @@ function installAgentTools(rootCtx: Context, agent: Agent): void {
         }
       }
       if (isDuplicateRegistration(error)) {
-        // Name the tool the registry actually rejected, so the message points
-        // at the real collision rather than a guessed plugin.
-        rootCtx.logger.error(conflictMessage(duplicateToolName(error)));
+        // Name the tool or section the registry actually rejected, so the
+        // message points at the real collision rather than a guessed plugin.
+        rootCtx.logger.error(
+          conflictMessage(duplicateToolName(error), duplicateSectionName(error)),
+        );
         return () => undefined;
       }
       throw error;
     }
-
-    // Same section names as the built-ins on the agent's own layer, so the
-    // encoding-aware contract replaces the UTF-8-only text.
-    disposers.push(
-      agent.ctx.systemPrompt.section({
-        name: SECTION_READ,
-        order: ORDER_READ,
-        text: () => readSectionText(),
-      }),
-    );
-    disposers.push(
-      agent.ctx.systemPrompt.section({
-        name: SECTION_WRITE,
-        order: ORDER_WRITE,
-        text: () => writeSectionText(),
-      }),
-    );
-    disposers.push(
-      agent.ctx.systemPrompt.section({
-        name: SECTION_EDIT,
-        order: ORDER_EDIT,
-        text: () => editSectionText(),
-      }),
-    );
 
     return () => {
       for (const dispose of disposers) dispose();
@@ -284,12 +366,28 @@ export function apply(rootCtx: Context): void {
     }
   }
 
-  const registered = new WeakSet<Agent>();
-  rootCtx.on("agent/session-start", ({ agent }) => {
-    if (registered.has(agent)) return;
-    registered.add(agent);
+  const installed = new WeakSet<Agent>();
+
+  /**
+   * Install this agent's tool set exactly once, from whichever lifecycle event
+   * the running harness emits.
+   *
+   * The agent is recorded only after a NON-THROWING attempt, and that ordering
+   * is load-bearing. `installAgentTools` returns normally both when it
+   * installed and when it refused a duplicate name (a conflict is final — the
+   * other plugin is not going to vacate the name), so those are the two
+   * conclusions worth remembering. An UNEXPECTED throw is not one of them:
+   * leaving the agent unrecorded lets the other lifecycle event retry, instead
+   * of the plugin silently never installing and the session quietly running the
+   * UTF-8-only built-ins.
+   *
+   * @param agent - the agent whose session just began.
+   */
+  const installOnce = (agent: Agent): void => {
+    if (installed.has(agent)) return;
     try {
       installAgentTools(rootCtx, agent);
+      installed.add(agent);
     } catch (error) {
       rootCtx.logger.warn(
         `dsh-fs-encoding: failed to install tools for agent ${agent.id}: ${
@@ -297,7 +395,15 @@ export function apply(rootCtx: Context): void {
         }`,
       );
     }
-  });
+  };
+
+  // Both events are subscribed, and on the rc line BOTH fire for one agent:
+  // `agent/created` is emitted first (agent-loop's `publish()`), so it installs
+  // and the later `agent/session-start` finds the agent already recorded and
+  // does nothing. Without that record the second install would re-register the
+  // same names in one layer, which the registry rejects outright.
+  onAgentEvent(rootCtx, "agent/created", installOnce);
+  onAgentEvent(rootCtx, "agent/session-start", installOnce);
 
   // Release the per-session records a finished session owned. Without this a
   // long-lived process keeps one bucket per session that ever ran; the bounds in

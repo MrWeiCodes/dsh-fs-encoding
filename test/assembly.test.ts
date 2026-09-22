@@ -2,10 +2,11 @@
  * Assembly tests: the plugin's `apply()` and its per-agent install.
  *
  * The tool bodies are covered by `roundtrip.test.ts`; this file covers what
- * wraps them — that the three tools actually register on an agent's own scope
- * layer (shadowing the built-ins), that their prompt sections land, and that
- * the plugin refuses to install when another plugin already owns a tool name
- * instead of leaving a half-registered tool set.
+ * wraps them — that all six tools register on an agent's own scope layer (the
+ * first three shadowing the built-ins, the rest being additions), that their
+ * prompt sections land, and that the plugin refuses to install when another
+ * plugin already owns one of those names — a tool name or a prompt section
+ * name — instead of leaving a half-registered set.
  *
  * The harness is built from the REAL `ToolRuntime` and `SystemPrompt` services
  * on a real cordis scope, so `agent.ctx.tools.register(...)` goes through the
@@ -16,6 +17,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { Context } from "@deepseek-ai/cordis";
+import { emitAgentEvent } from "@deepseek-ai/dsh-agent";
 import { SandboxedFileSystem } from "@deepseek-ai/dsh-fs-sandbox";
 import { ToolRuntime, defineTool, type ToolDefinition } from "@deepseek-ai/dsh-tools";
 import { SystemPrompt, TOOL_ORDER_REST } from "@deepseek-ai/dsh-system-prompt";
@@ -23,6 +25,7 @@ import { bindScopeParent, createScope, scopeOf } from "@deepseek-ai/dsh-scope";
 import { CANONICAL_ENCODINGS, normalizeEncoding } from "../src/encoding.js";
 import { DecodeError, decodeForOpen } from "../src/encoding-state.js";
 import { apply, inject, name } from "../src/index.js";
+import { SECTION_EDIT, SECTION_READ, SECTION_WRITE } from "../src/prompts.js";
 
 /**
  * Every tool name one install registers, sorted.
@@ -213,6 +216,104 @@ describe("apply", () => {
     // A second install would re-register the same names in one layer, which the
     // registry rejects outright — so this emit must be a no-op, not a throw.
     expect(() => root.emit("agent/session-start", { agent: h.agent } as never)).not.toThrow();
+
+    expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
+  });
+
+  it("installs from agent/created alone (the event newer DSH emits)", () => {
+    // `agent/session-start` does not exist from 0.1.6-alpha onward, where
+    // `agent/created` is the per-agent installation point. Subscribing to only
+    // the rc-line event would leave the plugin silently uninstalled there:
+    // cordis's `on` accepts any string and lazily creates a bucket, so a name
+    // nothing emits registers fine and never fires — no throw, no log, and the
+    // session quietly runs the UTF-8-only built-ins.
+    const root = makeHost();
+    apply(root);
+    const h = makeAgent(root);
+
+    root.emit("agent/created", { agent: h.agent } as never);
+
+    expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
+    const scope = scopeOf(h.agent.ctx);
+    expect(h.agent.ctx.tools.get("read", scope)).toBeDefined();
+    expect(h.agent.ctx.tools.get("write", scope)).toBeDefined();
+    expect(h.agent.ctx.tools.get("edit", scope)).toBeDefined();
+  });
+
+  it("installs once when both lifecycle events fire for one agent", () => {
+    // On the rc line BOTH events fire for a single agent, and `agent/created`
+    // comes FIRST (agent-loop's `publish()`). A plugin subscribed to both must
+    // therefore treat the second delivery as a no-op: re-registering the same
+    // names in one layer is rejected by the registry outright.
+    const root = makeHost();
+    apply(root);
+    const h = makeAgent(root);
+
+    expect(() => root.emit("agent/created", { agent: h.agent } as never)).not.toThrow();
+    expect(() => root.emit("agent/session-start", { agent: h.agent } as never)).not.toThrow();
+
+    expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
+  });
+
+  it("installs once when the events arrive in the opposite order", () => {
+    // The order is an implementation detail of the running harness, so the
+    // dedupe must not depend on it.
+    const root = makeHost();
+    apply(root);
+    const h = makeAgent(root);
+
+    root.emit("agent/session-start", { agent: h.agent } as never);
+    expect(() => root.emit("agent/created", { agent: h.agent } as never)).not.toThrow();
+
+    expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
+  });
+
+  it("receives the lifecycle events through the REAL scoped dispatch path", () => {
+    // The other tests emit on `root` directly, which bypasses the scope routing
+    // the deployment actually uses. The harness dispatches through the agent's
+    // own carrier (`emitAgentEvent`), and `dsh-scope` filters listeners by
+    // scope tag — a host-plane listener is admitted only because an untagged
+    // context is accepted for every key. That is an assumption this plugin's
+    // whole install rests on, and it is invisible to a direct `root.emit`, so
+    // it gets its own test rather than being taken on faith.
+    const root = makeHost();
+    apply(root);
+    const h = makeAgent(root);
+
+    emitAgentEvent(root, h.agent as never, "agent/created", {});
+    emitAgentEvent(root, h.agent as never, "agent/session-start", { source: "startup" });
+
+    expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
+  });
+
+  it("retries on the other event after an unexpected install failure", () => {
+    // A FAILED attempt must not record the agent. A duplicate-name conflict is
+    // a final answer and IS recorded, but an unexpected throw is not: the other
+    // lifecycle event is a free second chance, and swallowing it would leave
+    // the plugin silently absent. Here the first attempt throws and the second
+    // must install for real.
+    const root = makeHost();
+    const logger = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+    Object.defineProperty(root, "logger", { value: logger, configurable: true });
+
+    apply(root);
+    const h = makeAgent(root);
+
+    const realRegister = h.agent.ctx.tools.register.bind(h.agent.ctx.tools);
+    const spy = vi
+      .spyOn(h.agent.ctx.tools, "register")
+      .mockImplementationOnce(() => {
+        throw new Error("transient filesystem hiccup");
+      })
+      .mockImplementation((tool: ToolDefinition) => realRegister(tool));
+
+    root.emit("agent/created", { agent: h.agent } as never);
+    // Nothing installed, and the failure was reported rather than swallowed.
+    expect(h.registeredNames()).toHaveLength(0);
+    expect(logger.warn).toHaveBeenCalledOnce();
+
+    spy.mockRestore();
+    root.emit("agent/session-start", { agent: h.agent } as never);
 
     expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
   });
@@ -413,6 +514,88 @@ describe("apply", () => {
     const message = logger.error.mock.calls[0]![0] as string;
     expect(message).toContain('"write"');
     expect(message).toContain("disabled: true");
+  });
+
+  it("rolls back the tools when a PROMPT SECTION name is what collides", () => {
+    // A section name taken on the agent's own layer is a second, independent
+    // collision: `systemPrompt.section` throws its own "already registered".
+    // Sections are registered inside the SAME try as the tools precisely so this
+    // failure rolls the tools back too — left outside, the agent would keep a
+    // shadowed tool set with none of the encoding contract beside it, and the
+    // retry from the other lifecycle event would misreport this plugin's own
+    // leftovers as another plugin's TOOL conflict.
+    const root = makeHost();
+    const logger = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+    Object.defineProperty(root, "logger", { value: logger, configurable: true });
+
+    apply(root);
+    const h = makeAgent(root);
+    // The rival holds the section name only — no tool name is taken.
+    h.agent.ctx.systemPrompt.section({
+      name: SECTION_READ,
+      order: 100,
+      text: () => "rival section",
+    });
+
+    root.emit("agent/session-start", { agent: h.agent } as never);
+
+    // The failure is reported as a SECTION collision, not a tool one: the two
+    // rejections both say "already registered", so the wording is the only thing
+    // telling the operator which name is actually taken.
+    expect(logger.error).toHaveBeenCalledOnce();
+    const message = logger.error.mock.calls[0]![0] as string;
+    expect(message).toContain(`the prompt section "${SECTION_READ}"`);
+    expect(message).toContain("disabled: true");
+
+    // And nothing of ours survived — not the tools that landed before the
+    // section threw, and not the sections registered after it.
+    expect(h.registeredNames()).toHaveLength(0);
+    const scope = scopeOf(h.agent.ctx);
+    expect(h.agent.ctx.tools.get("read", scope)).toBeUndefined();
+    expect(h.agent.ctx.tools.get("write", scope)).toBeUndefined();
+    expect(h.agent.ctx.tools.get("edit", scope)).toBeUndefined();
+  });
+
+  it("leaves a foreign section intact and leaks none of its own", async () => {
+    // The rollback must undo OUR registrations only. Asserted through the real
+    // `assemble()` rather than the private layer map, because that is what the
+    // model actually receives: the rival's text must still be the one assembled
+    // for `tool:read`, and none of our three sections may appear.
+    const root = makeHost();
+    const logger = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+    Object.defineProperty(root, "logger", { value: logger, configurable: true });
+
+    apply(root);
+    const h = makeAgent(root);
+    h.agent.ctx.systemPrompt.section({
+      name: SECTION_READ,
+      order: 100,
+      text: () => "rival section",
+    });
+
+    root.emit("agent/session-start", { agent: h.agent } as never);
+
+    // `scopeOf` answers `ScopeKey | undefined` and `assemble`'s `scope` is
+    // optional, so under `exactOptionalPropertyTypes` the key may be passed only
+    // when it exists — spreading conditionally would silently degrade this to a
+    // GLOBAL assembly, asserting something other than what the comment claims.
+    // It always exists here (`makeAgent` mints the scope with `createScope`), so
+    // a missing key means the harness itself broke, which is worth failing on.
+    const scope = scopeOf(h.agent.ctx);
+    if (scope === undefined) throw new Error("the agent's scope key is missing");
+    const assembly = await h.agent.ctx.systemPrompt.assemble({ scope });
+    const sections = assembly.sections.map((section) => section.name);
+
+    // The rival's section is still the one that assembles for that name...
+    expect(sections).toContain(SECTION_READ);
+    const read = assembly.sections.find((section) => section.name === SECTION_READ);
+    expect(read?.text).toBe("rival section");
+
+    // ...and ours never landed, so neither of the other two names is present.
+    // A leak here would be invisible in the tool list but would teach the model
+    // a contract the install just refused.
+    expect(sections).not.toContain(SECTION_WRITE);
+    expect(sections).not.toContain(SECTION_EDIT);
   });
 
   it("installs normally when no other plugin holds a name", () => {

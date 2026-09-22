@@ -1,9 +1,20 @@
 # dsh-fs-encoding bundle patch: mount the host-plane plugin row.
 #
 # The plugin registers encoding-governed `read` / `write` / `edit` tools on each
-# agent's OWN scope layer at `agent/session-start`, so they shadow the preset's
-# built-in tools (nearest layer wins in dsh's tool registry) and unwind when the
-# agent is disposed. No preset editing is required.
+# agent's OWN scope layer — at `agent/created` or `agent/session-start`,
+# whichever the running dsh emits (see below for which versions emit which) —
+# so they shadow the preset's built-in tools (nearest layer wins in dsh's tool
+# registry) and unwind when the agent is disposed. No preset editing is
+# required.
+#
+# The install point is subscribed under BOTH names on purpose.
+# `agent/created` exists on every supported line. `agent/session-start` exists
+# on the `0.1.5-rc` line only, and is GONE from `0.1.6-alpha` onward, where
+# `agent/created` is the sole per-agent hook. On the rc line BOTH fire for one
+# agent, `agent/created` first; the install-once record makes the second
+# delivery a no-op. Cordis does NOT validate event names — `ctx.on` lazily
+# creates a bucket under any string — so a plugin listening only to the removed
+# name installs nothing and logs nothing.
 #
 # It does NOT replace `ctx.fs`: reads still go through `ctx.fs.readBytes`, and
 # writes reuse the public `fs/write-intent` + `fs/observed` event gate and the
@@ -13,8 +24,8 @@
 # CONFLICT: only one plugin can own a tool name on a given layer, so this plugin
 # cannot be enabled alongside any other plugin that also registers `read` /
 # `write` / `edit` on the agent's OWN layer — registering a name twice throws.
-# The plugin detects that collision at session-start and refuses to install
-# rather than leaving a half-registered tool set. To resolve it, either remove
+# The plugin detects that collision during the install and refuses rather than
+# leaving a half-registered tool set. To resolve it, either remove
 # this plugin from the profile or disable the other one in the profile's
 # cordis.patch.yml:
 #
