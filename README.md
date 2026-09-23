@@ -357,7 +357,7 @@ excludeEncodings: [windows-1251]
 
 ## 给插件开发者
 
-DSH 的 `ctx.fs` 只认 UTF-8：它用严格的 `TextDecoder` 解码，所以一个 GBK 文件在它看来是 `FS_NOT_TEXT`。本插件的工具层解决了**模型**读文件的问题，但**其他插件**直接调 `ctx.fs` 渲染内容时（审批预览、差异卡片、文件查看器）仍然会撞上这个限制，于是要么显示一个本该能读的文件的错误，要么自己再实现一套猜测——同一份部署的两处对同一个文件给出不同解读。
+DSH 的 `ctx.fs` 只认 UTF-8：它用严格的 `TextDecoder` 解码，所以一个 GBK 文件在它看来是 `FS_NOT_TEXT`。本插件的工具层解决了**模型**读文件的问题，但**其他插件**直接调 `ctx.fs` 取内容时仍然会撞上这个限制，于是要么对一个内容完全可以读的文件报错，要么自己再实现一套猜测——同一份部署的两处对同一个文件给出不同解读。
 
 本插件因此提供一个服务，把「这些字节是什么文本」这件事收在一处：
 
@@ -366,8 +366,8 @@ DSH 的 `ctx.fs` 只认 UTF-8：它用严格的 `TextDecoder` 解码，所以一
 const fsEncoding = ctx.get("fsEncoding");
 // 注意：名字被别的插件占用时，ctx.get 返回的是那个插件的对象而不是 undefined，
 // 所以判"有没有"要按能力判，不能只判 undefined。
-// 下面用的 isFsEncodingService 与守卫等价，它校验的正是 tryDecode 与 decode 两个方法——
-// 手写守卫时两个都要查，只查 tryDecode 会放过"只有 tryDecode"的异物，
+// isFsEncodingService 校验你点名的方法（不点名就是 tryDecode + decode 两个）——
+// 手写守卫时同样的规则：只查 tryDecode 会放过"只有 tryDecode"的异物，
 // 于是后面调 decode 时抛 TypeError，守卫就白写了
 if (!isFsEncodingService(fsEncoding)) {
   // 插件未安装（或服务名被占用）：按原来的方式处理（通常是显示"不是 UTF-8"）
@@ -400,9 +400,60 @@ if (outcome.ok) {
 
 - **`decided` 是必须看的字段。** 只有 `"bom"` / `"utf8"` / `"hint"` 是确定的，`"guessed"` 是概率性猜测。面向人展示内容时应当说明这一点——把一个猜测当成文件真实编码展示，正是本插件要消除的问题。
 - **拒绝是返回值，不是异常。** `tryDecode` 对任意输入都不会抛错（包括 `encoding` 传了非字符串这类参数错误，会作为拒绝返回）；需要与 `read` 工具完全一致的报错文本时用 `decode`。
-- **服务不读文件、不记录状态。** 读盘由调用方负责；解码不写入会话的编码记录，所以预览不会替你"读过"某个文件、进而授权后续写入。
+- **服务不读文件、不写记录。** 读盘由调用方负责；解码不写入会话的编码记录，所以预览不会替你"读过"某个文件、进而授权后续写入。（它可以**读**记录，见下一节——读记录与写记录是两件事。）
 
-其他方法：`isUtf8(bytes)`（廉价判断**这些字节是不是合法 UTF-8**——注意这不等于 `ctx.fs.readText` 一定成功，后者还会把前 8 KiB 含 NUL 的内容判为二进制）、`supportedEncodings()`（本部署实际会尝试的集合，做选择器时用它，而不是自己列一份）、`knownEncodings()`（全部可用的编码名）、`autoGuessEnabled()`、`isFsEncodingService(value)`（判断 `ctx.get` 拿到的是不是本服务）。
+### 与工具保持一致：`recordedEncoding`
+
+上面那套是"这些字节是什么文本"。但如果你的消费者要和**工具**对齐，光靠解码字节是不够的：`edit`、`insert`、`str_replace_editor` **没有 `encoding` 参数**，它们的编码来自本插件的内部记录。你按候选猜一个，可能落在与工具不同的页上，于是你描述的文本与工具实际改的完全不是同一份（实测：记录为 `big5` 时工具按 `big5` 解，而候选首位 `gbk` 解出的是另一份文档）。
+
+```js
+// sessionId 必须是你自己的执行所属会话：工具写盘用的记录就挂在这个会话上。
+// 拿不到会话（传 undefined 或空串）读的是"无 agent"匿名桶，与真实会话互不可见，
+// 于是这里必然返回 undefined——不要用它当基准，宁可什么都不显示。
+const sessionId = exec?.agent?.session?.id;
+
+const info = await ctx.fs.stat(target);
+if (info === undefined) {
+  // 文件不存在：没有可对齐的基准
+} else {
+  const rec = fsEncoding.recordedEncoding(sessionId, target, info.version);
+  if (rec) {
+    // rec.encoding 就是工具将要使用的编码
+    const bytes = await ctx.fs.readBytes(target, exec?.signal, maxBytes);
+    // 用 tryDecode：拒绝是返回值，不是异常。
+    // 注意 maxBytes 是你给 readBytes 的**内存保护上限**，与服务的 maxFileBytes
+    // （默认 10 MiB，属部署策略）是两回事——所以「你读得进来」不等于「服务肯解码」：
+    // 10–64 MiB 的文件会以 E_TOO_LARGE 拒绝，必须按 refusal 处理，而不是让它抛出来。
+    // （确有必要时可以用 maxBytes 提高单次解码上限，但那是在覆盖部署策略，
+    // 别拿自己的内存保护上限去顶替它——取小了会把服务本来能解码的文件提前拦掉。）
+    const out = await fsEncoding.tryDecode(bytes, {
+      encoding: rec.encoding,
+      displayPath: path,
+    });
+    if (out.ok) {
+      out.result.text;         // 与工具同基准的文本
+      rec.decided;             // 真实来源，见下
+      rec.hasBOM;              // 保存时会还原的 BOM
+      rec.lineEnding;          // 保存时会还原的行尾
+    } else {
+      // out.refusal.code 为 E_TOO_LARGE 时表示超过了服务的 maxFileBytes
+      out.refusal.message;     // 可直接展示的说明
+    }
+  } else {
+    // 该会话没有可用记录：退回按字节解码（并如实标注为猜测）
+  }
+}
+```
+
+- **`rec.decided` 必须用返回值，不能自己再解一次。** 你带着 `rec.encoding` 去调 `decode`，服务会回答 `"hint"`（"调用方已指定"）——那是**你**的决定，不是文件的真实来源。记录里是猜测的文件，这样会被呈现成确定，正是本插件要消除的那个失败。
+- **能力要按需判：`isFsEncodingService(fsEncoding, "recordedEncoding")`。** 不传方法名时它校验 `tryDecode` + `decode`（历史行为）；把你要调的方法名列出来，它只回答那一件事。**必须列出来**：服务名先注册者胜出，`ctx.get` 可能给你一个更早挂载的旧实例（本方法在 1.4.0 才加入，更早的版本没有），不列就会「守卫通过、调用却抛 `TypeError`」。反过来也别图省事去查一堆用不到的方法——那会把一个解码入口完好的实例判成不可用。这个判断是布尔值，所以你能区分「实例太旧、没这个能力」与「这个会话确实没读过该文件」（后者是 `recordedEncoding` 返回 `undefined`），前者应当告警而不是静默降级。不能 import 本包的消费者手写等价判定：`typeof fsEncoding?.recordedEncoding === "function"`。**问号不能省**：插件没装时 `ctx.get` 返回 `undefined`，少了它守卫本身就抛 `TypeError`——正是这个守卫要防的事（`isFsEncodingService` 对 `undefined` 返回 `false` 而不是抛错）。
+- **`sessionId` 必须是你自己的执行所属会话，且必传。** 工具写盘用的记录挂在调用会话上（`exec.agent.session.id`）；传 `undefined`/空串读的是"无 agent"匿名桶，与真实会话互不可见，于是必然返回 `undefined`。查不到时不要拿别的会话或猜测顶上——宁可什么都不显示。
+- **stale 判定交给方法，不要自己比版本。** 传入你刚 `stat` 到的 `version`，记录若已过期就返回 `undefined`。**省略该参数不是"跳过判定"**，而是与写盘路径对"没有版本"的读法一致（`invalidateIfStale(…, undefined)` 会删掉带版本的记录）：带版本的记录会被判为不可用。拿不到版本时（`stat` 没返回东西）如实当"无法确认"，别把记录当新鲜用。确实想看"记录本身、不管新鲜与否"（比如展示历史）才显式传 `null`——只有这一种写法会跳过判定，于是"仅仅拿不到版本"不会意外走到这里。版本号是内部记账细节，方法替你判，两边用同一个比较函数，不会出现"预览认为记录有效、工具认为失效"的分歧。
+- **`undefined` 把"从没记录"与"记录已失效"合并了**——两者的应对相同（退回解码并标注为猜测），区分它们就得暴露版本号，而那正是这个方法要挡在契约外的内部细节。
+- **可以跨会话查询。** 插件是宿主平面注册的，一个进程服务多个会话；传别的 `sessionId` 能读到那个会话的记录。这不会影响写入——**写盘用哪个编码只由调用方自己的会话决定**，读到别人的记录最多影响显示。`undefined` 表示无会话调用方，它有自己的桶，与任何真实会话互不可见。
+- **它不会替你写记录，也不会让写盘变得可能。** 一条记录既决定写盘字节、又是写盘闸的判据，所以能创建记录的方法等于能授权一次会话从未读过的写入。本方法只读：不改状态、不发事件、不 arm 闸门，可以随便调。
+
+其他方法：`isUtf8(bytes)`（廉价判断**这些字节是不是合法 UTF-8**——注意这不等于 `ctx.fs.readText` 一定成功，后者还会把前 8 KiB 含 NUL 的内容判为二进制）、`supportedEncodings()`（本部署实际会尝试的集合，做选择器时用它，而不是自己列一份）、`knownEncodings()`（全部可用的编码名）、`autoGuessEnabled()`、`recordedEncoding(sessionId, target, currentVersion?)`（见上）、`isFsEncodingService(value, ...required?)`（按能力判断 `ctx.get` 拿到的是不是本服务；`required` 写你要调的方法名，省略即 `tryDecode` + `decode`）。
 
 `tryDecode` / `decode` 接受 `maxBytes` 选项限制单次解码的字节数，默认取本插件的 `maxFileBytes`；超限会以拒绝（`E_TOO_LARGE`）返回，而不是对超大输入做全量候选排序。注意没有「无上限」的写法：省略 `maxBytes` 表示用本部署的 `maxFileBytes`，而 `Infinity` / `NaN` / 非正数这类不可用的值会以 `E_BAD_ENCODING` 拒绝，不会被静默当成默认值（否则错误信息会建议你调大一个刚被忽略的参数）。
 

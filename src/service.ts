@@ -28,6 +28,14 @@
  * become the session's recorded encoding, or a preview would silently authorize
  * a later save. Recording stays on the tool path, where the model's read is.
  *
+ * READING a record is a different act from MAKING one, and only the second is
+ * forbidden here. {@link FsEncodingService.recordedEncoding} reports what a
+ * session has already recorded, because a consumer that has to agree with a tool
+ * (`edit` takes no `encoding` argument; its encoding is this plugin's own
+ * record) cannot recover that answer from the bytes. It derives nothing, writes
+ * nothing and gates nothing — see the class doc for the guarantee both halves
+ * keep.
+ *
  * ## The contract consumers actually need
  *
  * {@link FsEncodingService.decode} answers with the text AND how it was decided
@@ -48,13 +56,19 @@
  */
 
 import type { Context } from "@deepseek-ai/cordis";
+import type { FsTarget, FsVersion } from "@deepseek-ai/dsh-fs";
 import { loadConfig } from "./config.js";
 import {
   decodeForOpen,
   DecodeError,
+  getEncodingState,
+  isStale,
+  provenanceOf,
+  sessionKeyOf,
   type DecodeForOpenResult,
   type DecodeProvenance,
 } from "./encoding-state.js";
+import { keyOf } from "./io.js";
 import { CANONICAL_ENCODINGS, isValidUtf8, SUPPORTED_ENCODINGS_TEXT } from "./encoding.js";
 import type { CandidatePreview } from "./encoding.js";
 
@@ -171,11 +185,65 @@ export interface FsDecodeOptions {
 }
 
 /**
+ * What a session has recorded about one file's encoding.
+ *
+ * The other half of the seam. {@link FsEncodingService.decode} answers "what do
+ * these bytes say?", which is enough for a viewer but NOT enough for a consumer
+ * that has to agree with a TOOL: `edit`, `insert` and `str_replace_editor` take
+ * no `encoding` argument, so their encoding comes from this plugin's own record
+ * (`io.ts` reuses it as the hint on every read). A consumer that guessed from
+ * the bytes instead can pick a different page and then render a diff against
+ * text the tool will never see — measured: a record of `big5` against bytes
+ * whose best-scoring candidate is `gbk` decodes to two different documents.
+ *
+ * Deliberately its own shape rather than the internal `FileEncodingState`:
+ *
+ * - `decided` and `footer` are optional there because a state may be built by
+ *   hand (tests, a caller that only knows the encoding name). That is an
+ *   internal construction path, and a consumer should not have to handle a
+ *   missing field for a reason that is not about consumers.
+ * - `footer` is model-facing prose ("Auto-guessed GBK …"), documented as
+ *   "never file content". Putting it in a service contract invites a renderer to
+ *   show it as UI text, which is not what it is for.
+ * - `version` is internal bookkeeping (an opaque freshness token that
+ *   `dsh-fs` says consumers MUST NOT parse). It is deliberately absent: the
+ *   staleness QUESTION is answered by the method instead, so a consumer never
+ *   reimplements the comparison — see
+ *   {@link FsEncodingService.recordedEncoding}.
+ */
+export interface RecordedEncoding {
+  /** Canonical encoding identifier, e.g. `utf8`, `utf8bom`, `gbk`, `utf16le`. */
+  encoding: string;
+  /**
+   * How {@link encoding} was arrived at.
+   *
+   * Carried because it CANNOT be recovered from the encoding name, and the
+   * difference decides how the text may be presented: `hint`/`bom`/`utf8` are
+   * determined, `guessed` is a probabilistic pick a human must be told about.
+   *
+   * A consumer that instead re-decodes with this encoding gets `"hint"` back
+   * (the service reports "the CALLER specified this" whenever an explicit
+   * encoding is passed), which would present a guess as a determination — the
+   * exact failure this plugin exists to prevent.
+   */
+  decided: DecodeProvenance;
+  /** Whether the file carried a byte-order mark when this was recorded. */
+  hasBOM: boolean;
+  /** The line terminator style a save will restore. */
+  lineEnding: "\r\n" | "\n" | "\r";
+}
+
+/**
  * The decoding rules of this plugin, as a service.
  *
- * Every method is pure with respect to the plugin's state: no memo reads, no
- * memo writes, no observation events. Calling `decode` a thousand times is
- * indistinguishable from calling it once.
+ * **No method here can change this plugin's state.** `decode` a thousand times
+ * is indistinguishable from calling it once, no call writes a record or emits an
+ * observation, and nothing here can arm the read-before-write gate.
+ *
+ * {@link FsEncodingService.recordedEncoding} is the one method that READS
+ * session state — it reports what a session has already recorded for a file. It
+ * derives nothing and writes nothing; reading a record is not the same act as
+ * making one, and only the tool path (where the model's own read is) makes one.
  */
 export class FsEncodingService {
   /**
@@ -284,6 +352,118 @@ export class FsEncodingService {
    */
   autoGuessEnabled(): boolean {
     return loadConfig().autoGuessEncoding;
+  }
+
+  /**
+   * What one session has recorded for one file, or `undefined` when there is no
+   * usable record.
+   *
+   * The method a consumer needs when it must agree with a TOOL rather than
+   * merely display bytes. `edit`, `insert` and `str_replace_editor` take no
+   * `encoding` argument; their encoding is whatever this plugin recorded when
+   * the file was read in that session, reused as the hint on every later read.
+   * Decoding the same bytes by guessing can land on a different page, and the
+   * resulting diff would then describe text the tool never touches.
+   *
+   * **This is a question, not an observation.** It writes no record, emits no
+   * event, arms no gate, and cannot make a write possible that was not possible
+   * before — the guarantee {@link FsEncodingService} states for every method it
+   * offers. A consumer that renders a preview can call it freely.
+   *
+   * **Staleness is answered here, not left to the caller.** Pass the version
+   * just observed from `ctx.fs.stat` and a record taken at a different version
+   * is reported as `undefined`, using the same comparison the write path uses to
+   * discard one.
+   *
+   * Omitting the argument is NOT "skip the check": it is read exactly as the
+   * write path reads an absent version (`invalidateIfStale(sessionKey, key,
+   * version)`), so a record that carries a version but is asked about without
+   * one is reported as `undefined`. That is the fail-closed direction, and it is
+   * deliberate — `undefined` is what a caller gets when it could not observe the
+   * file (a `stat` that returned nothing), and answering "here is the record"
+   * there is how a consumer ends up describing a file the tool will refuse to
+   * write. A caller that genuinely wants the record as it stands, fresh or not
+   * (to show history, say), says so explicitly with `null`.
+   *
+   * `undefined` therefore means "no usable record" and collapses two causes: the
+   * session never recorded this file, or the record no longer matches the file.
+   * They are reported alike because the ACTION is the same — fall back to
+   * decoding the bytes and presenting the result as a guess — and telling them
+   * apart would require exposing the version token, which is exactly the
+   * internal detail this method exists to keep out of the contract.
+   *
+   * Cross-session reads are allowed, and safe: this reports what a session
+   * recorded, while the encoding a WRITE uses is derived from the calling
+   * session alone (`sessionKeyFor(exec)`). Reading another session's record can
+   * therefore inform a display, but never change what gets written. Pass
+   * `undefined` for an agentless caller; it reads the anonymous bucket, which is
+   * distinct from every real session's.
+   *
+   * Never throws: an unusable `target` or `sessionId` answers `undefined`, the
+   * same promise {@link FsEncodingService.tryDecode} makes for its arguments.
+   *
+   * @param sessionId - the session whose record is wanted, or `undefined` for
+   *   the agentless bucket.
+   * @param target - the resolved target; a target, not a path, because resolving
+   *   a path may perform I/O and this service does none.
+   * @param currentVersion - the version just observed for the file; omit it when
+   *   you could not observe one (fail-closed, as the write path reads it), or
+   *   pass `null` to skip the staleness check deliberately.
+   * @returns the record, or `undefined` when there is none to trust.
+   */
+  recordedEncoding(
+    sessionId: string | undefined,
+    target: FsTarget,
+    currentVersion?: FsVersion | null,
+  ): RecordedEncoding | undefined {
+    try {
+      // Read through the internal-slot-free guards below rather than trusting
+      // the arguments: this method promises it never throws, and a consumer is
+      // usually another plugin, often plain JavaScript, documented to skip its
+      // own `try`. A Proxy whose `get` trap throws must not turn a lookup into
+      // an exception escaping into the caller.
+      if (typeof target !== "object" || target === null) return undefined;
+      if (sessionId !== undefined && typeof sessionId !== "string") return undefined;
+      // `keyOf` is the SAME function the tool path keys its records with. A
+      // second key derivation here could disagree with the first, and a record
+      // written under one key and looked up under another silently never
+      // matches — the failure this plugin's `keyOf` doc comment calls out.
+      const state = getEncodingState(sessionKeyOf(sessionId), keyOf(target as FsTarget));
+      if (state === undefined) return undefined;
+      // A version the caller supplied is a claim about the file NOW; a record
+      // taken at a different one describes a file that no longer exists. The
+      // comparison is `isStale`, shared with the write path, so a preview and
+      // the tool that follows it cannot disagree about whether the record holds.
+      //
+      // An OMITTED version goes through the same comparison rather than skipping
+      // it, because that is what the write path does with an absent version:
+      // `invalidateIfStale(sessionKey, key, version)` is handed `undefined` by a
+      // read that could not stat the file, and it deletes a record that carries
+      // one. Skipping here would hand a consumer a record the very next write
+      // discards — the disagreement this method exists to remove. `null` is the
+      // explicit "do not check", kept separate so that a caller which could not
+      // observe a version cannot get that answer by accident.
+      if (currentVersion !== null && isStale(state, currentVersion)) return undefined;
+      return {
+        encoding: state.encoding,
+        // The real provenance, which is the whole reason this method exists
+        // beside `decode`: re-decoding with `state.encoding` would answer
+        // `"hint"` and relabel a guess as a determination.
+        //
+        // Read through `provenanceOf` — the SAME function the read path uses —
+        // rather than restating its footer rule here. The two must agree about
+        // whether a record describes a guess, and one shared definition is what
+        // makes that structural instead of a comment claiming it. The `"hint"`
+        // fallback is this method's own: it is the one answer that must never be
+        // absent from the service's shape, and it is what the read path's
+        // admission already supplies on its side.
+        decided: provenanceOf(state) ?? "hint",
+        hasBOM: state.hasBOM,
+        lineEnding: state.lineEnding,
+      };
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -717,31 +897,104 @@ function toByteArray(value: unknown): Uint8Array | undefined {
  * `TypeError` inside the consumer. Checking the capability is what makes the
  * lookup safe in that deployment.
  *
- * The predicate is deliberately typed as the two methods it actually verifies,
- * NOT as the whole class. Claiming the full type would let a consumer call
+ * The predicate is deliberately typed as the methods it actually verifies, NOT
+ * as the whole class. Claiming the full type would let a consumer call
  * `supportedEncodings()` (or any other member) with no compile error and fail at
  * runtime — the type must not promise more than the check proves.
  *
+ * Name the methods you need to ask the precise question:
+ *
+ * ```js
+ * isFsEncodingService(svc)                        // tryDecode + decode
+ * isFsEncodingService(svc, "recordedEncoding")    // just that one
+ * ```
+ *
+ * The names matter because a service instance may be OLDER than the consumer's
+ * idea of it: the first registration of the name wins, so a mount can be handed
+ * an earlier build of this plugin, and a method added since then is simply
+ * absent. Checking a fixed list cannot express that — verifying less than the
+ * consumer calls lets the call throw, and verifying more rejects an instance
+ * whose decode entry points work perfectly. Asking for exactly what will be
+ * called is the only form that is right in both directions, and it is why
+ * {@link FsEncodingService.recordedEncoding} is NOT in the default set: a build
+ * that predates it still answers the decode question correctly.
+ *
+ * Omitting the names keeps the historical answer (`tryDecode` + `decode`), which
+ * is what `index.ts` grades its duplicate-provider diagnosis on: widening the
+ * default would make it report a service that HAS the decode entry points as one
+ * that does not.
+ *
+ * The no-names form is also a PLAIN one-argument predicate, and that is
+ * load-bearing rather than incidental: the historical signature was unary, so
+ * consumers pass this function itself as a callback —
+ * `candidates.filter(isFsEncodingService)`. A variadic signature breaks every
+ * one of those, because `filter` passes the ELEMENT INDEX as the second
+ * argument: `required` becomes `[0]`, the predicate then asks whether the object
+ * has a method named `"0"`, and a perfectly good service answers `false`.
+ * Measured: `filter` drops 2 matches to 0 and `every` flips from `true` to
+ * `false`, with no error anywhere — the callback position turns a variadic
+ * signature into a silently wrong answer rather than a compile failure. Both
+ * halves below exist for that reason: the unary overload keeps the usage typed,
+ * and the runtime drops non-string names so the plain-JavaScript callback (which
+ * no overload can reach) still answers correctly.
+ *
  * @param value - whatever `ctx.get("fsEncoding")` returned.
- * @returns whether the value offers this service's decode entry points.
+ * @param required - the members the caller is about to use; omit for the decode
+ *   entry points (`tryDecode`, `decode`).
+ * @returns whether the value offers every named member.
  */
 export function isFsEncodingService(
   value: unknown,
-): value is Pick<FsEncodingService, "tryDecode" | "decode"> {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as { tryDecode?: unknown }).tryDecode === "function" &&
-    typeof (value as { decode?: unknown }).decode === "function"
+): value is Pick<FsEncodingService, "tryDecode" | "decode">;
+export function isFsEncodingService<K extends keyof FsEncodingService>(
+  value: unknown,
+  ...required: readonly [K, ...K[]]
+): value is Pick<FsEncodingService, K>;
+export function isFsEncodingService(
+  value: unknown,
+  ...required: readonly unknown[]
+): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  // Non-string entries are DROPPED rather than used as a property name. Two
+  // callers produce them, and both are the historical usage this predicate must
+  // keep working:
+  //
+  //   - `filter`/`find`/`every` pass `(element, index, array)`, so a consumer
+  //     that hands this function straight to one of them delivers the index
+  //     here. Reading it as a name asks for a method called `"0"`.
+  //   - A name held in an optional variable (`isFsEncodingService(svc, maybe)`)
+  //     arrives as `undefined` when unset, which must mean "not asked for"
+  //     rather than "a member named undefined".
+  //
+  // Dropping them cannot silently weaken the check: a name the caller MEANT to
+  // pass is a string, and a string that is not a real member is already a
+  // compile error under the overloads.
+  const names = required.filter((name): name is keyof FsEncodingService =>
+    typeof name === "string",
   );
+  // A non-empty tuple is required by the second overload, so an EMPTY spread
+  // cannot reach here through the types: `g(v, ...maybeEmpty)` is a compile
+  // error rather than a call that quietly falls back to the default pair while
+  // the type claims every member was verified. This branch is the backstop for
+  // plain JavaScript, which has no overloads to consult.
+  const methods: readonly (keyof FsEncodingService)[] =
+    names.length === 0 ? (["tryDecode", "decode"] as const) : names;
+  const candidate = value as Record<string, unknown>;
+  // `every`, so the check is on the same footing for one name and for many.
+  return methods.every((method) => typeof candidate[method] === "function");
 }
 
 /**
  * Register the service on the plugin's own context.
  *
- * Host-plane, like `ctx.fs` itself: the decoding rules do not vary per agent or
- * per session — what varies (the recorded encoding) is deliberately NOT part of
- * this service — so one registration at load time is the whole install. Cordis
+ * Host-plane, like `ctx.fs` itself: the decoding RULES do not vary per agent or
+ * per session, so one registration at load time is the whole install. The
+ * per-session half — the recorded encodings — is reached through
+ * {@link FsEncodingService.recordedEncoding}, which takes the session as an
+ * argument rather than requiring one registration per session: the records are
+ * keyed by session inside this plugin, so a single host-plane instance can
+ * answer for any of them, and a consumer that has no agent in hand (a preview
+ * rendering before a session exists) is served by the same object. Cordis
  * removes it when the plugin's fiber unloads.
  *
  * @param rootCtx - the host-plane plugin context.

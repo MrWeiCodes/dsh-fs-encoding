@@ -22,6 +22,7 @@ import {
   getEncodingState,
   invalidateIfStale,
   openStateFor,
+  provenanceOf,
   recordOpenState,
   sessionKeyOf,
   setEncodingState,
@@ -260,10 +261,12 @@ export async function readFile(
   // written ONLY by the guess path, so its presence proves the encoding was
   // guessed. Without it that record would fall through to `decoded.decided`
   // ("hint") and reproduce the very contradiction this line exists to prevent.
+  //
+  // Read through `provenanceOf` rather than repeating the rule: the service
+  // reports the same field to consumers, and two copies of the footer rule would
+  // eventually disagree about whether a record describes a guess.
   const provenance =
-    opts.encodingHint === undefined && hint !== undefined
-      ? (memo?.decided ?? (memo?.footer === undefined ? undefined : "guessed"))
-      : undefined;
+    opts.encodingHint === undefined && hint !== undefined ? provenanceOf(memo) : undefined;
   // A read that may not speak for the session still needs a state to RETURN (the
   // caller reports on it), but it must not store one. `openStateFor` builds it
   // without recording, so the memo keeps whatever the session actually decided —

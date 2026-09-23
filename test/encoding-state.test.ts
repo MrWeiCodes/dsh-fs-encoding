@@ -4,6 +4,12 @@ import {
   decodeForOpen,
   encodeForSave,
   DecodeError,
+  getEncodingState,
+  invalidateIfStale,
+  isStale,
+  provenanceOf,
+  resetEncodingState,
+  setEncodingState,
   UnmappableError,
   type FileEncodingState,
 } from "../src/encoding-state.js";
@@ -742,3 +748,128 @@ describe("byte-exact round-trip", () => {
 function decodeAsGbk(bytes: Uint8Array): string {
   return iconv.decode(Buffer.from(bytes), "gbk");
 }
+
+describe("provenanceOf is the single definition of a record's provenance", () => {
+  // Shared by the read path (which feeds it to `openStateFor`, so a memo-reusing
+  // read does not relabel a guess as a determination) and the service (which
+  // reports it to a consumer that must agree with a tool). Two copies would
+  // eventually disagree, and the disagreement is visible in exactly the way the
+  // field exists to prevent: one side presenting a guess as a determination.
+  //
+  // These cases are the ones the REAL paths cannot produce, which is why they
+  // need pinning here: every record this plugin writes carries `decided`, so on
+  // the ordinary paths `decided` and `footer` agree and a broken fallback rule
+  // would go unnoticed. The distinguishing inputs are a record that predates
+  // `decided` (footer only) and one where the two disagree.
+  //
+  // The required fields are filled by a helper so each case states only what it
+  // is about; spelling out `encoding`/`hasBOM`/`lineEnding`/`version` in every
+  // literal would bury the two fields under test.
+  const rec = (
+    fields: Partial<Pick<FileEncodingState, "decided" | "footer">>,
+  ): FileEncodingState => ({
+    encoding: "gbk",
+    hasBOM: false,
+    lineEnding: "\n",
+    version: undefined,
+    ...fields,
+  });
+
+  it("prefers decided when the record carries one", () => {
+    expect(provenanceOf(rec({ decided: "utf8" }))).toBe("utf8");
+    expect(provenanceOf(rec({ decided: "bom" }))).toBe("bom");
+    expect(provenanceOf(rec({ decided: "hint" }))).toBe("hint");
+    expect(provenanceOf(rec({ decided: "guessed" }))).toBe("guessed");
+  });
+
+  it("falls back to the footer for a record that predates decided", () => {
+    // The footer is written ONLY by the guess path, so its presence proves the
+    // encoding was guessed. Without this fallback such a record would fall
+    // through to the caller's `"hint"` and present a guess as a determination.
+    expect(provenanceOf(rec({ footer: "Auto-guessed GBK (best of 3)" }))).toBe("guessed");
+    // A footer that is present but EMPTY still counts as present — `!== undefined`
+    // is the rule, and the safe direction is to call it a guess.
+    expect(provenanceOf(rec({ footer: "" }))).toBe("guessed");
+  });
+
+  it("lets decided win when the two disagree", () => {
+    // The ordering matters and is the thing a swapped implementation gets wrong:
+    // a record that says `utf8` while carrying a stale guess footer describes
+    // UTF-8, and reporting `guessed` there would warn about a file that has
+    // nothing to warn about.
+    expect(provenanceOf(rec({ decided: "utf8", footer: "Auto-guessed GBK" }))).toBe("utf8");
+    expect(provenanceOf(rec({ decided: "bom", footer: "Auto-guessed GBK" }))).toBe("bom");
+    // Same value either way — the point is that `decided` is what was read.
+    expect(provenanceOf(rec({ decided: "guessed", footer: "Auto-guessed GBK" }))).toBe("guessed");
+  });
+
+  it("answers undefined when the record says nothing", () => {
+    // Not a guess and not a determination: the caller decides, because the read
+    // path has a `"hint"` from admission to fall back on while the service has
+    // to supply its own. Answering `"hint"` here would make that choice for both.
+    expect(provenanceOf(undefined)).toBeUndefined();
+    expect(provenanceOf(rec({}))).toBeUndefined();
+  });
+});
+
+describe("isStale is the single definition of a record going out of date", () => {
+  // Two callers share this comparison: `invalidateIfStale` DELETES on a
+  // mismatch (the write path's guard) and the service REPORTS `undefined`
+  // (a query, which must not change state). If they ever disagreed, a preview
+  // and the tool that follows it would answer "is this record still good?"
+  // differently — the class of inconsistency the service exists to end. These
+  // tests pin the comparison itself, and the deletion that must keep matching
+  // it.
+
+  const stateAt = (version: string | undefined): FileEncodingState => ({
+    encoding: "gbk",
+    hasBOM: false,
+    lineEnding: "\n",
+    version,
+  });
+
+  it("compares by equality, in both directions", () => {
+    expect(isStale(stateAt("v1"), "v1")).toBe(false);
+    expect(isStale(stateAt("v1"), "v2")).toBe(true);
+  });
+
+  it("treats an unversioned record as stale against any real version", () => {
+    // The fail-closed direction: a record that cannot be confirmed fresh is not
+    // presented as fresh. This is why a caller that CAN pass the version should.
+    expect(isStale(stateAt(undefined), "v1")).toBe(true);
+  });
+
+  it("treats a versioned record as stale against an absent version", () => {
+    // The other direction, and the reason the service checks `currentVersion`
+    // for `undefined` BEFORE calling this: `undefined` there means "do not
+    // check", which must not be read as "the file reports no version".
+    expect(isStale(stateAt("v1"), undefined)).toBe(true);
+  });
+
+  it("does not consider two absent versions stale", () => {
+    // `undefined === undefined`: with neither side reporting a version there is
+    // nothing to contradict the record.
+    expect(isStale(stateAt(undefined), undefined)).toBe(false);
+  });
+
+  it("deletes exactly when isStale says so", () => {
+    // The equivalence that keeps the two callers honest.
+    resetEncodingState();
+    for (const [recorded, current, expected] of [
+      ["v1", "v1", "kept"],
+      ["v1", "v2", "dropped"],
+      [undefined, "v1", "dropped"],
+      [undefined, undefined, "kept"],
+    ] as const) {
+      resetEncodingState();
+      setEncodingState("s", "k", stateAt(recorded));
+      invalidateIfStale("s", "k", current);
+      const surviving = getEncodingState("s", "k");
+      if (expected === "kept") expect(surviving, `${recorded}/${current}`).toBeDefined();
+      else expect(surviving, `${recorded}/${current}`).toBeUndefined();
+      // And the predicate agrees with what the deletion did.
+      expect(isStale(stateAt(recorded), current)).toBe(expected === "dropped");
+    }
+    resetEncodingState();
+  });
+});

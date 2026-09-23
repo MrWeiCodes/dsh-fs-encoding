@@ -14,18 +14,21 @@
  *    lie or re-derive the provenance, which is the failure this seam prevents.
  */
 
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import iconv from "iconv-lite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Context } from "@deepseek-ai/cordis";
+import type { FsTarget, FsVersion } from "@deepseek-ai/dsh-fs";
 import { SandboxedFileSystem } from "@deepseek-ai/dsh-fs-sandbox";
 import { ToolRuntime } from "@deepseek-ai/dsh-tools";
+import type { ToolExecution } from "@deepseek-ai/dsh-tools";
 import { SystemPrompt, TOOL_ORDER_REST } from "@deepseek-ai/dsh-system-prompt";
 import { resetConfigCache } from "../src/config.js";
-import { resetEncodingState } from "../src/encoding-state.js";
+import { encodingStateCount, getEncodingState, resetEncodingState } from "../src/encoding-state.js";
 import { apply } from "../src/index.js";
+import { keyOf, readFile as pluginRead } from "../src/io.js";
 import {
   FS_ENCODING_SERVICE,
   FsEncodingService,
@@ -107,8 +110,15 @@ afterEach(async () => {
   else process.env["DSH_HOME"] = savedHome;
   resetConfigCache();
   resetEncodingState();
-  await rm(dir, { recursive: true, force: true });
-  await rm(home, { recursive: true, force: true });
+  // `maxRetries` is load-bearing, not defensive noise: `apply()` materializes
+  // the default config without awaiting it (`index.ts` — deliberately, so a
+  // config failure cannot fail the boot), so that `mkdir` + `writeFile` can
+  // still be in flight here. On Windows the removal can then list the directory,
+  // have the background write recreate a file inside it, and fail the `rmdir`
+  // with ENOTEMPTY — an error about the test's own cleanup, not about anything
+  // under test. The retry gives the losing side of that race time to settle.
+  await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 describe("the service is reachable the way a consumer reaches it", () => {
@@ -780,6 +790,58 @@ describe("refusal is a value a consumer can act on", () => {
     expect(isFsEncodingService("fsEncoding")).toBe(false);
   });
 
+  it("asks about exactly the members the caller names", () => {
+    // The reason the names are a parameter: an instance can be OLDER than the
+    // consumer's idea of it (the first registration of the name wins, so a mount
+    // may be handed an earlier build). A fixed list is wrong in one direction or
+    // the other — verifying less than is called lets the call throw, verifying
+    // more rejects an instance whose decode entry points work fine.
+    expect(isFsEncodingService(service, "recordedEncoding")).toBe(true);
+    expect(isFsEncodingService(service, "tryDecode", "recordedEncoding")).toBe(true);
+
+    // A build from before `recordedEncoding` existed: the decode entry points
+    // still answer `true`, and the newer method answers `false` — which is the
+    // distinction a consumer needs to warn instead of silently degrading.
+    const older = { tryDecode: () => {}, decode: () => {} };
+    expect(isFsEncodingService(older)).toBe(true);
+    expect(isFsEncodingService(older, "recordedEncoding")).toBe(false);
+    expect(isFsEncodingService(older, "tryDecode", "recordedEncoding")).toBe(false);
+
+    // A foreign object is refused whichever question is asked.
+    expect(isFsEncodingService({ notTheService: true }, "recordedEncoding")).toBe(false);
+    expect(isFsEncodingService(null, "recordedEncoding")).toBe(false);
+  });
+
+  it("stays a correct one-argument predicate in a callback position", () => {
+    // The regression this guards: the historical signature was UNARY, so
+    // consumers hand this function straight to `filter`/`find`/`every`. Those
+    // call the predicate with `(element, index, array)`, so a variadic-only
+    // implementation reads the INDEX as a method name, asks whether the object
+    // has a method called `"0"`, and answers `false` for a perfectly good
+    // service — silently, with no error. Measured before the fix: `filter` went
+    // from 2 matches to 0 and `every` from `true` to `false`.
+    const good = { tryDecode: () => {}, decode: () => {} };
+    const pool = [good, service];
+
+    expect(pool.filter(isFsEncodingService)).toHaveLength(2);
+    expect(pool.every(isFsEncodingService)).toBe(true);
+    expect(pool.find(isFsEncodingService)).toBe(good);
+
+    // A name held in an optional variable is refused by the TYPES — a TypeScript
+    // caller must decide which question it is asking rather than pass a maybe —
+    // while the runtime tolerates it, because a plain-JavaScript consumer has no
+    // overloads to consult and `undefined` there means "not asked for", not "a
+    // member named undefined". The `@ts-expect-error` asserts the first half and
+    // the assertion below it the second.
+    // @ts-expect-error -- the types require the caller to decide
+    expect(isFsEncodingService(good, undefined)).toBe(true);
+    // @ts-expect-error -- ditto
+    expect(isFsEncodingService(good, undefined, "tryDecode")).toBe(true);
+    // …and dropping it must not weaken a real question.
+    // @ts-expect-error -- ditto
+    expect(isFsEncodingService(good, undefined, "recordedEncoding")).toBe(false);
+  });
+
   it("reports a name collision by what consumers will actually receive", () => {
     // The regression this guards: grading the log on an ownership guess made the
     // message assert the opposite of the truth in both directions — a duplicate
@@ -997,5 +1059,217 @@ describe("the service is a question, not an observation", () => {
     setAutoGuess(true);
     const accepted = await service.tryDecode(bytes);
     expect(accepted.ok).toBe(true);
+  });
+
+  it("answers recordedEncoding without becoming an observation", async () => {
+    // Reading a record must not be confused with making one: the method reports
+    // what the tool path recorded, and a consumer rendering a preview can call
+    // it as freely as `decode`.
+    await writeFile(join(dir, "seen.txt"), gbk("你好，世界\n"));
+    await pluginRead(root, "seen.txt", dir, {
+      exec: makeExec("session-q"),
+      encodingHint: "gbk",
+    });
+    const target = await root.fs.resolve(join(dir, "seen.txt"));
+
+    const before = encodingStateCount();
+    service.recordedEncoding("session-q", target, null);
+    service.recordedEncoding("never-recorded", target, null);
+    expect(encodingStateCount()).toBe(before);
+  });
+});
+
+/** An execution carrying the session the record is keyed by. */
+function makeExec(sessionId: string): ToolExecution {
+  return {
+    name: "read",
+    callId: "call-1",
+    agent: { session: { id: sessionId, header: { cwd: dir } } },
+  } as unknown as ToolExecution;
+}
+
+describe("the recorded encoding is queryable without being writable", () => {
+  /** Read a GBK file through the plugin's own path, so a real record exists. */
+  async function recordGbk(name: string, sessionId: string, text = "你好，世界\n") {
+    await writeFile(join(dir, name), gbk(text));
+    const outcome = await pluginRead(root, name, dir, {
+      exec: makeExec(sessionId),
+      encodingHint: "gbk",
+    });
+    const target = await root.fs.resolve(join(dir, name));
+    return { target, outcome };
+  }
+
+  it("answers undefined for a file no session recorded", async () => {
+    await writeFile(join(dir, "plain.txt"), Buffer.from("plain\n"));
+    const target = await root.fs.resolve(join(dir, "plain.txt"));
+    // Not a throw and not a guess: "I have nothing" is an answer.
+    expect(service.recordedEncoding("session-q", target)).toBeUndefined();
+  });
+
+  it("reports the encoding the tool will actually use", async () => {
+    const { target, outcome } = await recordGbk("gbk.txt", "session-q");
+    // `null` here is the explicit "do not check freshness": this case is about
+    // the record's CONTENT, and the staleness question has its own cases below.
+    const rec = service.recordedEncoding("session-q", target, null);
+    expect(rec).toBeDefined();
+    // The whole point of the seam: a consumer that guessed from the bytes could
+    // land on a different page, and its diff would describe text the tool never
+    // touches. The record is what `readFile` itself used.
+    expect(rec?.encoding).toBe("gbk");
+    expect(rec?.encoding).toBe(outcome.state.encoding);
+  });
+
+  it("carries the real provenance, not the hint the caller passed", async () => {
+    // `decodeForOpen`'s hint branch reports `"hint"` for ANY explicit encoding
+    // ("the CALLER specified this"), so a consumer that re-decodes with the
+    // returned name gets a different provenance than the record holds. A guessed
+    // file re-decoded that way would be presented as a determination — the exact
+    // failure this plugin exists to prevent.
+    await writeFile(join(dir, "guessed.txt"), gbk("你好，世界，这是中文测试内容\n"));
+    setAutoGuess(true);
+    await pluginRead(root, "guessed.txt", dir, { exec: makeExec("session-g") });
+    const target = await root.fs.resolve(join(dir, "guessed.txt"));
+
+    const rec = service.recordedEncoding("session-g", target, null);
+    expect(rec?.decided).toBe("guessed");
+    // The contrast, executed rather than asserted in prose: re-decoding with the
+    // returned name answers `"hint"`.
+    const reDecoded = await service.decode(gbk("你好，世界，这是中文测试内容\n"), {
+      encoding: rec?.encoding,
+    });
+    expect(reDecoded.decided).toBe("hint");
+  });
+
+  it("reports the BOM and line-ending the save will restore", async () => {
+    // Through the helper, so the fixture lives in one place: an inline copy here
+    // would drift from `recordGbk` the moment either side changes how it reads.
+    const text = "第一行\r\n第二行\r\n";
+    const { target } = await recordGbk("crlf.txt", "session-q", text);
+
+    const rec = service.recordedEncoding("session-q", target, null);
+    expect(rec?.hasBOM).toBe(false);
+    expect(rec?.lineEnding).toBe("\r\n");
+  });
+
+  it("returns the record when the version matches", async () => {
+    const { target } = await recordGbk("versioned.txt", "session-q");
+    const info = await root.fs.stat(target);
+    expect(service.recordedEncoding("session-q", target, info?.version)).toBeDefined();
+  });
+
+  it("answers undefined when the file changed since it was recorded", async () => {
+    const { target } = await recordGbk("stale.txt", "session-q");
+    // A different version is a claim that this record describes a file that is
+    // no longer there. Reporting it would let a preview decode text the tool
+    // will never see.
+    const stale = "different-version" as FsVersion;
+    expect(service.recordedEncoding("session-q", target, stale)).toBeUndefined();
+  });
+
+  it("omitting the version is fail-closed, not 'skip the check'", async () => {
+    const { target } = await recordGbk("failclosed.txt", "session-q");
+    // A caller with no version is one that could not observe the file — a `stat`
+    // that returned nothing. The write path reads an absent version the same way
+    // (`invalidateIfStale(…, undefined)` deletes a versioned record), so this
+    // must NOT hand back a record the next write would discard.
+    expect(service.recordedEncoding("session-q", target)).toBeUndefined();
+  });
+
+  it("returns the record as it stands when the caller explicitly skips", async () => {
+    const { target } = await recordGbk("history.txt", "session-q");
+    // `null` is the deliberate "do not check freshness" — the only spelling that
+    // skips, so a caller that merely lacks a version cannot get this by accident.
+    expect(service.recordedEncoding("session-q", target, null)).toBeDefined();
+  });
+
+  it("treats an unversioned record as unusable once a version is supplied", async () => {
+    // The fail-closed direction of the shared comparison: `undefined` on the
+    // record's side compares unequal to a real version, so a record that cannot
+    // be confirmed fresh is not presented as fresh.
+    const { target } = await recordGbk("unversioned.txt", "session-q");
+    const state = getEncodingState("session-q", keyOf(target));
+    expect(state).toBeDefined();
+    // Rewrite the record without a version, the way a hand-built state looks.
+    const { setEncodingState } = await import("../src/encoding-state.js");
+    setEncodingState("session-q", keyOf(target), { ...state!, version: undefined });
+
+    const fresh = "some-version" as FsVersion;
+    expect(service.recordedEncoding("session-q", target, fresh)).toBeUndefined();
+    // With neither side reporting a version there is nothing to contradict the
+    // record, so the omitted argument is not stale here.
+    expect(service.recordedEncoding("session-q", target)).toBeDefined();
+    // And the explicit skip still works.
+    expect(service.recordedEncoding("session-q", target, null)).toBeDefined();
+  });
+
+  it("keeps two sessions' records apart, and reads either on request", async () => {
+    const { target } = await recordGbk("shared.txt", "session-a");
+    await pluginRead(root, "shared.txt", dir, {
+      exec: makeExec("session-b"),
+      encodingHint: "big5",
+    });
+
+    // Cross-session reads are allowed — this plugin serves a whole process, not
+    // one conversation — and each answer is that session's own record.
+    expect(service.recordedEncoding("session-a", target, null)?.encoding).toBe("gbk");
+    expect(service.recordedEncoding("session-b", target, null)?.encoding).toBe("big5");
+    expect(service.recordedEncoding("session-c", target, null)).toBeUndefined();
+  });
+
+  it("reads the anonymous bucket for an agentless caller", async () => {
+    const { target } = await recordGbk("anon.txt", "session-q");
+    // `undefined` is its own bucket, distinct from every real session's, so an
+    // agentless caller neither inherits nor satisfies a session's record.
+    expect(service.recordedEncoding(undefined, target, null)).toBeUndefined();
+  });
+
+  it("does not write, and so cannot authorize a write", async () => {
+    // The load-bearing guarantee. A record is what `writeFile` inverts to decide
+    // the bytes AND what its `FS_NOT_OBSERVED` guard checks, so a method that
+    // could create one would let a consumer authorize a save the session never
+    // read. Measured: inserting a record flips that guard from refusing to
+    // allowing.
+    await writeFile(join(dir, "never-read.txt"), gbk("你好，世界\n"));
+    const target = await root.fs.resolve(join(dir, "never-read.txt"));
+    const before = encodingStateCount();
+
+    expect(service.recordedEncoding("session-q", target)).toBeUndefined();
+    expect(service.recordedEncoding("session-q", target, null)).toBeUndefined();
+    expect(service.recordedEncoding(undefined, target)).toBeUndefined();
+    expect(service.recordedEncoding("session-q", target, "v" as FsVersion)).toBeUndefined();
+
+    expect(encodingStateCount()).toBe(before);
+    expect(getEncodingState("session-q", keyOf(target))).toBeUndefined();
+  });
+
+  it("does not delete a stale record — it only declines to report it", async () => {
+    // A query must not have the write path's side effect. `invalidateIfStale`
+    // DELETES on a mismatch; this method reports `undefined` and leaves the
+    // record alone, so a consumer can never destroy a record merely by asking.
+    const { target } = await recordGbk("kept.txt", "session-q");
+    const key = keyOf(target);
+    const before = getEncodingState("session-q", key);
+    expect(before).toBeDefined();
+
+    expect(service.recordedEncoding("session-q", target, "other" as FsVersion)).toBeUndefined();
+    // The omitted-version (fail-closed) answer declines too, and equally leaves
+    // the record in place: asking is never destructive, whichever way it answers.
+    expect(service.recordedEncoding("session-q", target)).toBeUndefined();
+    // Still there, unchanged.
+    expect(getEncodingState("session-q", key)).toEqual(before);
+  });
+
+  it("answers undefined for unusable arguments instead of throwing", async () => {
+    const { target } = await recordGbk("robust.txt", "session-q");
+    // Same promise `tryDecode` makes: a consumer is usually another plugin,
+    // often plain JavaScript, documented to skip its own `try`.
+    expect(service.recordedEncoding("session-q", null as unknown as FsTarget)).toBeUndefined();
+    expect(service.recordedEncoding("session-q", {} as FsTarget)).toBeUndefined();
+    expect(
+      service.recordedEncoding("session-q", undefined as unknown as FsTarget),
+    ).toBeUndefined();
+    expect(service.recordedEncoding(42 as unknown as string, target)).toBeUndefined();
+    expect(service.recordedEncoding(null as unknown as string, target)).toBeUndefined();
   });
 });

@@ -209,6 +209,29 @@ export function clearSession(sessionId: string): void {
 }
 
 /**
+ * Whether a record was taken at a different version than the one just observed.
+ *
+ * The single definition of "this record no longer describes the file", shared by
+ * the write path (which DELETES on a mismatch) and the service (which REPORTS
+ * one, because a query must not change state). Two copies of this comparison
+ * would eventually disagree, and the disagreement would be visible: a preview
+ * and the tool that follows it would answer "is this record still good?"
+ * differently, which is the class of inconsistency the service exists to end.
+ *
+ * A plain `!==`, deliberately: `undefined` on either side means "no version was
+ * reported" and compares unequal to a real one. That is the fail-closed reading
+ * — an unversioned record cannot be confirmed fresh — and it is why a caller
+ * that CAN pass the current version should.
+ *
+ * @param state - the recorded state.
+ * @param currentVersion - the version just observed, or `undefined` when absent.
+ * @returns whether the record must not be trusted.
+ */
+export function isStale(state: FileEncodingState, currentVersion: string | undefined): boolean {
+  return state.version !== currentVersion;
+}
+
+/**
  * Drop a recorded state when the file's version no longer matches.
  *
  * This is the guard that keeps a stale encoding from authorizing a write: the
@@ -227,7 +250,7 @@ export function invalidateIfStale(
   const states = sessions.get(sessionKey)?.states;
   if (states === undefined) return;
   const state = states.get(targetKey);
-  if (state !== undefined && state.version !== currentVersion) states.delete(targetKey);
+  if (state !== undefined && isStale(state, currentVersion)) states.delete(targetKey);
 }
 
 /** Number of sessions currently tracked. Test seam. */
@@ -254,6 +277,33 @@ export function encodingStateCount(): number {
  * as the file's real encoding is the failure this plugin exists to prevent.
  */
 export type DecodeProvenance = "hint" | "bom" | "utf8" | "guessed";
+
+/**
+ * The provenance a recorded state carries, including the legacy footer rule.
+ *
+ * The single definition of "what did this record say about how its encoding was
+ * decided", shared by the read path (which feeds it to `openStateFor` so a
+ * memo-reusing read does not relabel a guess as a determination) and the service
+ * (which reports it to a consumer that must agree with a tool). Two copies would
+ * eventually disagree, and the disagreement would be visible in exactly the way
+ * this field exists to prevent: one side presenting a guess as a determination.
+ *
+ * A record that predates `decided` is read from its `footer`, which is written
+ * ONLY by the guess path — so its presence proves the encoding was guessed. A
+ * record with NEITHER field can only come from a caller that knew the encoding
+ * name, which is what `"hint"` means; that reading is left to the caller rather
+ * than answered here, because the read path already has a `"hint"` from
+ * admission to fall back on while the service has to supply its own.
+ *
+ * @param state - the recorded state, or `undefined` when there is none.
+ * @returns the provenance, or `undefined` when the record does not say.
+ */
+export function provenanceOf(
+  state: FileEncodingState | undefined,
+): DecodeProvenance | undefined {
+  if (state === undefined) return undefined;
+  return state.decided ?? (state.footer === undefined ? undefined : "guessed");
+}
 
 /** The outcome of admitting a byte buffer for reading. */
 export interface DecodeForOpenResult {

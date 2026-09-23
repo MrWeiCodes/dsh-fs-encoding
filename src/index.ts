@@ -328,11 +328,13 @@ export function apply(rootCtx: Context): void {
   });
 
   // The decoding rules other plugins need. Provided once, host-plane, at load
-  // time — not per agent — because the rules do not vary by session; what
-  // varies is the recorded encoding, which is deliberately not part of the
-  // service. Wrapped because a second provider of the same name on this scope
-  // throws, and a plugin that cannot publish its service must still install its
-  // tools rather than lose both.
+  // time — not per agent — because the rules do not vary by session. The
+  // per-session half (the recorded encodings) rides the same instance: records
+  // are keyed by session inside this plugin, so `recordedEncoding(sessionId, …)`
+  // answers for any session without a second registration. Wrapped because a
+  // second provider of the same name on this scope throws, and a plugin that
+  // cannot publish its service must still install its tools rather than lose
+  // both.
   //
   // The message asserts only what this process can actually verify. "Was the
   // object already there created by us?" is NOT answerable: `instanceof` fails
@@ -432,6 +434,7 @@ export {
   type FsDecodeOptions,
   type FsDecodeRefusal,
   type FsDecodeResult,
+  type RecordedEncoding,
 } from "./service.js";
 export type { DecodeProvenance } from "./encoding-state.js";
 export type { FileSystem };

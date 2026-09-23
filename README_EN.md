@@ -357,7 +357,7 @@ Names are case- and style-insensitive: `Shift-JIS`, `shift_jis` and `SJIS` all m
 
 ## For plugin authors
 
-DSH's `ctx.fs` is UTF-8-only: it decodes with a strict `TextDecoder`, so a GBK file is simply `FS_NOT_TEXT` to it. This plugin's tool layer solves reading for the **model**, but **other plugins** that call `ctx.fs` directly to render content (approval previews, diff cards, file viewers) still hit that limit — so they either show an error for a file with perfectly readable content, or reimplement the guess themselves, and two parts of one deployment end up disagreeing about what a file says.
+DSH's `ctx.fs` is UTF-8-only: it decodes with a strict `TextDecoder`, so a GBK file is simply `FS_NOT_TEXT` to it. This plugin's tool layer solves reading for the **model**, but **other plugins** that call `ctx.fs` directly for content still hit that limit — so they either report an error for a file with perfectly readable content, or reimplement the guess themselves, and two parts of one deployment end up disagreeing about what a file says.
 
 This plugin therefore publishes a service that keeps "what text is in these bytes" in one place:
 
@@ -367,9 +367,10 @@ This plugin therefore publishes a service that keeps "what text is in these byte
 const fsEncoding = ctx.get("fsEncoding");
 // Careful: when another plugin already owns the name, `ctx.get` returns THAT
 // plugin's object rather than `undefined`, so test for the capability, not just
-// for absence. `isFsEncodingService` checks exactly the two methods used below —
-// if you hand-roll the guard, check BOTH: testing only `tryDecode` lets a
-// `tryDecode`-only object through, and the later `decode` call then throws.
+// for absence. `isFsEncodingService` verifies the members you name (with none
+// named, `tryDecode` + `decode`). If you hand-roll the guard, the same rule
+// applies: testing only `tryDecode` lets a `tryDecode`-only object through, and
+// the later `decode` call then throws.
 if (!isFsEncodingService(fsEncoding)) {
   // Not installed (or the name is taken): fall back to what you did before.
 }
@@ -402,9 +403,66 @@ Three design points:
 
 - **`decided` is the field you must look at.** Only `"bom"` / `"utf8"` / `"hint"` are determined; `"guessed"` is a probabilistic pick. When rendering for a human, say which one you got — presenting a guess as the file's real encoding is exactly the failure this plugin exists to prevent.
 - **Refusal is a value, not an exception.** `tryDecode` throws for no input at all — including an argument error such as a non-string `encoding`, which comes back as a refusal; use `decode` when you want the refusal thrown with the `read` tool's exact wording.
-- **The service does not read files and records nothing.** IO is yours; a decode writes no session encoding record, so a preview cannot count as having "read" a file and thereby authorize a later write.
+- **The service does not read files and writes no records.** IO is yours; a decode writes no session encoding record, so a preview cannot count as having "read" a file and thereby authorize a later write. (It can **read** a record — see the next section. Reading one is not the same act as making one.)
 
-Other methods: `isUtf8(bytes)` (cheap check for whether these bytes are **valid UTF-8** — note this does NOT mean `ctx.fs.readText` will succeed, since that also rejects content with a NUL byte in the first 8 KiB), `supportedEncodings()` (the set this deployment will actually try — use it for a picker instead of your own list), `knownEncodings()` (every usable encoding name), `autoGuessEnabled()`, `isFsEncodingService(value)` (whether `ctx.get` handed you this service).
+### Agreeing with a tool: `recordedEncoding`
+
+The above answers "what text is in these bytes". But a consumer that has to agree with a **tool** needs more than that: `edit`, `insert` and `str_replace_editor` take **no `encoding` argument**, so their encoding comes from this plugin's own record. Guess from the candidates instead and you can land on a different page than the tool, so what you describe is not the same document the tool actually touches (measured: with a record of `big5` the tool decodes as `big5`, while the top candidate `gbk` decodes the same bytes into a different document).
+
+```js
+// `sessionId` must be the session YOUR execution belongs to: the record the
+// tools write with is keyed by it. Without one (`undefined` or an empty string)
+// you read the "no agent" bucket, which is invisible from every real session —
+// so this necessarily returns `undefined`. Never use that as the basis; show
+// nothing rather than something on the wrong page.
+const sessionId = exec?.agent?.session?.id;
+
+const info = await ctx.fs.stat(target);
+if (info === undefined) {
+  // The file does not exist: there is no basis to agree with.
+} else {
+  const rec = fsEncoding.recordedEncoding(sessionId, target, info.version);
+  if (rec) {
+    // rec.encoding is the encoding the tool will use
+    const bytes = await ctx.fs.readBytes(target, exec?.signal, maxBytes);
+    // Use `tryDecode`: a refusal is a value, not an exception.
+    // Note `maxBytes` is the MEMORY-GUARD cap you gave `readBytes`, which is a
+    // different thing from the service's `maxFileBytes` (10 MiB by default,
+    // deployment policy) — so "you could read it" does not mean "the service
+    // will decode it": a 10–64 MiB file comes back as `E_TOO_LARGE`, which you
+    // must handle as a refusal rather than let it throw.
+    // (You may pass `maxBytes` to raise the per-decode cap when you really mean
+    // to override deployment policy — but do not substitute your memory guard
+    // for it, since a small value rejects files the service could have decoded.)
+    const out = await fsEncoding.tryDecode(bytes, {
+      encoding: rec.encoding,
+      displayPath: path,
+    });
+    if (out.ok) {
+      out.result.text;         // text on the same basis as the tool
+      rec.decided;             // the real provenance, see below
+      rec.hasBOM;              // the BOM a save will restore
+      rec.lineEnding;          // the line ending a save will restore
+    } else {
+      // out.refusal.code is E_TOO_LARGE when the service's maxFileBytes was hit
+      out.refusal.message;     // presentable explanation
+    }
+  } else {
+    // No usable record for this session: fall back to decoding the bytes
+    // (and present the result as a guess).
+  }
+}
+```
+
+- **Use the returned `rec.decided`; do not re-derive it.** Decoding with `rec.encoding` makes the service answer `"hint"` ("the CALLER specified this") — that is YOUR decision, not the file's real provenance. A file the record says was guessed would then be presented as a determination, which is the very failure this plugin exists to prevent.
+- **Ask for what you call: `isFsEncodingService(fsEncoding, "recordedEncoding")`.** With no names it verifies `tryDecode` + `decode` (the historical answer); name the members you are about to use and it answers exactly that question. **Naming them matters**: the first registration of the service name wins, so `ctx.get` may hand you an older instance from an earlier mount (this method arrived in 1.4.0; earlier versions do not have it), and without the name you get "guard passes, call throws `TypeError`". Do not over-ask either — checking members you never call rejects an instance whose decode entry points work perfectly. The answer is a boolean, so you can tell "the instance is too old to have this" from "this session has no record for that file" (the latter is `recordedEncoding` returning `undefined`) and warn instead of degrading silently. A consumer that cannot import this package writes the equivalent test by hand: `typeof fsEncoding?.recordedEncoding === "function"`. **The `?.` is not optional**: when the plugin is not installed `ctx.get` returns `undefined`, and without it the guard itself throws a `TypeError` — the very thing the guard exists to prevent (`isFsEncodingService` answers `false` for `undefined` rather than throwing).
+- **`sessionId` is required, and must be your own session.** The tools' record is keyed by the calling session (`exec.agent.session.id`); passing `undefined` or an empty string reads the agentless bucket, which is invisible from every real session, so it necessarily returns `undefined`. When there is no record, do not substitute another session's or a guess — show nothing instead.
+- **Let the method decide staleness; do not compare versions yourself.** Pass the `version` you just got from `stat` and a record taken at a different version comes back as `undefined`. **Omitting the argument is not "skip the check"** — it is read exactly as the write path reads an absent version (`invalidateIfStale(…, undefined)` deletes a versioned record), so a versioned record is reported as unusable. When you could not observe a version (a `stat` that returned nothing), treat that as "cannot confirm" rather than presenting the record as fresh. Pass `null` only when you deliberately want the record as it stands, fresh or not (to show history) — that is the one spelling that skips the check, so merely lacking a version cannot reach it by accident. The version token is internal bookkeeping, and one shared comparison is what keeps a preview and the tool that follows it from disagreeing about whether the record still holds.
+- **`undefined` collapses "never recorded" and "record no longer valid"** — the action is the same for both (decode the bytes and present them as a guess), and telling them apart would mean exposing the version token, the internal detail this method exists to keep out of the contract.
+- **Cross-session reads are allowed.** The service is host-plane, so one process serves many sessions; passing another `sessionId` reads that session's record. This cannot affect a write — **the encoding a write uses is decided by the calling session alone** — so reading another session's record can inform a display but never change what gets written. `undefined` is the agentless caller, which has its own bucket, invisible to and from every real session.
+- **It never writes a record, and cannot make a write possible.** A record both decides the bytes of a write and is the guard that permits it, so a method able to create one could authorize a write the session never read. This one only reads: no state change, no events, no arming the gate — call it freely.
+
+Other methods: `isUtf8(bytes)` (cheap check for whether these bytes are **valid UTF-8** — note this does NOT mean `ctx.fs.readText` will succeed, since that also rejects content with a NUL byte in the first 8 KiB), `supportedEncodings()` (the set this deployment will actually try — use it for a picker instead of your own list), `knownEncodings()` (every usable encoding name), `autoGuessEnabled()`, `recordedEncoding(sessionId, target, currentVersion?)` (see above), `isFsEncodingService(value, ...required?)` (whether `ctx.get` handed you this service, by capability; name the members you will call in `required`, or omit it for `tryDecode` + `decode`).
 
 `tryDecode` / `decode` accept a `maxBytes` option bounding a single decode, defaulting to this plugin's `maxFileBytes`; an oversized input comes back as a refusal (`E_TOO_LARGE`) instead of being fully ranked. Note there is no "unlimited" spelling: omitting `maxBytes` means this deployment's `maxFileBytes`, while an unusable value (`Infinity`, `NaN`, a non-positive number) is refused with `E_BAD_ENCODING` rather than silently treated as the default — otherwise the error would advise raising an argument that was just ignored.
 
