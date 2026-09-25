@@ -52,6 +52,56 @@ interface Harness {
   registeredNames: () => string[];
 }
 
+/** The agent-lifecycle events this plugin subscribes to, across the version skew. */
+type LifecycleEvent = "agent/created" | "agent/session-start";
+
+/**
+ * Fire one agent-lifecycle event on the host context, BY NAME.
+ *
+ * The emit-side mirror of `onAgentEvent` in `src/index.ts`, and it exists for
+ * the same reason: the event NAME is the one thing that differs between the
+ * supported DSH lines. `agent/session-start` exists on the 0.1.5 line only and
+ * is gone from 0.1.6 onward, where `agent/created` is the sole installation
+ * point — and there `agent/created`'s payload also gained a required `source`
+ * field the 0.1.5 payload does not have. Typing either call honestly would pin
+ * this suite to one line's `Events` map and fail to compile against the
+ * other's, so the name is the one thing asserted here, exactly as the plugin
+ * asserts it on the subscribe side.
+ *
+ * The payload carries only `agent`, which both lines accept: cordis validates
+ * nothing at runtime, and the plugin's listener reads nothing else.
+ *
+ * @param root - the host context.
+ * @param eventName - the lifecycle event to fire.
+ * @param agent - the agent-shaped subject the event carries.
+ */
+function emitLifecycle(root: Context, eventName: LifecycleEvent, agent: object): void {
+  (root.emit as unknown as (name: string, payload: { agent: object }) => void)(eventName, {
+    agent,
+  });
+}
+
+/**
+ * Same, but through the REAL scoped dispatch path (`emitAgentEvent`), which
+ * carries the agent's scope as `thisArg` so `@deepseek-ai/dsh-scope` filters
+ * listeners. A direct `root.emit` bypasses that routing entirely, so the one
+ * test that exercises it cannot use {@link emitLifecycle}. The cast is the
+ * same trade as above; `source` is supplied because the newer line requires it.
+ *
+ * @param root - the host context.
+ * @param eventName - the lifecycle event to dispatch.
+ * @param agent - the agent-shaped subject the event carries.
+ */
+function emitScopedLifecycle(root: Context, eventName: LifecycleEvent, agent: object): void {
+  const dispatch = emitAgentEvent as unknown as (
+    ctx: Context,
+    agent: object,
+    name: string,
+    payload: object,
+  ) => void;
+  dispatch(root, agent, eventName, { source: "startup" });
+}
+
 /** Build a context wired like a real deployment. */
 function makeHost(): Context {
   const root = new Context();
@@ -195,7 +245,7 @@ describe("apply", () => {
     apply(root);
     const h = makeAgent(root);
 
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
 
     expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
     // And they are visible through the same registry the model's list comes
@@ -212,10 +262,10 @@ describe("apply", () => {
     apply(root);
     const h = makeAgent(root);
 
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
     // A second install would re-register the same names in one layer, which the
     // registry rejects outright — so this emit must be a no-op, not a throw.
-    expect(() => root.emit("agent/session-start", { agent: h.agent } as never)).not.toThrow();
+    expect(() => emitLifecycle(root, "agent/session-start", h.agent)).not.toThrow();
 
     expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
   });
@@ -231,7 +281,7 @@ describe("apply", () => {
     apply(root);
     const h = makeAgent(root);
 
-    root.emit("agent/created", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/created", h.agent);
 
     expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
     const scope = scopeOf(h.agent.ctx);
@@ -249,8 +299,8 @@ describe("apply", () => {
     apply(root);
     const h = makeAgent(root);
 
-    expect(() => root.emit("agent/created", { agent: h.agent } as never)).not.toThrow();
-    expect(() => root.emit("agent/session-start", { agent: h.agent } as never)).not.toThrow();
+    expect(() => emitLifecycle(root, "agent/created", h.agent)).not.toThrow();
+    expect(() => emitLifecycle(root, "agent/session-start", h.agent)).not.toThrow();
 
     expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
   });
@@ -262,8 +312,8 @@ describe("apply", () => {
     apply(root);
     const h = makeAgent(root);
 
-    root.emit("agent/session-start", { agent: h.agent } as never);
-    expect(() => root.emit("agent/created", { agent: h.agent } as never)).not.toThrow();
+    emitLifecycle(root, "agent/session-start", h.agent);
+    expect(() => emitLifecycle(root, "agent/created", h.agent)).not.toThrow();
 
     expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
   });
@@ -280,8 +330,8 @@ describe("apply", () => {
     apply(root);
     const h = makeAgent(root);
 
-    emitAgentEvent(root, h.agent as never, "agent/created", {});
-    emitAgentEvent(root, h.agent as never, "agent/session-start", { source: "startup" });
+    emitScopedLifecycle(root, "agent/created", h.agent);
+    emitScopedLifecycle(root, "agent/session-start", h.agent);
 
     expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
   });
@@ -307,13 +357,13 @@ describe("apply", () => {
       })
       .mockImplementation((tool: ToolDefinition) => realRegister(tool));
 
-    root.emit("agent/created", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/created", h.agent);
     // Nothing installed, and the failure was reported rather than swallowed.
     expect(h.registeredNames()).toHaveLength(0);
     expect(logger.warn).toHaveBeenCalledOnce();
 
     spy.mockRestore();
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
 
     expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
   });
@@ -324,12 +374,12 @@ describe("apply", () => {
     const first = makeAgent(root, "a1");
     const second = makeAgent(root, "a2");
 
-    root.emit("agent/session-start", { agent: first.agent } as never);
+    emitLifecycle(root, "agent/session-start", first.agent);
     // The second agent's install must not throw. A duplicate registration in
     // one layer is rejected by the registry, so reaching the assertion at all
     // proves each agent's install targeted its own layer.
     expect(() =>
-      root.emit("agent/session-start", { agent: second.agent } as never),
+      emitLifecycle(root, "agent/session-start", second.agent),
     ).not.toThrow();
 
     // Both agents resolve the three tools through their own scoped view.
@@ -354,7 +404,7 @@ describe("apply", () => {
 
     apply(root);
     const h = makeAgent(root, "agent-1", { presetKey });
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
 
     expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
     expect(logger.error).not.toHaveBeenCalled();
@@ -377,7 +427,7 @@ describe("apply", () => {
 
     apply(root);
     const h = makeAgent(root);
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
 
     expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
     expect(logger.error).not.toHaveBeenCalled();
@@ -392,7 +442,7 @@ describe("apply", () => {
     // AGENT'S OWN layer, which is the only layer where a duplicate throws.
     apply(root);
     const h = makeAgent(root, "agent-1", { rivals: ["read"] });
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
 
     // Nothing of ours was registered, and the rival is untouched.
     expect(h.registeredNames()).toHaveLength(0);
@@ -411,7 +461,7 @@ describe("apply", () => {
 
     apply(root);
     const h = makeAgent(root, "agent-1", { rivals: ["edit"] });
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
 
     expect(logger.error).toHaveBeenCalledOnce();
     const message = logger.error.mock.calls[0]![0] as string;
@@ -444,7 +494,7 @@ describe("apply", () => {
       return realRegister(tool);
     });
 
-    expect(() => root.emit("agent/session-start", { agent: h.agent } as never)).not.toThrow();
+    expect(() => emitLifecycle(root, "agent/session-start", h.agent)).not.toThrow();
 
     expect(logger.error).toHaveBeenCalledOnce();
     const message = logger.error.mock.calls[0]![0] as string;
@@ -475,7 +525,7 @@ describe("apply", () => {
       return realRegister(tool);
     });
 
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
 
     expect(logger.error).toHaveBeenCalledOnce();
     const message = logger.error.mock.calls[0]![0] as string;
@@ -501,7 +551,7 @@ describe("apply", () => {
       return realRegister(tool);
     });
 
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
 
     // `read` was registered before the failure and must have been rolled back,
     // so the layer is not left half-shadowed: NOTHING of ours survives.
@@ -537,7 +587,7 @@ describe("apply", () => {
       text: () => "rival section",
     });
 
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
 
     // The failure is reported as a SECTION collision, not a tool one: the two
     // rejections both say "already registered", so the wording is the only thing
@@ -573,7 +623,7 @@ describe("apply", () => {
       text: () => "rival section",
     });
 
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
 
     // `scopeOf` answers `ScopeKey | undefined` and `assemble`'s `scope` is
     // optional, so under `exactOptionalPropertyTypes` the key may be passed only
@@ -602,7 +652,7 @@ describe("apply", () => {
     const root = makeHost();
     apply(root);
     const h = makeAgent(root);
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
 
     expect(h.registeredNames().sort()).toEqual(REGISTERED_TOOL_NAMES);
   });
@@ -618,7 +668,7 @@ describe("apply", () => {
     const logger = { error: vi.fn(), warn: vi.fn() };
     (root as unknown as { logger: unknown }).logger = logger;
 
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
 
     // Only the foreign tool remains — ours were rolled back.
     expect(h.registeredNames().sort()).toEqual(["str_replace_editor"]);
@@ -635,7 +685,7 @@ describe("apply", () => {
     const logger = { error: vi.fn(), warn: vi.fn() };
     (root as unknown as { logger: unknown }).logger = logger;
 
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
 
     expect(h.registeredNames().sort()).toEqual(["insert"]);
     expect(logger.error).toHaveBeenCalledOnce();
@@ -653,7 +703,7 @@ describe("apply", () => {
 
     apply(root);
     const h = makeAgent(root, "agent-1", { rivals: ["read"] });
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
 
     expect(h.registeredNames()).toHaveLength(0);
     expect(logger.error).toHaveBeenCalledOnce();
@@ -665,7 +715,7 @@ describe("tool schemas", () => {
     const root = makeHost();
     apply(root);
     const h = makeAgent(root);
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
 
     expect(Object.keys(paramsOf(h.agent.ctx, "read")).sort()).toEqual([
       "encoding",
@@ -679,7 +729,7 @@ describe("tool schemas", () => {
     const root = makeHost();
     apply(root);
     const h = makeAgent(root);
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
 
     const scope = scopeOf(h.agent.ctx);
     const read = h.agent.ctx.tools.get("read", scope) as unknown as {
@@ -726,7 +776,7 @@ describe("tool schemas", () => {
     const root = makeHost();
     apply(root);
     const h = makeAgent(root);
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
 
     // fs-sandbox is mounted, so the escalation pair is advertised too.
     //
@@ -754,7 +804,7 @@ describe("tool schemas", () => {
     const root = makeHost();
     apply(root);
     const h = makeAgent(root);
-    root.emit("agent/session-start", { agent: h.agent } as never);
+    emitLifecycle(root, "agent/session-start", h.agent);
 
     const scope = scopeOf(h.agent.ctx);
     const write = h.agent.ctx.tools.get("write", scope) as unknown as {
