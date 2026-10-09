@@ -1,6 +1,6 @@
 {
   "name": "dsh-fs-encoding",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "Encoding-governed read/write/edit tools for DeepSeek Harness (dsh): UTF-8 BOM fidelity and byte-exact round-trips for GBK, Big5, Shift-JIS, EUC-KR, Windows-1251 and UTF-16 text files.",
   "keywords": [
     "bom",
@@ -19,6 +19,7 @@
     "write"
   ],
   "license": "MIT",
+  "icon": "./icon.svg",
   "type": "module",
   "repository": {
     "type": "git",
@@ -35,11 +36,14 @@
       "types": "./lib/types/index.d.ts",
       "default": "./lib/index.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
   },
   "files": [
     "lib",
     "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json",
     "README.md",
     "README_EN.md",
     "LICENSE"

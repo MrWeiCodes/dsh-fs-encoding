@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "File Encoding",
+    "description": "Lets read / write / edit handle non-UTF-8 files correctly — GBK, Big5, Shift-JIS, EUC-KR and more: writes go back in the original encoding with bytes, line endings and BOM preserved, and an uncertain guess lists the candidates for you to pick."
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "文件编码",
+    "description": "让 read / write / edit 正确读写 GBK、Big5、Shift-JIS、EUC-KR 等非 UTF-8 文件：按原编码回写，字节、换行与 BOM 原样保留；编码不确定时列出候选供你选择。"
+  }
+}

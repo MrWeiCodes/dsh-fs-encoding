@@ -1,0 +1,20 @@
+<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+<!-- 插件管理页的图形：DSH 读成 base64 data URL 后用 <img> 渲染，
+     故页面 CSS 与 currentColor 都够不到——颜色必须写死在本文件里。
+     画布 36×36 与内置那套图形（PluginArtworkDefault 等）一致。
+
+     字形是「文」的真实轮廓，不是手画的等粗线条：取 Noto Sans SC 的 wght=900
+     （SIL OFL 1.1，允许嵌入与再分发；Windows 自带的微软雅黑/黑体/等线是商业
+     授权字体，不可嵌入分发）。真实轮廓自带横细竖粗与撇捺出锋，等粗线条在
+     36px 下会读成火柴棍。21px 字号让墨迹占画布 56%，与官方 voice-input 的
+     声波图标同占比；再大就显得挤，再小则撑不住 36px 的格子。 -->
+<defs>
+<linearGradient id="fsenc-g" x1="18" y1="6" x2="18" y2="30" gradientUnits="userSpaceOnUse">
+<stop stop-color="#7AC2FF"/>
+<stop offset="1" stop-color="#4A65E8"/>
+</linearGradient>
+</defs>
+<g transform="translate(7.4475 26.1270) scale(0.02100000 -0.02100000)" fill="url(#fsenc-g)">
+<path d="M673 623L824 583Q766 399 668.5 266.5Q571 134 431.5 46Q292 -42 107 -94Q99 -76 83.5 -50.5Q68 -25 50.5 0.5Q33 26 19 43Q196 83 325.5 156Q455 229 541 344Q627 459 673 623ZM325 614Q374 472 462 359Q550 246 680.5 167.5Q811 89 986 50Q970 34 951 9.5Q932 -15 915.5 -40.5Q899 -66 888 -86Q702 -37 569 52.5Q436 142 344.5 272.5Q253 403 190 573ZM41 691L964 691L964 549L41 549ZM406 822L562 868Q581 833 599.5 790.5Q618 748 625 716L459 665Q454 696 438.5 740.5Q423 785 406 822Z"/>
+</g>
+</svg>
