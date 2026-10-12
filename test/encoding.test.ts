@@ -10,6 +10,7 @@ import {
   encodeText,
   getTop3Candidates,
   hasScriptFamily,
+  isAdoptableDecode,
   isSupportedEncoding,
   isValidUtf8,
   isAcceptableDecode,
@@ -24,6 +25,8 @@ const utf8 = (s: string) => new Uint8Array(Buffer.from(s, "utf8"));
 const gbk = (s: string) => new Uint8Array(iconv.encode(s, "gbk"));
 /** Bytes for `s` on a non-GBK legacy page, named so the call sites read clearly. */
 const gbkAs = (s: string, enc: string) => new Uint8Array(iconv.encode(s, enc));
+/** The decode of `bytes` under `enc`, as the admission call sites compute it. */
+const decode = (bytes: Uint8Array, enc: string) => decodeBytes(bytes, enc) ?? "";
 
 describe("normalizeEncoding", () => {
   it("canonicalizes case and punctuation", () => {
@@ -383,6 +386,90 @@ describe("bytes a single-byte page leaves unassigned", () => {
     expect(isAcceptableDecode(text)).toBe(false);
     expect(scoreText(text, "windows-1252")).toBe(-1000);
     expect(scoreText(text, "iso-8859-1")).toBe(-1000);
+  });
+
+  it("isAdoptableDecode is the admission question, and it is not the text rule", () => {
+    // The text rule above stays for SCORING, where "does this look like text" is
+    // the right question. At the two places an encoding is ADOPTED — an explicit
+    // hint and a guess — the question is instead "could this encoding really have
+    // produced this text", which the text rule answers wrongly in both directions.
+    //
+    // This function asks ONLY that question. The BOM is a separate concern with a
+    // separate answer (`incompatibleBom`, exercised in the encoding-state suite),
+    // because whether a name can write the mark back depends on whether the CALLER
+    // treats the mark as a prefix or as content — see the hint branch, which
+    // strips it, versus the guess branch, which does not.
+    //
+    // Too strict: a legal UTF-8 file whose CONTENT is U+FFFD. The text rule refuses
+    // it, so step 3 accepted bytes the hint branch rejected — same bytes, two
+    // answers, one call. UTF-8 has no gaps, so the character is spellable.
+    const literal = Uint8Array.from([0x58, 0xef, 0xbf, 0xbd, 0x59]);
+    expect(isAcceptableDecode(decode(literal, "utf8"))).toBe(false);
+    expect(isAdoptableDecode(literal, "utf8", decode(literal, "utf8"))).toBe(true);
+
+    // Too lax: a single-byte page whose U+FFFD can only be its own gap byte. The
+    // round trip does NOT catch this — iconv-lite encodes U+FFFD onto the gap, so
+    // the invented replacement round-trips perfectly. The gap table is what
+    // refutes it, and this is the case that a byte test alone got wrong.
+    const gap = Uint8Array.from([0x58, 0x9d, 0x59]);
+    expect(decode(gap, "windows-1252")).toContain("\uFFFD");
+    expect(unassignedBytes("windows-1252")).toContain(0x9d);
+    expect(encodeText("\uFFFD", "windows-1252")).toEqual(Uint8Array.from([0x9d]));
+    expect(isAdoptableDecode(gap, "windows-1252", decode(gap, "windows-1252"))).toBe(false);
+
+    // A lone surrogate decodes to an ordinary-looking U+FFFD that no gap table can
+    // explain, so the round trip is what catches it (`00 D8` becomes `FD FF`).
+    const surrogate = Uint8Array.from([0x58, 0x00, 0x00, 0xd8, 0x59, 0x00]);
+    expect(isAdoptableDecode(surrogate, "utf16le", decode(surrogate, "utf16le"))).toBe(false);
+    const utf16Literal = Uint8Array.from([0x58, 0x00, 0xfd, 0xff, 0x59, 0x00]);
+    expect(isAdoptableDecode(utf16Literal, "utf16le", decode(utf16Literal, "utf16le"))).toBe(true);
+
+    // A decode that does not happen at all can never be adopted. `undefined` and
+    // an empty string are deliberately different answers: "" is a real decode of
+    // bytes that carry no text, while `undefined` means the codec refused them.
+    // 0xB5 is a GBK lead byte with nothing after it, which decodes to U+FFFD
+    // rather than failing, so the explicit `undefined` below is what pins the
+    // "no decode at all" case.
+    expect(isAdoptableDecode(Uint8Array.from([0xb5]), "gbk", decodeBytes(Uint8Array.from([0xb5]), "gbk"))).toBe(false);
+    expect(isAdoptableDecode(Uint8Array.from([0xb5]), "gbk", undefined)).toBe(false);
+  });
+
+  it("admits the non-canonical multi-byte mappings instead of refusing them", () => {
+    // The reason a byte-exact round trip cannot be the admission test: iconv-lite's
+    // encoders canonicalise, so these legal, U+FFFD-free files write back as a
+    // different byte pair. Each one must still be adoptable.
+    const cases = [
+      ["gbk", Uint8Array.from([0xa2, 0xe3])],
+      ["gbk", Uint8Array.from([0xa3, 0xa0])],
+      ["shift_jis", Uint8Array.from([0x87, 0x90])],
+      ["big5", Uint8Array.from([0x8e, 0x69])],
+    ] as const;
+
+    for (const [enc, bytes] of cases) {
+      const text = decode(bytes, enc);
+      expect(text, `${enc} fixture must decode`).not.toBe("");
+      expect(text).not.toContain("\uFFFD");
+      // The bytes are genuinely non-canonical, which is the whole point.
+      expect(
+        Buffer.from(encodeText(text, enc)!).equals(Buffer.from(bytes)),
+        `${enc} fixture must be non-canonical`,
+      ).toBe(false);
+      expect(isAdoptableDecode(bytes, enc, text), `${enc} must stay admissible`).toBe(true);
+    }
+  });
+
+  it("agrees with a plain re-encode on ordinary text", () => {
+    for (const [enc, bytes] of [
+      ["utf8", utf8("中文测试")],
+      ["gbk", gbk("中文测试")],
+      ["big5", gbkAs("中文測試", "big5")],
+      ["utf16le", new Uint8Array(iconv.encode("中文测试", "utf16le"))],
+      ["windows-1252", gbkAs("caf\u00E9 r\u00E9sum\u00E9", "windows-1252")],
+    ] as const) {
+      const text = decodeBytes(bytes, enc);
+      expect(text, `${enc} must decode`).toBeDefined();
+      expect(isAdoptableDecode(bytes, enc, text!), `${enc} must be admissible`).toBe(true);
+    }
   });
 
   it("never lets a candidate that decodes with U+FFFD win", () => {

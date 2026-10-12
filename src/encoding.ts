@@ -492,6 +492,186 @@ export function decodeBytes(bytes: Uint8Array, enc: string): string | undefined 
 }
 
 /**
+ * The byte-order mark that stops this encoding name from being adopted.
+ *
+ * A save takes its BOM from the encoding NAME (`encodeForSave`), never from the
+ * bytes that were read, so a name and a mark that disagree cannot both survive:
+ * a `utf8bom` file read as `utf8` loses its three mark bytes on the next save.
+ *
+ * The question is asked of the MARK, and only of the mark: does this name write
+ * those leading bytes back as CONTENT? A name that reads the mark as ordinary
+ * characters — a legacy page reads `EF BB BF` as `ï»¿` — reproduces them and has
+ * nothing to refuse, which is why comparing NAMES is wrong. A codec that swallows
+ * only PART of a foreign mark is still caught, because `utf16le` reads the `FF FE`
+ * of a `utf32le` mark as a character instead of writing it back, so its
+ * re-encoding does not begin with those four bytes.
+ *
+ * Asking it of the WHOLE FILE — whether re-encoding reproduces every byte — is
+ * too strong, and the excess is not the conservative kind. `iconv-lite`'s encoders
+ * canonicalise rather than invert, so a legal body can hold a non-canonical pair
+ * (`A3 A0` for the ideographic space, written back as `A1 A1`) far from the mark.
+ * A whole-file compare blames the mark for that, refuses a file whose mark is
+ * perfectly reproducible, and names the mark's own encoding as the remedy — a name
+ * that cannot decode the body at all. Worse, the refusal lands on the SECOND read
+ * of a file the first read accepted, because the session feeds its recorded name
+ * back as the hint, so the file stops opening for the rest of the session.
+ *
+ * Bytes that do not decode under this name are NOT this function's business, and
+ * it says so by returning `undefined`. The caller has its own message for that
+ * case, and it is the accurate one: reporting a mark problem for `EF BB BF E4 B8`
+ * under `utf8` would name `utf8bom` as the remedy for a truncated sequence that
+ * `utf8bom` cannot decode either, sending the model in a circle.
+ *
+ * @param bytes - the file's bytes, BOM included.
+ * @param enc - the canonical encoding name being adopted.
+ * @returns the mark this name cannot write back, or `undefined` when it can, or
+ *   when the question does not arise because the bytes do not decode.
+ */
+export function incompatibleBom(bytes: Uint8Array, enc: string): BomInfo | undefined {
+  const bom = detectBom(bytes);
+  // A mark whose own name is being adopted is a PREFIX: the caller strips it and
+  // the save writes it back from the name, so the pairing is exact by
+  // construction and there is nothing to test.
+  if (bom === undefined || bom.encoding === enc) return undefined;
+  const text = decodeBytes(bytes, enc);
+  if (text === undefined) return undefined;
+  // The mark is written back when the FIRST `bomLen` bytes of the re-encoding are
+  // the mark itself. Comparing only that prefix is what keeps a canonicalising
+  // codec's body from being blamed on the mark: a name that reads the mark as
+  // content reproduces it here whatever it does further along.
+  const markBytes = bomBytesForEncoding(bom.encoding);
+  const back = encodeText(text, enc);
+  if (markBytes === undefined || back === undefined || back.length < bom.bomLen) return bom;
+  for (let i = 0; i < bom.bomLen; i += 1) {
+    if (back[i] !== markBytes[i]) return bom;
+  }
+  return undefined;
+}
+
+/**
+ * Whether a decode may be adopted as the file's encoding.
+ *
+ * Two questions, asked in this order, and the ORDER is what keeps the answer
+ * honest.
+ *
+ * 1. A decode with no U+FFFD is admissible. Nothing was invented, so there is
+ *    nothing to attribute and no further byte-level test to run.
+ * 2. A decode WITH U+FFFD is admissible only if the encoding can really SPELL
+ *    that character. U+FFFD is an ordinary code point, so `EF BF BD` is a legal
+ *    UTF-8 file whose CONTENT holds it — and only bytes that really are the
+ *    character re-encode to themselves, which is what {@link roundTrips} asks.
+ *
+ * A byte-exact round trip ALONE is not the rule, and both halves of that matter.
+ * It is too STRICT on the multi-byte pages, because `iconv-lite`'s encoders
+ * canonicalise rather than invert: measured, 2091 Shift-JIS byte pairs, 100 Big5
+ * and 2 GBK decode to real characters but re-encode to a DIFFERENT pair (`87 90`
+ * is `≒`, written back as `81 E0`; `A2 E3` is `€`, written back as `80`). Those
+ * are legal, U+FFFD-free files, so a byte test used as the gate refused files the
+ * text rule had always accepted — and refused them under the CORRECT encoding
+ * too, leaving no way to open them at all.
+ *
+ * It is too LAX on the single-byte pages, where U+FFFD is not in the page at
+ * all: `iconv-lite` encodes it onto one of the page's own unassigned bytes
+ * (`0x9D` for windows-1252, `0x98` for windows-1251), and that byte decodes back
+ * to U+FFFD — so the round trip succeeds on a U+FFFD the DECODER invented. That
+ * is the historical corruption in a new shape: a wrong page adopted as the file's
+ * encoding, and a save that rewrites its bytes. {@link unassignedBytes} is what
+ * separates the two cases, and it is used here to REFUTE, never to permit — if
+ * the character's own encoding lands on a byte the page leaves unassigned, the
+ * U+FFFD cannot have come from the file.
+ *
+ * The text rule ({@link isAcceptableDecode}) still governs the places where the
+ * question really is "does this look like text": SCORING ({@link scoreText}) and
+ * the chardet verdict filter, which decides which pages are worth SHOWING. It is
+ * wrong for ADMISSION only because it cannot tell those two U+FFFDs apart, which
+ * is the one thing rule 2 resolves. The two rules therefore coexist deliberately,
+ * and the difference is reachable: a legal UTF-32 file whose content holds a
+ * literal U+FFFD is dropped by the chardet filter (so guessing cannot pick that
+ * page) while an explicit hint for it is admitted here.
+ *
+ * This asks only about the byte range `text` decodes to. A caller that treats a
+ * leading BOM as a PREFIX rather than as content has one more question to ask —
+ * whether the name can write that prefix back — and asks it separately with
+ * {@link incompatibleBom}, because that check belongs to the caller's BOM
+ * handling and not to the text.
+ *
+ * @param bytes - the byte range `text` decodes to.
+ * @param enc - canonical encoding identifier to admit them under.
+ * @param text - the decode of `bytes` under `enc`, or `undefined` when they do
+ *   not decode at all. Taking the decode as an argument rather than repeating it
+ *   keeps the caller's own decode and the admission test from ever disagreeing,
+ *   and a failed decode is refused here rather than left to the caller.
+ * @returns whether this decode may become the file's encoding.
+ */
+export function isAdoptableDecode(
+  bytes: Uint8Array,
+  enc: string,
+  text: string | undefined,
+): boolean {
+  if (text === undefined) return false;
+  if (!text.includes(REPLACEMENT_CHAR)) return true;
+  return replacementIsSpellable(enc) && roundTrips(bytes, text, enc);
+}
+
+/**
+ * Whether `enc` can spell U+FFFD itself, rather than substituting a gap byte.
+ *
+ * Only the single-byte pages need asking: they have no U+FFFD, so `iconv-lite`
+ * writes the character onto one of the bytes the page leaves unassigned, and that
+ * substitution is exactly what makes the round trip succeed on an invented
+ * U+FFFD. A page with no unassigned bytes — and every multi-byte or Unicode
+ * encoding — has nowhere to hide it and can hold the character for real.
+ *
+ * The test is written as "encode the character and see where it lands" rather
+ * than as the shorter `unassignedBytes(enc).length === 0`, even though the two
+ * agree on every encoding measured today: `iconv-lite`'s single-byte tables write
+ * U+FFFD onto a gap byte by construction, so the `some` below is false whenever
+ * there is a gap at all (verified across all 19 canonical encodings and iconv's
+ * full 358-page single-byte set, 0 counterexamples). Asking the codec is what
+ * makes the answer a fact about the encoder instead of an assumption about it, so
+ * a future iconv-lite that starts spelling U+FFFD properly on some page is
+ * admitted rather than silently refused.
+ *
+ * @param enc - canonical encoding identifier.
+ * @returns whether a U+FFFD under this encoding can come from the file.
+ */
+function replacementIsSpellable(enc: string): boolean {
+  const gaps = unassignedBytes(enc);
+  if (gaps.length === 0) return true;
+  const encoded = encodeText(REPLACEMENT_CHAR, enc);
+  return encoded !== undefined && ![...encoded].some((b) => gaps.includes(b));
+}
+
+/**
+ * Whether re-encoding `text` under `enc` reproduces `bytes` exactly.
+ *
+ * The caller passes the exact range `text` was decoded from, and the comparison
+ * uses that range verbatim. An earlier version stripped a BOM here as well,
+ * which double-stripped on the hint path — the caller had already removed the
+ * mark — so a body that itself began with mark bytes lost 2-4 real content bytes
+ * before the compare and passed a round trip a save would not honour.
+ *
+ * BOM handling is therefore the caller's business, not this function's: see
+ * {@link incompatibleBom} for the question a caller that treats the mark as a
+ * prefix has to ask.
+ *
+ * @param bytes - the exact bytes `text` was decoded from.
+ * @param text - that decode. Narrowed to `string` rather than `string | undefined`
+ *   because the only caller has already refused a failed decode, and a parameter
+ *   that admits `undefined` would advertise a branch no call site can reach.
+ * @param enc - canonical encoding identifier.
+ * @returns whether a save would write back these same bytes.
+ */
+function roundTrips(bytes: Uint8Array, text: string, enc: string): boolean {
+  const back = encodeText(text, enc);
+  if (back === undefined || back.length !== bytes.length) return false;
+  for (let i = 0; i < bytes.length; i += 1) {
+    if (back[i] !== bytes[i]) return false;
+  }
+  return true;
+}
+
+/**
  * Encode text under one canonical encoding.
  *
  * Unmappable characters become `?` here; callers that must not silently corrupt

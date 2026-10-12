@@ -7,13 +7,21 @@ import {
   getEncodingState,
   invalidateIfStale,
   isStale,
+  openStateFor,
   provenanceOf,
   resetEncodingState,
   setEncodingState,
   UnmappableError,
   type FileEncodingState,
 } from "../src/encoding-state.js";
-import { DEFAULT_SUPPORTED_ENCODINGS, decodeBytes, isAcceptableDecode, unassignedBytes } from "../src/encoding.js";
+import {
+  CANONICAL_ENCODINGS,
+  DEFAULT_SUPPORTED_ENCODINGS,
+  decodeBytes,
+  encodeText,
+  isAcceptableDecode,
+  unassignedBytes,
+} from "../src/encoding.js";
 import { UTF8_BOM_BYTES } from "../src/line-endings.js";
 
 const utf8 = (s: string) => new Uint8Array(Buffer.from(s, "utf8"));
@@ -235,10 +243,17 @@ describe("decodeForOpen — deterministic admission", () => {
     expect(r.hasBOM).toBe(false);
   });
 
-  it("keeps hasBOM when an explicit hint is combined with a BOM", async () => {
-    const r = await decodeForOpen(withBom("hello"), noGuess, { encodingHint: "utf8" });
+  it("keeps hasBOM when the hint names the BOM-carrying form", async () => {
+    // The name has to MATCH the mark, and this test is the pair to
+    // "refuses a BOM the named encoding cannot write back". An earlier version of
+    // it asserted `encodingHint: "utf8"` here and expected `hasBOM: true` — a
+    // state the save cannot honour, because `encodeForSave` writes a BOM only for
+    // the `utf8bom` name. That expectation was the bug: the read reported a BOM
+    // the write then dropped. Naming `utf8bom` is what actually keeps it.
+    const r = await decodeForOpen(withBom("hello"), noGuess, { encodingHint: "utf8bom" });
     expect(r.text).toBe("hello");
     expect(r.hasBOM).toBe(true);
+    expect(r.encoding).toBe("utf8bom");
   });
 
   it("rejects an unknown encoding hint", async () => {
@@ -353,6 +368,402 @@ describe("decodeForOpen — deterministic admission", () => {
       expect(message).toContain("probably wrong");
       expect(message).not.toContain("has no character in");
     }
+  });
+
+  it("does not lock a file out when the session's own recorded name is reused", async () => {
+    // The regression this pins: `io.ts` feeds the session's recorded encoding back
+    // as the hint on every later read. A file whose first read went through the
+    // GUESS branch records a page that reads the mark as CONTENT, so a check that
+    // compared encoding NAMES alone refused it on the second read — and no name
+    // could reopen it, because the file's real mark was never the recorded one.
+    // The file became unreadable and uneditable for the rest of the session.
+    //
+    // What makes it admissible is that the legacy page reproduces the mark bytes
+    // as content, which is what `incompatibleBom` now asks the codec instead of
+    // assuming. The allowlist is the default set, because reaching the guess
+    // branch for a BOM-prefixed body needs a page that can read the mark as text.
+    const permissive = {
+      autoGuessEncoding: true,
+      supportedEncodings: [...DEFAULT_SUPPORTED_ENCODINGS],
+    };
+    for (const bytes of [
+      // UTF-8 BOM followed by GBK text, whose mark bytes no UTF-8 decoder accepts.
+      Uint8Array.from([0xef, 0xbb, 0xbf, 0xd6, 0xd0, 0xce, 0xc4]),
+      // UTF-8 BOM followed by a truncated sequence.
+      Uint8Array.from([0xef, 0xbb, 0xbf, 0xe4, 0xb8]),
+    ]) {
+      const first = await decodeForOpen(bytes, permissive, { displayPath: "probe.txt" });
+      expect(first.decided).toBe("guessed");
+      expect(first.hasBOM).toBe(false);
+
+      // The second read is the one that used to fail.
+      const second = await decodeForOpen(bytes, permissive, {
+        encodingHint: first.encoding,
+        displayPath: "probe.txt",
+      });
+      expect(second.encoding).toBe(first.encoding);
+      expect(second.text).toBe(first.text);
+
+      // And the bytes really are reproducible under that recorded name.
+      const saved = encodeForSave(second.text, openStateFor(second, undefined));
+      expect(Buffer.from(saved.bytes).equals(Buffer.from(bytes))).toBe(true);
+    }
+  });
+
+  it("does not lock a file out when only the BODY is non-canonical", async () => {
+    // The same lockout in its second shape, and the one a whole-file byte compare
+    // gets wrong. The mark here IS reproducible — the page reads `EF BB BF` as
+    // content and writes it straight back — but a byte pair further along is
+    // non-canonical (`A2 E3` for the euro sign, written back as `80`; `A3 A0` for
+    // the ideographic space, written back as `A1 A1`), so a check that asked
+    // "would re-encoding reproduce EVERY byte" blamed the mark, refused a file
+    // whose mark is fine, and named `utf8bom` as the remedy for a body `utf8bom`
+    // cannot decode at all. The refusal landed on the SECOND read, so a file the
+    // first read had just accepted stopped opening for the rest of the session.
+    //
+    // The mark question is therefore asked of the MARK. Byte fidelity is NOT
+    // asserted below, and deliberately so: these bodies legitimately change bytes
+    // on save, which is the accepted behaviour of a canonicalising codec (see the
+    // multi-byte cases in the encoding suite). What must hold is that the session
+    // can still reopen the file and get the same text back.
+    const permissive = {
+      autoGuessEncoding: true,
+      supportedEncodings: [...DEFAULT_SUPPORTED_ENCODINGS],
+    };
+
+    // Guess branch: the first read records a page that reads the mark as content,
+    // and the recorded name must reopen the file. This is the user-visible half.
+    const guessed = Uint8Array.from([0xef, 0xbb, 0xbf, 0x81, 0x41, 0xa2, 0xe3]);
+    const firstGuessed = await decodeForOpen(guessed, permissive, { displayPath: "probe.txt" });
+    expect(firstGuessed.decided).toBe("guessed");
+    const secondGuessed = await decodeForOpen(guessed, permissive, {
+      encodingHint: firstGuessed.encoding,
+      displayPath: "probe.txt",
+    });
+    expect(secondGuessed.encoding).toBe(firstGuessed.encoding);
+    expect(secondGuessed.text).toBe(firstGuessed.text);
+
+    // Hint branch: a doubled mark over a non-canonical body, read as the page that
+    // sees the marks as content. Refusing this is what a whole-file compare did.
+    const doubled = Uint8Array.from([0xef, 0xbb, 0xbf, 0xef, 0xbb, 0xbf, 0xa3, 0xa0, 0xd6, 0xd0, 0xce, 0xc4]);
+    const hinted = await decodeForOpen(doubled, permissive, {
+      encodingHint: "gbk",
+      displayPath: "probe.txt",
+    });
+    expect(hinted.encoding).toBe("gbk");
+    expect(hinted.hasBOM).toBe(false);
+  });
+
+  it("blames the decode, not the mark, when the body does not decode at all", async () => {
+    // The mark refusal must not shadow the accurate message. `EF BB BF E4 B8` is a
+    // utf8bom mark over a TRUNCATED sequence: `utf8` cannot read it, and neither
+    // can `utf8bom`, so naming the mark as the obstacle would recommend a remedy
+    // that fails too and send the model in a circle. The reason to refuse is that
+    // the bytes do not decode, and that is what has to be said.
+    for (const [hint, bytes] of [
+      ["utf8", [0xef, 0xbb, 0xbf, 0xe4, 0xb8]],
+      ["utf8", [0xff, 0xfe, 0x41, 0x00, 0x00, 0xd8]],
+    ] as const) {
+      try {
+        await decodeForOpen(Uint8Array.from(bytes), noGuess, { encodingHint: hint, displayPath: "probe.md" });
+        expect.unreachable("expected E_DECODE_FAILED");
+      } catch (error) {
+        const message = (error as Error).message;
+        expect((error as DecodeError).code).toBe("E_DECODE_FAILED");
+        expect(message).toContain(`cannot be decoded as ${hint}`);
+        expect(message).not.toContain("byte-order mark");
+      }
+    }
+
+    // A mark that IS the obstacle still says so, and its remedy works.
+    try {
+      await decodeForOpen(Uint8Array.from([0xef, 0xbb, 0xbf, 0x41, 0x42]), noGuess, {
+        encodingHint: "utf8",
+        displayPath: "probe.md",
+      });
+      expect.unreachable("expected E_DECODE_FAILED");
+    } catch (error) {
+      const message = (error as Error).message;
+      expect(message).toContain("byte-order mark");
+      expect(message).toContain('"utf8bom"');
+    }
+    const recovered = await decodeForOpen(Uint8Array.from([0xef, 0xbb, 0xbf, 0x41, 0x42]), noGuess, {
+      encodingHint: "utf8bom",
+      displayPath: "probe.md",
+    });
+    expect(recovered.text).toBe("AB");
+  });
+
+  it("refuses a mark only PART of which the named encoding would drop", async () => {
+    // Why the BOM question is a byte round trip and not a name comparison or a
+    // "does the codec swallow the mark" probe. A codec can drop part of a foreign
+    // mark and keep the rest as content: `utf16le` eats the leading `FF FE` of a
+    // `utf32le` mark and reads `00 00` as a NUL, so adopting utf16le for such a
+    // file loses two bytes on save. Asking whether the whole mark is swallowed
+    // says no here and admits it.
+    //
+    // The other direction matters just as much, and the same test covers it: a
+    // legacy page reads `EF BB BF` as `ï»¿`, which re-encodes to the very same
+    // bytes, so those files ARE reproducible and must stay readable — refusing
+    // them by name is what locked a file out of its own session.
+    await expect(
+      decodeForOpen(Uint8Array.from([0xff, 0xfe, 0x00, 0x00, 0x41, 0x41, 0x41, 0x41]), noGuess, {
+        encodingHint: "utf16le",
+        displayPath: "probe.md",
+      }),
+      "a utf32le mark read as utf16le loses its first two bytes",
+    ).rejects.toThrow(/E_DECODE_FAILED/);
+
+    // The reproducible pairings stay readable, and their bytes survive a save.
+    for (const [hint, bytes] of [
+      ["gbk", [0xef, 0xbb, 0xbf, 0x41, 0x42]],
+      ["windows-1252", [0xef, 0xbb, 0xbf, 0x41, 0x42]],
+      ["utf16be", [0xff, 0xfe, 0x41, 0x00, 0x42, 0x00]],
+    ] as const) {
+      const admitted = await decodeForOpen(Uint8Array.from(bytes), noGuess, {
+        encodingHint: hint,
+        displayPath: "probe.md",
+      });
+      const saved = encodeForSave(admitted.text, openStateFor(admitted, undefined));
+      expect(
+        Buffer.from(saved.bytes).equals(Buffer.from(bytes)),
+        `${hint} must reproduce the mark bytes it reads as content`,
+      ).toBe(true);
+    }
+  });
+
+  it("refuses a body that begins with mark bytes it cannot write back", async () => {
+    // The double-strip regression: the hint branch hands `roundTrips` a range with
+    // the mark already removed, so a second strip inside the helper ate 2-4 REAL
+    // content bytes and the comparison then passed on the wrong range. Every BOM
+    // family was affected, and each of these was admitted while its save silently
+    // dropped bytes. They must be refused instead.
+    for (const [hint, bytes] of [
+      ["utf8bom", [0xef, 0xbb, 0xbf, 0xef, 0xbb, 0xbf, 0xef, 0xbf, 0xbd]],
+      ["utf16le", [0xff, 0xfe, 0xff, 0xfe, 0xfd, 0xff]],
+      ["utf16be", [0xfe, 0xff, 0xfe, 0xff, 0xff, 0xfd]],
+      ["utf32le", [0xff, 0xfe, 0x00, 0x00, 0xff, 0xfe, 0x00, 0x00, 0xfd, 0xff, 0x00, 0x00]],
+      ["utf32be", [0x00, 0x00, 0xfe, 0xff, 0x00, 0x00, 0xfe, 0xff, 0x00, 0x00, 0xff, 0xfd]],
+    ] as const) {
+      await expect(
+        decodeForOpen(Uint8Array.from(bytes), noGuess, { encodingHint: hint, displayPath: "probe.md" }),
+        `${hint} must not adopt a body whose mark bytes it would drop`,
+      ).rejects.toThrow(/E_DECODE_FAILED/);
+    }
+  });
+
+  it("refuses a BOM body the mark's own page cannot reproduce", async () => {
+    // Step 2 used to adopt on `decoded !== undefined` alone, so a body that the
+    // mark's page decodes but cannot re-encode was taken on the strength of its
+    // first two bytes — while the SAME bytes with an explicit hint of that name
+    // were refused. A lone surrogate is the case: `00 D8` decodes to U+FFFD and
+    // re-encodes to `FD FF`, so a save rewrites bytes the user never edited.
+    //
+    // The assertion is that step 2 REFUSES these bytes, which is what the title
+    // claims. It deliberately does NOT claim that every adopted file is
+    // byte-reproducible: that is a stronger invariant this plugin does not
+    // establish, and asserting it here would be false comfort. A truncated
+    // UTF-32 body is the counterexample — `FF FE 00 00 41 00 00` decodes to ""
+    // with no U+FFFD at all, so rule 1 admits it and a save drops the tail. That
+    // case is pre-existing (HEAD behaves the same) and is not what step 2 fixed.
+    for (const bytes of [
+      [0xff, 0xfe, 0x41, 0x00, 0x00, 0xd8],
+      [0xfe, 0xff, 0x00, 0x41, 0xd8, 0x00],
+    ]) {
+      // Guessing off, so nothing can rescue the body after step 2 declines it.
+      await expect(
+        decodeForOpen(Uint8Array.from(bytes), {
+          autoGuessEncoding: false,
+          supportedEncodings: [...DEFAULT_SUPPORTED_ENCODINGS],
+        }, { displayPath: "probe.txt" }),
+        "step 2 must not adopt a surrogate body on the strength of its mark",
+      ).rejects.toThrow(/E_NOT_TEXT/);
+    }
+  });
+
+  it("refuses a BOM the named encoding cannot write back", async () => {
+    // A save takes its BOM from the encoding NAME, while the read strips the
+    // file's real BOM before decoding. When the two disagree the save rewrites
+    // the prefix, so a file whose BOM the name does not account for must not be
+    // adopted — however clean its text is. This is the case a body-only round
+    // trip called reversible.
+    await expect(
+      decodeForOpen(Uint8Array.from([0xef, 0xbb, 0xbf, 0xef, 0xbf, 0xbd]), noGuess, {
+        encodingHint: "utf8",
+        displayPath: "probe.md",
+      }),
+    ).rejects.toThrow(/E_DECODE_FAILED/);
+
+    await expect(
+      decodeForOpen(Uint8Array.from([0xff, 0xfe, 0x00, 0x00, 0x41, 0x00, 0xfd, 0xff]), noGuess, {
+        encodingHint: "utf16le",
+        displayPath: "probe.md",
+      }),
+    ).rejects.toThrow(/E_DECODE_FAILED/);
+
+    // The matching form stays readable, and its bytes survive an untouched save.
+    const bytes = Uint8Array.from([0xef, 0xbb, 0xbf, 0xef, 0xbf, 0xbd]);
+    const admitted = await decodeForOpen(bytes, noGuess, {
+      encodingHint: "utf8bom",
+      displayPath: "probe.md",
+    });
+    expect(admitted.text).toBe("\uFFFD");
+    const saved = encodeForSave(admitted.text, openStateFor(admitted, undefined));
+    expect(Buffer.from(saved.bytes).equals(Buffer.from(bytes))).toBe(true);
+  });
+
+  it("admits a legal UTF-8 file whose CONTENT holds a literal U+FFFD", async () => {
+    // `EF BF BD` IS U+FFFD's own UTF-8 encoding, so the character can be file
+    // content rather than a decoder's footprint. The old text rule could not tell
+    // those apart, so step 3 (strict UTF-8) accepted these bytes while the hint
+    // branch refused them — same bytes, opposite answers, one call. UTF-8 has no
+    // unassigned bytes, so the character is spellable there and must be admitted.
+    const bytes = Uint8Array.from([0x58, 0xef, 0xbf, 0xbd, 0x59]);
+
+    // Both paths must agree, and both must admit.
+    const bare = await decodeForOpen(bytes, noGuess, { displayPath: "probe.md" });
+    expect(bare.encoding).toBe("utf8");
+    expect(bare.decided).toBe("utf8");
+    expect(bare.text).toBe("X\uFFFDY");
+
+    // The hint is what a SECOND read of the same file uses (the session record
+    // feeds it back as `encodingHint`), which is why the asymmetry locked the
+    // file out permanently after a successful first read.
+    const hinted = await decodeForOpen(bytes, noGuess, {
+      encodingHint: "utf8",
+      displayPath: "probe.md",
+    });
+    expect(hinted.encoding).toBe("utf8");
+    expect(hinted.decided).toBe("hint");
+    expect(hinted.text).toBe(bare.text);
+
+    // The alias spelling a caller may pass explicitly.
+    const aliased = await decodeForOpen(bytes, noGuess, {
+      encodingHint: "utf-8",
+      displayPath: "probe.md",
+    });
+    expect(aliased.text).toBe(bare.text);
+  });
+
+  it("still refuses bytes that only LOOK like that file, in both directions", async () => {
+    // The fix must not become a general reprieve. A truncated sequence is NOT the
+    // character, and a decode that does not even succeed cannot be adopted.
+    await expect(
+      decodeForOpen(Uint8Array.from([0x58, 0xef, 0xbf, 0x59]), noGuess, {
+        encodingHint: "utf8",
+      }),
+    ).rejects.toThrow(/E_DECODE_FAILED/);
+
+    // And the historical corruption stays refused: a wrong single-byte page that
+    // hits an unassigned byte produces the same U+FFFD as the right page, so no
+    // text rule separates them — and the round trip cannot either, since U+FFFD
+    // re-encodes onto a gap byte. Accepting this was what rewrote 0x81 as 0x9D.
+    await expect(
+      decodeForOpen(Uint8Array.from([0x43, 0x61, 0x66, 0xe9, 0x20, 0x81, 0x20, 0x6d]), noGuess, {
+        encodingHint: "windows-1252",
+        displayPath: "menu.txt",
+      }),
+    ).rejects.toThrow(/E_DECODE_FAILED/);
+  });
+
+  it("admits a legal multi-byte file the byte round trip alone would refuse", async () => {
+    // `iconv-lite`'s encoders canonicalise rather than invert, so a byte-exact
+    // round trip is the WRONG admission test: these sequences decode to ordinary
+    // characters with no U+FFFD at all, but write back as a different (equally
+    // valid) pair. Measured, 2091 Shift-JIS byte pairs and 100 Big5 ones do this.
+    //
+    // A gate that demanded the round trip refused these files — and refused them
+    // under the CORRECT encoding too, so no spelling of the name could open them.
+    // Each case below is a file that must stay readable. The bytes are written
+    // out literally rather than produced with `encodeText`, because the whole
+    // point is the NON-canonical spelling: encoding the text would yield the
+    // canonical pair that iconv-lite prefers, and the fixture would stop testing
+    // anything.
+    const cases = [
+      // The CP936 spelling of the euro sign; iconv writes 0x80 instead.
+      ["gbk", Uint8Array.from([0xa2, 0xe3]), "\u20AC"],
+      // The CP936 spelling of the ideographic space; iconv writes A1 A1 instead.
+      ["gbk", Uint8Array.from([0xa3, 0xa0]), "\u3000"],
+      // A CP932 NEC row-13 character, written back as its canonical twin.
+      ["shift_jis", Uint8Array.from([0x87, 0x90]), "\u2252"],
+      // A Big5 ETEN character, likewise.
+      ["big5", Uint8Array.from([0x8e, 0x69]), "\u7BB8"],
+    ] as const;
+
+    for (const [enc, bytes, expected] of cases) {
+      const viaHint = await decodeForOpen(bytes, noGuess, { encodingHint: enc, displayPath: "doc.txt" });
+      expect(viaHint.text, `${enc} must read its own bytes back`).toBe(expected);
+      expect(viaHint.encoding).toBe(enc);
+
+      // The bytes really are non-canonical: re-encoding does NOT reproduce them,
+      // which is exactly why a round trip cannot be the admission test.
+      const back = encodeText(viaHint.text, enc)!;
+      expect(
+        Buffer.from(back).equals(Buffer.from(bytes)),
+        `${enc} fixture must exercise a non-canonical mapping`,
+      ).toBe(false);
+    }
+  });
+
+  it("refuses a page whose U+FFFD can only be its own unassigned byte", async () => {
+    // The distinction the text rule could not draw, and the one a byte round trip
+    // cannot draw either. windows-1252 leaves five bytes unassigned, and
+    // `iconv-lite` writes U+FFFD onto one of them (0x9D) — so a decoder-invented
+    // replacement re-encodes to the very byte it came from and round-trips
+    // perfectly. Accepting that was the third form of the historical corruption:
+    // the wrong page adopted, and a save rewriting the file.
+    //
+    // What settles it is not the round trip but the page's own gap table: if the
+    // character's encoding lands on a byte the page leaves unassigned, the U+FFFD
+    // cannot have come from the file. The list is derived from the SAME table the
+    // rule reads, so a page cannot quietly become the exception by being left off
+    // it: every canonical encoding that has a gap is covered, and the assertion
+    // below fails loudly if one that had gaps ever stops having them.
+    const gapPages = CANONICAL_ENCODINGS.filter((enc) => unassignedBytes(enc).length > 0);
+    // Measured: seven pages, all of the Windows ANSI family. The number is pinned
+    // so that a page silently dropping out of the list is a failure rather than a
+    // quietly narrower test.
+    expect(gapPages.length, `expected the seven Windows pages, got ${gapPages.join(", ")}`).toBe(7);
+    for (const enc of gapPages) {
+      const gaps = unassignedBytes(enc);
+      expect(gaps.length, `${enc} must have gaps for this test to mean anything`).toBeGreaterThan(0);
+      for (const gap of gaps) {
+        await expect(
+          decodeForOpen(Uint8Array.from([0x58, gap, 0x59]), noGuess, { encodingHint: enc }),
+          `${enc} must refuse its own unassigned byte 0x${gap.toString(16)}`,
+        ).rejects.toThrow(/E_DECODE_FAILED/);
+      }
+    }
+
+    // The character itself is still readable in the encodings that really can
+    // spell it: UTF-8 spells it `EF BF BD`, UTF-16LE spells it `FD FF`, and
+    // neither page has a gap for it to hide in.
+    const utf8Literal = await decodeForOpen(Uint8Array.from([0x58, 0xef, 0xbf, 0xbd, 0x59]), noGuess, {
+      encodingHint: "utf8",
+    });
+    expect(utf8Literal.text).toBe("X\uFFFDY");
+    const utf16Literal = await decodeForOpen(
+      Uint8Array.from([0x58, 0x00, 0xfd, 0xff, 0x59, 0x00]),
+      noGuess,
+      { encodingHint: "utf16le" },
+    );
+    expect(utf16Literal.text).toBe("X\uFFFDY");
+  });
+
+  it("admits a literal U+FFFD in UTF-16, and refuses a lone surrogate", async () => {
+    // `FD FF` is U+FFFD in UTF-16LE, so the same false positive existed there.
+    // A lone surrogate is a different case: it also decodes to U+FFFD, but the
+    // text rule could not see it at all, while the round trip does (`00 D8`
+    // becomes `FD FF`).
+    const literal = Uint8Array.from([0x58, 0x00, 0xfd, 0xff, 0x59, 0x00]);
+    const admitted = await decodeForOpen(literal, noGuess, { encodingHint: "utf16le" });
+    expect(admitted.text).toBe("X\uFFFDY");
+
+    await expect(
+      decodeForOpen(Uint8Array.from([0x58, 0x00, 0x00, 0xd8, 0x59, 0x00]), noGuess, {
+        encodingHint: "utf16le",
+      }),
+    ).rejects.toThrow(/E_DECODE_FAILED/);
   });
 });
 

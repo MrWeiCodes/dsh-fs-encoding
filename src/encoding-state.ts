@@ -20,7 +20,8 @@ import {
   decodeBytes,
   detectBom,
   encodeText,
-  isAcceptableDecode,
+  incompatibleBom,
+  isAdoptableDecode,
   isValidUtf8,
   normalizeEncoding,
   rankCandidates,
@@ -520,10 +521,69 @@ export async function decodeForOpen(
         "E_BAD_ENCODING",
       );
     }
+    // A mark the hint cannot write back is refused with its own remedy, and it
+    // has to be reported as itself: the text here is perfectly clean, so the
+    // "replacement characters" wording below would send the model looking for a
+    // decoding problem that does not exist, and re-reading with the same name
+    // would fail identically. Naming the encoding that CAN write the mark back is
+    // the whole remedy.
+    //
+    // The check is `incompatibleBom`, which asks the codec rather than comparing
+    // names, and that distinction is what keeps this branch from refusing files
+    // it must accept. The legacy pages read a mark as ordinary content
+    // (`EF BB BF` becomes `ï»¿`), so their saves reproduce it and the name never
+    // has to write it. Comparing names alone refused every such file — including
+    // the one the session had just recorded itself, which made a BOM-prefixed
+    // file unreadable from the second read on.
+    //
+    // It deliberately stays silent when the bytes do not decode at all, so the
+    // message below reports that instead: naming the mark as the obstacle for a
+    // truncated body would recommend an encoding that cannot read it either.
+    const mismatch = incompatibleBom(bytes, hint);
+    if (mismatch !== undefined) {
+      // The remedy has to be one the caller can actually follow, and naming the
+      // mark's own encoding is only useful when that name can READ these bytes.
+      // It often cannot: for `EF BB BF FF` the mark is `utf8bom`, but `utf8bom`
+      // is a fatal UTF-8 decoder and `FF` is not valid UTF-8, so "re-read with
+      // utf8bom" fails identically — the circle the docstring above promises to
+      // avoid. `incompatibleBom` cannot answer this itself, because it asks
+      // whether the HINT can write the mark back, not whether the mark's own
+      // name can read the body.
+      //
+      // The question asked here is the one a re-read would ask — strip the mark,
+      // decode the body, admit it — so the advice and the attempt cannot
+      // disagree. Measured over a sweep of mark/body/hint combinations, roughly
+      // two in five mark refusals were naming a remedy that failed identically.
+      const remedyBody = bytes.subarray(mismatch.bomLen);
+      const remedyText = decodeBytes(remedyBody, mismatch.encoding);
+      const remedy =
+        remedyText !== undefined && isAdoptableDecode(remedyBody, mismatch.encoding, remedyText)
+          ? ` Re-read with encoding: "${mismatch.encoding}" to keep them.`
+          : " Re-read without an encoding to see candidates.";
+      throw new DecodeError(
+        `[E_DECODE_FAILED] ${display} starts with a ${mismatch.encoding} byte-order mark, which ` +
+          `${hint} cannot write back — saving would rewrite the file's first bytes.${remedy}`,
+        "E_DECODE_FAILED",
+      );
+    }
     const bom = detectBom(bytes);
-    // The BOM (when present) is stripped for the text, but its presence is kept
-    // in the state so a save can put it back.
-    const body = bom === undefined ? bytes : bytes.subarray(bom.bomLen);
+    // The mark is a PREFIX — stripped from the text and restored from the name on
+    // save — only when the name IS the mark's own name. For every other pairing
+    // the mark stays in `body` and `hasBOM` stays false, which is the state
+    // `encodeForSave` inverts to reproduce those bytes.
+    //
+    // That reproduces the file only when the codec reads the mark back as
+    // CONTENT, which is the case the check above admits: a legacy page sees
+    // `EF BB BF` as the characters `ï»¿` and writes them out again. It is NOT
+    // true of `utf8`, whose fatal decoder silently swallows a leading `EF BB BF`
+    // as a BOM rather than as content — so a doubled mark read as `utf8` is
+    // adopted with `hasBOM: false` and a save writes one mark instead of two.
+    // That case is pre-existing (HEAD behaves identically) and is not what this
+    // branch decides; the mark check above asks whether the name can write the
+    // mark back, and `utf8` writing back one `EF BB BF` for a doubled prefix is
+    // the codec's own BOM handling rather than a mismatch this branch can see.
+    const mark = bom !== undefined && bom.encoding === hint ? bom.bomLen : 0;
+    const body = bytes.subarray(mark);
     const decoded = decodeBytes(body, hint);
     if (decoded === undefined) {
       throw new DecodeError(
@@ -531,9 +591,16 @@ export async function decodeForOpen(
         "E_DECODE_FAILED",
       );
     }
-    if (!isAcceptableDecode(decoded)) {
+    if (!isAdoptableDecode(body, hint, decoded)) {
       // The verdict is "probably wrong" — the common case, and the safe one.
       // Naming the byte is additive FACT, never advice and never a reprieve.
+      //
+      // The test is {@link isAdoptableDecode}, NOT the text rule alone: a decode
+      // holding U+FFFD is refused only when this encoding could not have spelled
+      // that character itself. A legal UTF-8 file whose content really is
+      // `EF BF BD` is therefore admitted, where the text rule refused it while
+      // step 3 accepted the very same bytes — the same bytes, two answers, one
+      // call.
       //
       // Two earlier revisions of this branch were reverted for the same reason:
       // they handed the model a way to read the file as something it is not.
@@ -551,6 +618,15 @@ export async function decodeForOpen(
       // appears in two of them, so 15 by page and 14 by value). Every one of
       // them decodes to a printable letter under iso-8859-1 — "ª Ò ÿ Ù ß û ü ¡ ¥"
       // — not to a control character.
+      //
+      // Both relaxations failed on single-byte pages, where a WRONG page that
+      // hits an unassigned byte produces the same U+FFFD as the right one, so no
+      // text rule could separate them. What separates them is not the byte round
+      // trip either — that is the shape that failed a THIRD time, because
+      // `iconv-lite` encodes U+FFFD onto the page's own gap byte, so the invented
+      // replacement round-trips perfectly. It is `unassignedBytes`, which asks
+      // the one question the text cannot: could this page have written that
+      // character at all, or did it have nowhere to put it?
       //
       // So the note states the byte and stops. `firstUnassignedByte` only asks
       // whether such a byte VALUE occurs in the file — it cannot tell a genuine
@@ -571,7 +647,7 @@ export async function decodeForOpen(
       text: decoded,
       encoding: hint,
       decided: "hint",
-      hasBOM: bom !== undefined,
+      hasBOM: mark > 0,
       lineEnding: detectEnding(decoded),
       candidates: [],
     };
@@ -579,10 +655,18 @@ export async function decodeForOpen(
 
   // 2) BOM — authoritative, and it precedes the UTF-8 check because a UTF-8 BOM
   //    is itself valid UTF-8 and must be recorded rather than silently dropped.
+  //
+  //    The mark is trusted as the ENCODING but not as proof that the body decodes:
+  //    the same admission rule the hint branch applies is applied here, so a body
+  //    this page cannot reproduce (`FF FE 41 00 00 D8` is a lone surrogate that a
+  //    save rewrites to `FD FF`) falls through to the checks below instead of
+  //    being adopted on the strength of its first two bytes. Without it the two
+  //    adoption paths disagreed about identical bytes.
   const bom = detectBom(bytes);
   if (bom !== undefined) {
-    const decoded = decodeBytes(bytes.subarray(bom.bomLen), bom.encoding);
-    if (decoded !== undefined) {
+    const body = bytes.subarray(bom.bomLen);
+    const decoded = decodeBytes(body, bom.encoding);
+    if (decoded !== undefined && isAdoptableDecode(body, bom.encoding, decoded)) {
       return {
         text: decoded,
         encoding: bom.encoding,
@@ -625,8 +709,22 @@ export async function decodeForOpen(
     // when both producers independently agree.
     const best = ranked.adoptable ? ranked.candidates[0] : undefined;
     if (best !== undefined) {
+      // The same admission rule the hint branch uses, for the same reason: this
+      // is the other place an encoding is ADOPTED, so it is the other place a
+      // later save can be authorized to rewrite the file. Asking one question in
+      // both spots is what keeps a guess and a hint from disagreeing about the
+      // same bytes.
+      //
+      // This branch is reachable for the false positive the rule exists to
+      // handle, and the earlier claim that it was not is worth recording so it
+      // is not believed again. `scoreText` does return -1000 for any text holding
+      // U+FFFD, but that only orders the heuristic list: the `heuristic-only`
+      // branch of `rankCandidates` returns that list with `adoptable: true` and
+      // the head is taken by POSITION, so a -1000 head is still adopted when
+      // chardet produced no allowlisted verdict. The rule therefore decides real
+      // reads here, not just consistency between the two call sites.
       const decoded = decodeBytes(bytes, best.encoding);
-      if (decoded !== undefined && isAcceptableDecode(decoded)) {
+      if (decoded !== undefined && isAdoptableDecode(bytes, best.encoding, decoded)) {
         const footer = buildGuessFooter(ranked);
         return {
           text: decoded,
