@@ -14,11 +14,13 @@
 export const SECTION_READ = "tool:read";
 export const SECTION_WRITE = "tool:write";
 export const SECTION_EDIT = "tool:edit";
+export const SECTION_GREP = "tool:grep";
 
 /** Order values, above the built-in tool band to avoid registration-order ties. */
 export const ORDER_READ = 130;
 export const ORDER_WRITE = 131;
 export const ORDER_EDIT = 132;
+export const ORDER_GREP = 133;
 
 /**
  * The `read` call that re-opens a file under an explicit encoding.
@@ -78,6 +80,19 @@ export const UNDO_DESCRIPTION =
   "reverted, and only while the file still matches what that edit wrote — if the " +
   "file changed since, the undo is refused rather than overwriting those changes. " +
   "The history is held in memory, so it does not survive a restart.";
+
+export const GREP_DESCRIPTION =
+  "Search file contents with a ripgrep regular expression. Returns matching lines " +
+  "with line numbers, grouped by file. Handles any text encoding: a GBK, Big5, " +
+  "Shift-JIS, UTF-16 or UTF-32 file is searched and reported as text rather than " +
+  "as unreadable bytes. Returns up to 250 matches; a larger result reports where " +
+  "the complete match list was saved.";
+
+export const GREP_SECTION_TEXT =
+  "Use the grep tool — not shell grep or rg — to search file contents. It decodes " +
+  "any text encoding, so a GBK or UTF-16 file is searched and shown as text. A " +
+  "matched line that cannot be decoded is reported with candidate encodings; " +
+  "re-read the file with one of them and search again.";
 
 /**
  * The read result envelope, shared by `read` and by `str_replace_editor`'s `view`.

@@ -1,7 +1,7 @@
 {
   "name": "dsh-fs-encoding",
   "version": "1.4.3",
-  "description": "Encoding-governed read/write/edit tools for DeepSeek Harness (dsh): UTF-8 BOM fidelity and byte-exact round-trips for GBK, Big5, Shift-JIS, EUC-KR, Windows-1251 and UTF-16 text files.",
+  "description": "Encoding-governed read/write/edit/grep tools for DeepSeek Harness (dsh): UTF-8 BOM fidelity and byte-exact round-trips for GBK, Big5, Shift-JIS, EUC-KR, Windows-1251 and UTF-16 text files.",
   "keywords": [
     "bom",
     "big5",
@@ -12,8 +12,10 @@
     "edit",
     "encoding",
     "gbk",
+    "grep",
     "iconv",
     "read",
+    "search",
     "shift-jis",
     "utf-16",
     "write"
@@ -69,8 +71,22 @@
     "@deepseek-ai/dsh-agent": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0",
     "@deepseek-ai/dsh-fs": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0",
     "@deepseek-ai/dsh-home-paths": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0",
+    "@deepseek-ai/dsh-output-retention": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0",
     "@deepseek-ai/dsh-sandbox": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0",
+    "@deepseek-ai/dsh-spill": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0",
+    "@deepseek-ai/dsh-tool-fs-search": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0",
     "@deepseek-ai/dsh-tools": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-output-retention": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-spill": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tool-fs-search": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
@@ -80,11 +96,17 @@
     "@deepseek-ai/dsh-fs-observation-policy": "^0.1.5-rc.2",
     "@deepseek-ai/dsh-fs-sandbox": "^0.1.5-rc.2",
     "@deepseek-ai/dsh-home-paths": "^0.1.5-rc.2",
+    "@deepseek-ai/dsh-output-retention": "0.1.5-rc.2",
     "@deepseek-ai/dsh-sandbox": "^0.1.5-rc.2",
     "@deepseek-ai/dsh-sandbox-policy": "^0.1.5-rc.2",
     "@deepseek-ai/dsh-scope": "^0.1.5-rc.2",
     "@deepseek-ai/dsh-session": "^0.1.5-rc.2",
+    "@deepseek-ai/dsh-spill": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-spill-local": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-subprocess": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-subprocess-local": "0.1.5-rc.2",
     "@deepseek-ai/dsh-system-prompt": "^0.1.5-rc.2",
+    "@deepseek-ai/dsh-tool-fs-search": "0.1.5-rc.2",
     "@deepseek-ai/dsh-tools": "^0.1.5-rc.2",
     "@types/node": "^24.0.0",
     "oxlint": ">=1",

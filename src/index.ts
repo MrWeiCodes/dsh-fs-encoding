@@ -55,22 +55,27 @@ import { clearSession } from "./encoding-state.js";
 import { clearSessionUndo } from "./undo-state.js";
 import {
   editSectionText,
+  GREP_SECTION_TEXT,
   ORDER_EDIT,
+  ORDER_GREP,
   ORDER_READ,
   ORDER_WRITE,
   readSectionText,
   SECTION_EDIT,
+  SECTION_GREP,
   SECTION_READ,
   SECTION_WRITE,
   writeSectionText,
 } from "./prompts.js";
 import { EncodingSandbox } from "./sandbox.js";
+import { loadSearchKit } from "./search-kit.js";
 import {
   FS_ENCODING_SERVICE,
   isFsEncodingService,
   provideFsEncoding,
 } from "./service.js";
 import { buildEditTool } from "./tool-edit.js";
+import { buildGrepTool, subprocessOf } from "./tool-grep.js";
 import { buildInsertTool } from "./tool-insert.js";
 import { buildReadTool } from "./tool-read.js";
 import { buildStrReplaceEditorTool } from "./tool-str-replace-editor.js";
@@ -93,14 +98,16 @@ export const inject = ["tools", "systemPrompt", "fs"];
 /**
  * Names of the tools this plugin owns.
  *
- * The first three shadow the built-ins on the agent's layer. The last three are
- * ADDITIONS rather than shadows: `insert` and `undo_last_edit` have no built-in
- * counterpart, and `str_replace_editor` is only mounted by the headless / SDK /
- * ACP profiles, not by `dsh-base`, so in a web profile it is a new name too.
+ * The first three shadow the built-ins on the agent's layer. `insert` and
+ * `undo_last_edit` are ADDITIONS with no built-in counterpart, and
+ * `str_replace_editor` is only mounted by the headless / SDK / ACP profiles, not
+ * by `dsh-base`, so in a web profile it is a new name too.
  *
- * All six are listed because all six are registered, and a name this plugin
- * registers is a name it can collide on — the conflict check is about the layer,
- * not about who the other plugin is.
+ * `grep` is the conditional one: it shadows the built-in `grep` only when the
+ * deployment has a `subprocess` seam to run ripgrep through (see
+ * {@link installAgentTools}). It is listed here regardless, because this array
+ * answers "which names could this plugin occupy", and the conflict check is
+ * about the layer rather than about what happens to be mounted.
  */
 const OWNED_TOOLS = [
   "read",
@@ -109,6 +116,7 @@ const OWNED_TOOLS = [
   "insert",
   "str_replace_editor",
   "undo_last_edit",
+  "grep",
 ] as const;
 
 /**
@@ -305,10 +313,122 @@ function installAgentTools(rootCtx: Context, agent: Agent): void {
       throw error;
     }
 
+    // `grep` is installed separately, and asynchronously, because it depends on
+    // two things that may simply not be there: a `subprocess` seam to run
+    // ripgrep through, and the search toolkit package. Both are read
+    // opportunistically rather than declared, and neither is allowed to cost the
+    // six tools above — a deployment that has the filesystem plugin without the
+    // search one keeps `read`/`write`/`edit` and simply keeps the built-in
+    // `grep`, which is exactly the behaviour it had before this plugin was
+    // installed.
+    //
+    // `inject` is NOT the mechanism for either. Cordis deactivates the WHOLE
+    // plugin when an injected service is missing — measured: the fiber reports
+    // `epoch: __INACTIVE__`, `apply` never runs, and mounting the service
+    // afterwards does not activate it either — so declaring `subprocess` would
+    // trade this tool's availability for the other six tools working at all.
+    void installGrepTool(rootCtx, agent, disposers);
+
     return () => {
       for (const dispose of disposers) dispose();
     };
   });
+}
+
+/**
+ * Install the encoding-aware `grep`, when this deployment can support it.
+ *
+ * Async because the toolkit is imported on demand, and deliberately not awaited
+ * by the caller: the six filesystem tools must land immediately rather than
+ * waiting on a search dependency. The `effect` that owns `disposers` may already
+ * have run its cleanup by the time the import resolves — an agent disposed
+ * during startup — so the disposal list is checked before registering, and a
+ * registration that happens after disposal is undone rather than leaked.
+ *
+ * @param rootCtx - the host-plane plugin context.
+ * @param agent - the agent whose layer the tool is registered on.
+ * @param disposers - the install's shared disposal list.
+ */
+async function installGrepTool(
+  rootCtx: Context,
+  agent: Agent,
+  disposers: Array<() => void>,
+): Promise<void> {
+  let disposed = false;
+  const guard = (): void => {
+    disposed = true;
+  };
+  disposers.push(guard);
+
+  const subprocess = subprocessOf(rootCtx);
+  if (subprocess === undefined) {
+    rootCtx.logger.debug(
+      "dsh-fs-encoding: no subprocess service on this deployment, so `grep` stays " +
+        "the built-in's. The encoding-aware tools are unaffected.",
+    );
+    return;
+  }
+
+  const kit = await loadSearchKit((reason) => {
+    rootCtx.logger.warn(
+      `dsh-fs-encoding: ${reason}, so the encoding-aware \`grep\` is not installed ` +
+        `and the built-in's remains in place. The other tools are unaffected.`,
+    );
+  });
+  if (kit === undefined) return;
+
+  // The agent's install was rolled back or disposed while the import was in
+  // flight. Registering now would leak a tool onto a dead layer.
+  if (disposed) return;
+
+  const grepTool = buildGrepTool(rootCtx, kit, subprocess);
+  // The tool and its section are two registrations, so they are rolled back
+  // through the same local list `installAgentTools` uses: each disposer is
+  // collected the moment it is produced rather than parked in a local variable.
+  // Parked, a collision on the SECTION would strand this plugin's `grep`
+  // shadowing the built-in while the section beside it stayed the other
+  // plugin's — the log would say the built-in's `grep` remains in place, and the
+  // model would be handed this one instead.
+  const registered: Array<() => void> = [];
+  try {
+    registered.push(agent.ctx.tools.register(grepTool));
+    registered.push(
+      agent.ctx.systemPrompt.section({
+        name: SECTION_GREP,
+        order: ORDER_GREP,
+        text: () => GREP_SECTION_TEXT,
+      }),
+    );
+    if (disposed) {
+      for (const dispose of registered) dispose();
+      return;
+    }
+    disposers.push(...registered);
+  } catch (error) {
+    // Undo whatever landed before the failure — the tool as well as the section
+    // — so what the agent keeps really is the built-in `grep`, which is what the
+    // messages below tell the operator.
+    for (const dispose of registered) {
+      try {
+        dispose();
+      } catch {
+        // A disposer that throws must not mask the original failure.
+      }
+    }
+    // A collision on `grep` or its section is reported and survivable: the
+    // built-in's tool stays, and the six tools above are already installed.
+    if (isDuplicateRegistration(error)) {
+      rootCtx.logger.error(
+        conflictMessage(duplicateToolName(error), duplicateSectionName(error)),
+      );
+      return;
+    }
+    rootCtx.logger.warn(
+      `dsh-fs-encoding: could not install the encoding-aware \`grep\`: ${
+        error instanceof Error ? error.message : String(error)
+      }. The built-in's \`grep\` remains in place.`,
+    );
+  }
 }
 
 /**

@@ -10,13 +10,14 @@
 
 ## Introduction
 
-DSH's built-in `read` / `write` / `edit` tools **only understand UTF-8**, which breaks down on the encodings common in Chinese, Japanese and Korean projects:
+DSH's built-in `read` / `write` / `edit` / `grep` tools **only understand UTF-8**, which breaks down on the encodings common in Chinese, Japanese and Korean projects:
 
 - **GBK, Big5 and Shift-JIS files simply cannot be read** — they fail with `invalid UTF-8 text` and the AI is left staring at an error;
 - **UTF-8 files with a BOM can be read, but the BOM is silently swallowed** — one casual edit and those first three bytes are gone. For PHP, older compilers and some Windows software, a missing BOM can mean a parse error or garbled output;
+- **`grep` reports a hit in a non-UTF-8 file as `(line is not valid UTF-8)`**; searching for a Chinese word is worse — it returns **zero matches with no error**, reading as "not in the file" when the truth is "not searched";
 - Worse, **there is no warning at all**: you find out the file is broken days later, with no idea which edit did it.
 
-This plugin takes over those three tools and, while **preserving every existing behaviour** (sandbox fence, read-before-write protection, version checking, diff display), makes non-UTF-8 files and BOMs round-trip correctly: **whatever encoding a file had, it still has after the edit.**
+This plugin takes over those four tools and, while **preserving every existing behaviour** (sandbox fence, read-before-write protection, version checking, diff display), makes non-UTF-8 files and BOMs round-trip correctly: **whatever encoding a file had, it still has after the edit.**
 
 ## Features
 
@@ -25,8 +26,9 @@ This plugin takes over those three tools and, while **preserving every existing 
 - **Line-ending fidelity**: CRLF / LF / CR are detected at read and restored on save, so Windows projects are not rewritten to LF.
 - **No silent corruption**: if the target encoding cannot represent the new content (an emoji in a GBK file), the plugin **refuses the write** and explains why, leaving the file untouched — instead of filling it with `?` and destroying it.
 - **It tells you what to do when it cannot read**: for a non-UTF-8 file, the plugin lists the most likely encodings with a sample decode of each, so the AI (or you) can pick one and re-read — like VS Code's "Reopen with Encoding".
+- **`grep` searches non-UTF-8 files too**: hits show their real text instead of a placeholder, and a Chinese or Japanese pattern is no longer a silent miss. A file it cannot pin down comes back with its candidate encodings, and one `read` is enough for `grep` to follow along.
 - **Nineteen encodings**: UTF-8 (with BOM), UTF-16, UTF-32, plus GBK, Big5, Shift-JIS, EUC-KR and the full Windows-125x family (Western, Central European, Cyrillic, Greek, Turkish, Hebrew, Arabic, Baltic).
-- **Zero learning curve**: `read` / `write` / `edit` take the same arguments and return the same shapes as the built-ins — **drop-in replacements**, so existing prompts and habits keep working; `read` and `write` each gain one optional `encoding` argument (the one on `write` applies to new files only, see below).
+- **Zero learning curve**: `read` / `write` / `edit` / `grep` take the same arguments and return the same shapes as the built-ins — **drop-in replacements**, so existing prompts and habits keep working; `read` and `write` each gain one optional `encoding` argument (the one on `write` applies to new files only, see below).
 - **Create files in a chosen encoding**: one `encoding` argument on `write` produces a GBK, Shift-JIS or other legacy-encoded file directly — no writing UTF-8 and converting afterwards.
 - **Three further tools**: `insert` (insert at a line number, which the built-ins cannot do), `undo_last_edit` (revert the last edit, content and encoding together) and `str_replace_editor` (a compatibility layer for its four commands, also encoding-governed). See "Three further tools" below.
 - **Simple configuration**: one YAML file with a few switches, all overridable by environment variables.
@@ -124,9 +126,27 @@ Use it when an edit produced the wrong result, or when the AI notices its own la
 >
 > The native `str_replace` and `insert` understand UTF-8 only — a GBK file fails outright or gets converted. That is precisely why this plugin takes them over.
 
+### `grep`: searching non-UTF-8 files
+
+`grep` is a **drop-in replacement** for the built-in: same arguments (`pattern` / `path` / `include`), same result shape, same search card. The built-in has two defects, and the second is the serious one:
+
+- **Matching lines cannot be shown.** A hit in a non-UTF-8 file is reported as the literal string `(line is not valid UTF-8)`, even though the content is right there in the file.
+- **A non-ASCII pattern silently misses.** The built-in matches the pattern as a byte sequence, and a UTF-8 pattern's bytes cannot occur in a GBK file — so searching for a Chinese word returns **zero matches with no error**. It reads as "not in the file" when the truth is "not searched".
+
+This plugin takes one of two routes, depending on whether the pattern holds a non-ASCII character:
+
+- **ASCII pattern** (e.g. `port`): still one ripgrep pass. Only files that actually produced an undecodable row are re-searched under a per-file encoding. In a UTF-8 repository that is zero files, so the extra cost is nil.
+- **Non-ASCII pattern** (e.g. `配置项`): the pattern runs once per candidate encoding. A hit is self-validating — ripgrep transcodes a file with the encoding it is given and only then matches, so a hit under `gbk` means those bytes really are GBK. Measured, no `(path, lineNumber)` is claimed by more than one encoding, so the union needs no scoring.
+
+> **Consistent with `read`**: `grep` never knows more than `read` does. Under the default config (`autoGuessEncoding: false`) a file `read` cannot open gets a placeholder from `grep` too — but with its **candidate encodings attached**. One `read({ file_path: "...", encoding: "gbk" })` is enough, and every later `grep` uses that record and shows the real content. The two tools can never contradict each other.
+>
+> **UTF-32** is the one encoding that takes the JavaScript fallback (ripgrep rejects `--encoding=utf-32le`), so patterns against those files use JavaScript syntax: `(?i)` and `(?s)` are unavailable. Such files are located by their BOM bytes in byte mode, so a **BOM-less UTF-32 file is not found**.
+>
+> **Requires `subprocess`**: a deployment without that service (the `minimal` preset, for instance) does not get this plugin's `grep` — the built-in stays, and the other tools are unaffected.
+
 ## Installation
 
-> **⚠️ Conflict**: **any** plugin that registers `read` / `write` / `edit` / `insert` / `str_replace_editor` / `undo_last_edit` — any one of those names — on the same scope layer is mutually exclusive with this one; registering a name twice in a layer throws.
+> **⚠️ Conflict**: **any** plugin that registers `read` / `write` / `edit` / `insert` / `str_replace_editor` / `undo_last_edit` / `grep` — any one of those names — on the same scope layer is mutually exclusive with this one; registering a name twice in a layer throws.
 >
 > If those names are already held by another plugin **on the same layer**, the install is refused with the offending tool named, rather than leaving a half-registered tool set. To resolve it, either remove this plugin from the profile or disable the plugin that holds the name:
 >
@@ -136,7 +156,9 @@ Use it when an edit produced the wrong result, or when the AI notices its own la
 >   disabled: true
 > ```
 >
-> Note: the built-in `read` / `write` / `edit` live on an outer host/preset layer and are **not** a conflict — shadowing them on the agent's own layer is exactly what this plugin does, matching how the native tools shadow each other.
+> Note: the built-in `read` / `write` / `edit` / `grep` live on an outer host/preset layer and are **not** a conflict — shadowing them on the agent's own layer is exactly what this plugin does, matching how the native tools shadow each other.
+>
+> `grep` is listed for the **occupancy** check unconditionally, but its **install** is conditional: it is registered only when a `subprocess` service is available.
 
 ### Option 1: install from the plugin market (dsh-market, recommended)
 
