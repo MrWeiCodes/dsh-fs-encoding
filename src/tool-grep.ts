@@ -47,6 +47,7 @@
  */
 
 import type { Context } from "@deepseek-ai/cordis";
+import type { FsTarget } from "@deepseek-ai/dsh-fs";
 import type { RetainedItems } from "@deepseek-ai/dsh-output-retention";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolExecution } from "@deepseek-ai/dsh-tools";
@@ -56,10 +57,12 @@ import {
   candidatesOf,
   encodingsForPattern,
   filesNeedingDecoding,
+  isPlainUtf8Text,
   mergeMatches,
   needsTranscodedSearch,
   parseRgJson,
   placeholderFor,
+  provedFiles,
   readAndDecode,
   rgLabelFor,
   searchDecodedTextIsolated,
@@ -542,6 +545,91 @@ async function isExplicitFile(
 }
 
 /**
+ * A file two pages read differently, and the lines they disagree about.
+ *
+ * The sweep cannot say which page is right, and the candidate order is not an
+ * answer to that question — measured, it picks the mojibake. So it reports the
+ * file and the lines at stake, and the caller turns them into placeholders that
+ * name the candidates while the per-file pass tries to settle it.
+ */
+interface ConflictedFile {
+  /** The path as ripgrep printed it. */
+  raw: string;
+  /** The 1-based line numbers the pages contradict each other on, ascending. */
+  lineNumbers: number[];
+  /** The canonical encodings that proved the file, in candidate order. */
+  candidates: string[];
+}
+
+/**
+ * What one transcoding sweep concluded about the tree.
+ *
+ * `matches` are the rows the sweep stands behind, ready to merge. `conflicted`
+ * are files two pages proved with contradicting text — a question the sweep
+ * cannot answer and must not answer by guessing. The two are kept apart because
+ * they have different destinations: one is a result, the other is a work item.
+ */
+interface SweepResult {
+  /** Decoded rows, one file's worth per file, in first-seen order. */
+  matches: DecodedMatch[];
+  /** Files two pages read differently, with the lines they disagree on. */
+  conflicted: ConflictedFile[];
+}
+
+/**
+ * The lines the given pages DISAGREE about, if any.
+ *
+ * Disagreement is per LINE, and only per line. Pages may legitimately match
+ * different SETS of lines — that is what a wrong page's text looks like, not a
+ * second opinion about the file: measured on a plain GBK file holding three
+ * Chinese comments, `[一-龥]` matches lines {2,4,6} under `gbk`/`big5`/`euc-kr`
+ * and only {2,6} under `shift_jis`, because that page's decode of line 4 holds no
+ * CJK at all. Treating a differing COUNT as a contradiction withheld lines the
+ * correct page had decoded, so a file came back as placeholders.
+ *
+ * A page that matched FEWER lines therefore contributes nothing to the
+ * contradiction: its silence about a line is not a competing reading of it. Only
+ * where two pages report the SAME line number with DIFFERENT text is there a
+ * question the sweep cannot answer.
+ *
+ * The pages compared are the caller's `encodings`, and the caller decides how far
+ * that reaches. The two families do NOT address the same positions — a UTF-16
+ * page pairs the bytes two at a time, so measured on a plain GBK file under
+ * `[一-龥]`, `utf-16be` reports "line 1" while the legacy pages report lines 41
+ * and 42 — and what that rules out is reading a re-pairing as a second opinion
+ * about the lines a legacy page matched. It does not rule out asking both
+ * families about ONE line number, which is what the sweep's caller does: a
+ * disagreement there is withheld and handed to the per-file pass rather than
+ * settled in either family's favour, and the caller's own `sources` still decides
+ * whose text is shown for a line only one family reports. WITHIN the UTF-16
+ * family the positions ARE comparable — both pair the same bytes — and there they
+ * disagree for real: measured on a UTF-16BE file under `[一-龥]`, `utf16le` reads
+ * line 1 as `⼀⼀䶑湿` while `utf16be` reads it as `// 端口配置`.
+ *
+ * @param encodings - the pages to compare, in preference order.
+ * @param pages - each page's rows for one file, keyed by encoding.
+ * @returns the line numbers those pages contradict each other on, ascending.
+ */
+function contradictedLines(
+  encodings: readonly string[],
+  pages: ReadonlyMap<string, readonly DecodedMatch[]>,
+): number[] {
+  const textOf = new Map<number, string>();
+  const contradicted = new Set<number>();
+  for (const encoding of encodings) {
+    for (const row of pages.get(encoding)!) {
+      const previous = textOf.get(row.lineNumber);
+      if (previous === undefined) {
+        textOf.set(row.lineNumber, row.line);
+        continue;
+      }
+      if (previous !== row.line) contradicted.add(row.lineNumber);
+    }
+  }
+  return [...contradicted].sort((a, b) => a - b);
+}
+
+/**
  * Re-search the whole tree under one candidate encoding.
  *
  * The strategy for a NON-ASCII pattern, and the only one that can work for it.
@@ -552,16 +640,14 @@ async function isExplicitFile(
  * per-file strategy has nothing to trigger on.
  *
  * Instead the pattern is run once per candidate encoding over the whole search
- * root. Each run is self-validating: ripgrep transcodes a file with the encoding
- * it is given and only then matches, so a hit under `gbk` means the file really
- * is GBK for those bytes. Measured over five encodings holding the same text,
- * every `(path, lineNumber)` was claimed by exactly ONE encoding — no
- * duplicates and no false positives — so the union of the runs needs no scoring.
+ * root. A run's rows are adopted per FILE, and only for a file that run PROVED
+ * it decoded — see {@link provedFiles} for what counts as proof and why a bare
+ * match is not it.
  *
  * The candidate list is narrowed first by {@link encodingsForPattern}, which
  * skips a page that cannot spell the pattern at all. For `配置项` that leaves
- * only `gbk`, so the common case is two runs (UTF-8 plus one), not one per
- * supported encoding.
+ * `gbk` plus the two UTF-16 pages, so the common case is a handful of runs
+ * rather than one per supported encoding.
  *
  * A run that fails is skipped rather than fatal, because one encoding's failure
  * must not discard the hits another encoding already produced. That reasoning
@@ -593,6 +679,7 @@ async function isExplicitFile(
  * @param exec - the calling execution.
  * @param input - the validated arguments.
  * @param encodings - the canonical names to try, in order.
+ * @param config - the deployment's admission config, for the read cap.
  * @param workdir - the resolved workdir, for display paths.
  */
 async function searchByTranscoding(
@@ -602,9 +689,9 @@ async function searchByTranscoding(
   exec: ToolExecution,
   input: { pattern: string; path?: string; include?: string },
   encodings: readonly string[],
+  config: PluginConfig,
   workdir: string,
-): Promise<DecodedMatch[]> {
-  const out: DecodedMatch[] = [];
+): Promise<SweepResult> {
   const labels: Array<{ encoding: string; label: string }> = [];
   for (const encoding of encodings) {
     const label = rgLabelFor(encoding);
@@ -626,11 +713,27 @@ async function searchByTranscoding(
   // that must never be rendered as "no matches".
   let truncated = 0;
   let firstLaunchError: unknown;
+  // Rows per file, and per page within that file. Kept per page rather than
+  // appended to one list because two pages can prove the same file, and whether
+  // that is a contradiction is a per-LINE question answered after the whole
+  // sweep has run — see the flattening below.
+  const byPath = new Map<string, { raw: string; pages: Map<string, DecodedMatch[]> }>();
+  // Whether a file's bytes are strict UTF-8 text, which settles its encoding and
+  // therefore voids every page's claim about it. Memoized across the whole sweep
+  // because the answer is a property of the BYTES: several pages claim the same
+  // file, and a read per claim would be the same read repeated. See
+  // {@link isPlainUtf8Text} for why this is the discriminator.
+  const plainUtf8 = new Map<string, boolean>();
+  // The byte order each file's own bytes name, for the UTF-16 pages only.
+  // Memoized for the same reason as `plainUtf8`, and separate from it because a
+  // file can be a UTF-16 candidate without being plain UTF-8 text and vice versa.
+  const orderCache = new Map<string, Utf16Order>();
 
-  for (const { label } of labels) {
-    // The pattern's own `--encoding` for a legacy page, plus the always-present
-    // UTF-8 run: a repository can hold both, and the UTF-8 run is what finds the
-    // files that were never in a legacy page to begin with.
+  for (const { encoding, label } of labels) {
+    // The page's own `--encoding` for a legacy or Unicode candidate. UTF-8 is
+    // deliberately not among the candidates: the strict pass below already
+    // decodes every valid-UTF-8 file, and `--encoding=utf-8` would only add a
+    // lossy second reading of the same bytes.
     const argv = kit.kit.buildGrepCommand(input);
     let run: RgRun;
     try {
@@ -660,17 +763,179 @@ async function searchByTranscoding(
       firstRefusal ??= run;
       continue;
     }
-    for (const raw of parseRgJson(run.stdout)) {
+    const rows = parseRgJson(run.stdout);
+    // A MATCH is not proof that this page decoded the file, and this is where
+    // that matters. A pattern holding an ASCII alternative — `配置|read` —
+    // matches under EVERY page, because `read` is the same bytes in all of them,
+    // so unioning each page's rows put one page's mojibake on screen for a file
+    // another page had decoded: measured over a directory holding the same text
+    // as UTF-8 and as GBK, four pages claimed every line and the last one to run
+    // won — Korean-looking garbage for both files. What only THIS page can
+    // produce is a NON-ASCII character in a submatch, because producing it
+    // required mapping the file's bytes onto that character. See
+    // {@link provedFiles}.
+    const proved = new Set(provedFiles(rows));
+    if (proved.size === 0) continue;
+    // A file whose bytes are strict UTF-8 TEXT is not this page's to answer for,
+    // whatever the page proved about it. Such a file has exactly one correct
+    // reading — the strict pass's — so a page's decode of it is mojibake by
+    // construction, and the proof rule cannot tell the difference because
+    // mojibake is non-ASCII text too. Measured: a valid-UTF-8 file whose only
+    // non-ASCII character was an em-dash came back as `// note 鈥� dash only`,
+    // because that character's bytes decode to CJK under `gbk`; and this
+    // repository's LICENSE alone was claimed by 4 pages under `[一-龥]`, 57 files
+    // in total. See {@link isPlainUtf8Text}, which is `read`'s own rule.
+    //
+    // Asked per FILE rather than per row, and memoized across the whole sweep:
+    // the answer is a property of the bytes, so the second page to claim the same
+    // file must not pay for a second read of it.
+    const answerable = new Set<string>();
+    for (const path of proved) {
+      let plain = plainUtf8.get(path);
+      if (plain === undefined) {
+        plain = await isPlainUtf8Text(ctx, exec, path, config);
+        plainUtf8.set(path, plain);
+      }
+      if (plain) continue;
+      // A UTF-16 page re-pairs the file's bytes, so its claim is admissible only
+      // when the file's OWN bytes name that order — the same gate
+      // `searchUnicodeFiles` applies to every row it reports, and for the same
+      // reason. Without it a BOM-less UTF-16LE file is claimed by `utf16be` as
+      // well: measured, its re-pairing of the ASCII lines is itself CJK, so it
+      // matched `[一-龥]` at a line number the file does not have and the row was
+      // reported beside the correct one. The two families are asked separately
+      // because only a UTF-16 page can be wrong this way: a legacy page's line
+      // numbers address the file's real lines whatever it decodes them to.
+      if (encoding === "utf16le" || encoding === "utf16be") {
+        let order = orderCache.get(path);
+        if (order === undefined) {
+          order = await utf16OrderOfFile(ctx, exec, path, config);
+          orderCache.set(path, order);
+        }
+        if (order !== encoding) continue;
+      }
+      answerable.add(path);
+    }
+    if (answerable.size === 0) continue;
+    // The proof is per FILE, not per row, and that is what carries the ASCII
+    // alternative: `--encoding` transcoded the whole file in this one pass, so a
+    // file proved by its non-ASCII row has its ASCII-matching rows reported from
+    // the same decode. Measured on a GBK file whose line 1 is `# 端口配置` and
+    // whose line 2 is the plain-ASCII `PORT=8080 read this`, the gbk run proves
+    // the file on line 1 and both rows come out decoded.
+    for (const raw of rows) {
       // A row that is still bytes means this encoding did not decode the file,
       // so this run's claim about it is not trustworthy; the encoding that does
       // decode it will report the line.
       if (raw.text === undefined) continue;
-      out.push({
-        path: kit.kit.toWorkdirRelative(raw.path, workdir),
-        lineNumber: raw.lineNumber,
-        line: raw.text,
-      });
+      // A row for a file this page did not prove is a reading nothing vouches
+      // for, so it is left to the strict pass and to whichever page does prove
+      // the file. Dropping it is the difference between "not searched" and
+      // "searched and garbled".
+      if (!answerable.has(raw.path)) continue;
+      const displayPath = kit.kit.toWorkdirRelative(raw.path, workdir);
+      let entry = byPath.get(displayPath);
+      if (entry === undefined) {
+        entry = { raw: raw.path, pages: new Map() };
+        byPath.set(displayPath, entry);
+      }
+      const row: DecodedMatch = { path: displayPath, lineNumber: raw.lineNumber, line: raw.text };
+      const page = entry.pages.get(encoding);
+      if (page === undefined) entry.pages.set(encoding, [row]);
+      else page.push(row);
     }
+  }
+
+  // A file's rows are decided LINE BY LINE, because that is the only unit on
+  // which two pages can actually contradict each other.
+  //
+  // The file-level rule this replaces was too broad: it compared whole readings,
+  // so a page that merely matched fewer lines (its decode of some line holding no
+  // CJK at all) made the file a conflict and withheld lines another page had
+  // decoded correctly. It was also measured to fire on files that were never in
+  // doubt — see `contradictedLines`.
+  //
+  // So a line only one page reports is that page's answer, and a line several
+  // pages report identically is theirs too. Only a line two COMPARABLE pages
+  // report with different text is withheld, because no evidence here can order
+  // them: measured, `操` is `be de` in Big5 and `b2 d9` in GBK, so a Big5 file
+  // holding both is proved by both pages and under `gbk` reads
+  // `// 巨弧操砰╰参砞﹚弧` — mojibake rather than a second opinion, and the candidate
+  // order is no help because it is ordered for GUESSING rather than for this.
+  //
+  // A withheld line becomes a placeholder naming the pages that could hold the
+  // bytes — the remedy an undecodable line gets, and the one `read` would give.
+  // That keeps both promises the tool exists for: never render a hit as "no
+  // matches", and never render it as text nothing vouches for.
+  const out: DecodedMatch[] = [];
+  const conflicted: ConflictedFile[] = [];
+  for (const entry of byPath.values()) {
+    // The pages whose TEXT answers for this file. A file any legacy page proved is
+    // theirs to answer for: their line numbers address the file's real lines,
+    // whereas a UTF-16 page re-pairs the bytes and would report positions no
+    // reading of the file supports — measured on a plain GBK file under `[一-龥]`,
+    // `utf-16be` says "line 1" where the legacy pages say 41 and 42. A file only
+    // the UTF-16 pages proved is theirs, and there they DO compete: they pair the
+    // same bytes, so their readings are of the same lines (measured on a UTF-16BE
+    // file, `utf16le` reads line 1 as `⼀⼀䶑湿` against `utf16be`'s `// 端口配置`).
+    const legacy = [...entry.pages.keys()].filter((e) => !UNICODE_SEARCH_ENCODINGS.has(e));
+    const sources = legacy.length > 0 ? legacy : [...entry.pages.keys()];
+    // The pages COMPARED are every page that proved the file, which is a WIDER set
+    // than the pages reported. The two are different questions — whose text is
+    // shown, and whether the text is in doubt — and separating them is the fix
+    // here.
+    //
+    // Asking only `sources` was wrong for the one file both families prove and
+    // where the UTF-16 page is the one holding the text. A BOM-less UTF-16LE file
+    // is exactly that file: `-a` lets the `gbk` run treat the file's NUL bytes as
+    // line terminators and re-pair them into legal CJK, so `gbk` PROVES it and
+    // `legacy` is non-empty — and `sources` then held `gbk` alone. The `utf16le`
+    // page, the only reading that can decode the file, was left out of the
+    // comparison, so `gbk` could not be contradicted and its mojibake was reported
+    // as the line. Measured on a BOM-less UTF-16LE file whose line 41 is
+    // `// 消息队列消费失败`, searched for `[一-龥]` at an explicit path:
+    // `pages=["gbk","utf16le"] legacy=["gbk"] sources=["gbk"]`, and the answer was
+    // the gbk reading of the NUL-split bytes while the correct line was dropped —
+    // and on a two-line fixture the second real hit was dropped with it.
+    //
+    // Comparing the families is safe HERE, and only here, because the outcome is
+    // not a choice between them: a line they disagree about is withheld and handed
+    // to the per-file pass, which decodes the file through admission and is the
+    // only pass that can order two readings. What the comparison must NOT do is
+    // decide which page's text is shown, and it does not — `sources` still decides
+    // that, so a line only one family reports stays that family's answer. The two
+    // families do not address the same positions, which is why a disagreement
+    // about WHICH lines matched is still not a contradiction: only the same line
+    // number read two ways is, and that is the shape a re-pairing and a legacy page
+    // produce when both are looking at the same bytes.
+    const contradicted = contradictedLines([...entry.pages.keys()], entry.pages);
+    const contested = new Set(contradicted);
+    const emitted = new Set<number>();
+    for (const encoding of sources) {
+      for (const row of entry.pages.get(encoding)!) {
+        if (contested.has(row.lineNumber)) continue;
+        if (emitted.has(row.lineNumber)) continue;
+        emitted.add(row.lineNumber);
+        out.push(row);
+      }
+    }
+    if (contradicted.length === 0) continue;
+    // The candidates are the pages that proved the file, which is a sharper list
+    // than a guess: it is the set of encodings that can hold these bytes at all.
+    // That is every page in `entry.pages`, and NOT `sources` — the two answer
+    // different questions, exactly as the comparison above does. `sources` says
+    // whose text the sweep stands behind, which is not the same as which pages
+    // could decode the file, and naming only `sources` here hands the caller a
+    // page that cannot read the file it is offered for: measured on a BOM-less
+    // UTF-16LE file whose first line is ASCII before its first NUL — so the strict
+    // pass owns it and the UTF-16 pass never sees it — the placeholder said
+    // `candidates: gbk` for a file `gbk` re-pairs, while `utf16le`, the one page
+    // that decodes it, was left out. The keys are already in candidate order.
+    conflicted.push({
+      raw: entry.raw,
+      lineNumbers: contradicted,
+      candidates: [...entry.pages.keys()],
+    });
   }
   // Every run that ran was refused, which no encoding can explain: an encoding
   // problem is per-page, while a pattern ripgrep cannot parse fails identically
@@ -696,24 +961,31 @@ async function searchByTranscoding(
   // An empty union that a truncated run could have filled.
   //
   // Measured on 80000 matching lines of a plain UTF-8 Chinese corpus with
-  // `pattern=配置项`: the utf-8 run exits 0 with 18.5 MB retained of 25.1 MB and
-  // is dropped as truncated, while gbk/utf-16le/utf-16be each exit 1 — a real
-  // verdict, but about a different READING of the file, and none of them can
-  // speak for the rows the truncated run lost. Nothing was refused, so the old
-  // gate stayed silent and the union came out empty: `Found 0 matches`, while
-  // the same corpus under an ASCII pattern fails loudly on pass 1. The threshold
-  // is corpus size alone (about 65000 matching lines here), so this is a wide
+  // `pattern=配置项`: a run exits 0 with 18.5 MB retained of 25.1 MB and is
+  // dropped as truncated, while the other pages exit 1 — a real verdict, but
+  // about a different READING of the file, and none of them can speak for the
+  // rows the truncated run lost. Nothing was refused, so the old gate stayed
+  // silent and the union came out empty: `Found 0 matches`, while the same
+  // corpus under an ASCII pattern fails loudly on pass 1. The threshold is
+  // corpus size alone (about 65000 matching lines here), so this is a wide
   // search's ordinary outcome rather than a corner case.
   //
   // Narrow on purpose: `refused === 0` leaves the registered mixed disposition
   // (a truncated run beside a refused one) alone, and `out.length === 0` leaves
   // every sweep that answered with rows alone — a hit beside a truncated sibling
-  // stands exactly as a hit beside a refused one. Only the empty union, the one
-  // answer that must never be a guess, becomes a failure.
+  // stands exactly as a hit beside a refused one.
+  //
+  // `conflicted` is deliberately NOT part of this condition. A contradiction is
+  // an answer about the lines it names, but a truncated run lost rows that are
+  // not named by anything: its output is a SUFFIX, so the sweep cannot know which
+  // lines are missing, and reporting the conflicted placeholders as the whole
+  // result would render "not searched completely" as "these are the matches".
+  // That is the confusion this gate exists to refuse, so a truncated sweep with
+  // nothing adopted still fails loudly.
   if (out.length === 0 && refused === 0 && truncated > 0) {
     throw stdoutOverflow(capsOf(kit).rawOutputMaxBytes);
   }
-  return out;
+  return { matches: out, conflicted };
 }
 
 /**
@@ -919,6 +1191,8 @@ async function searchUtf32Files(
  * @param config - the deployment's admission config.
  * @param workdir - the resolved workdir, for display paths.
  * @param owned - display paths an earlier pass already decoded.
+ * @param refusedCandidates - the candidate list an earlier pass already refused a
+ *   line with, keyed by `(displayPath, lineNumber)`. See the `tied` branch.
  */
 async function searchUnicodeFiles(
   kit: SearchKit,
@@ -929,6 +1203,7 @@ async function searchUnicodeFiles(
   config: PluginConfig,
   workdir: string,
   owned: ReadonlySet<string>,
+  refusedCandidates: ReadonlyMap<string, readonly string[]>,
 ): Promise<DecodedMatch[]> {
   const out: DecodedMatch[] = [];
   for (const encoding of UNICODE_SEARCH_ENCODINGS) {
@@ -968,11 +1243,68 @@ async function searchUnicodeFiles(
       // bytes hold a U+0000 code unit: not UTF-16 text, so neither pass may
       // speak for it.
       if (order === undefined || order === "not-text") continue;
-      // A TIE is refused, and the row is dropped, because nothing available can
-      // tell which of the file's two readings is the text. The two passes are
-      // both wrong about a legacy page's file, so "which pass matched" is not
-      // evidence about the file — see the note above `utf16ByteOrder`.
-      if (order === "tied") continue;
+      // A TIE is refused, because nothing available can tell which of the file's
+      // two readings is the text. The two passes are both wrong about a legacy
+      // page's file, so "which pass matched" is not evidence about the file — see
+      // the note above `utf16ByteOrder`.
+      //
+      // Refused VISIBLY rather than dropped, and that is the whole reason this
+      // branch has a body. Both passes are off the file, so dropping the row
+      // leaves nothing at all behind it, and a file whose only match was here
+      // renders as `Found 0 matches` — the silent miss this tool exists to
+      // remove, arriving by the one route the per-file pass cannot cover: a file
+      // over `maxFileBytes` never reaches admission, so no candidate list is ever
+      // built for it. Measured on a 6032-byte BOM-less UTF-16LE file whose line 1
+      // is 3000 ASCII characters and whose only break sits at byte 6000, searched
+      // for `配置说明` with `maxFileBytes` 4096: the workspace answered `Found 0
+      // matches` where the same bytes on the strict path returned the line
+      // verbatim. A placeholder at the matched line number, naming the two pages
+      // that can hold these bytes, is the honest answer and the one `read` gives.
+      //
+      // The line numbers are a UNION over both pages, which is the same shape
+      // `contradictedLines` produces and for the same reason: the two readings do
+      // not have to break in the same places, so the only safe claim is that
+      // SOMETHING matched around here and which encoding it was is undecided.
+      // `mergeMatches` deduplicates the two pages' identical placeholders.
+      //
+      // A line the sweep ALREADY refused keeps BOTH candidate lists, and that is
+      // the whole point of this branch having a map to consult. The two lists are
+      // not alternatives to choose between — they are the two families of page
+      // that could hold these bytes, and neither pass can rule the other out:
+      //
+      //   - the sweep's list is the pages that PROVED the file, and it exists only
+      //     for a file the strict pass could not decode at all;
+      //   - this list is the two pages that pair the bytes, and it exists whenever
+      //     no LEGACY page proved the file.
+      //
+      // Taking either alone hands the caller a dead end on the other's files, and
+      // both directions are measured. On the reported fixture — a single-line Big5
+      // file carrying two stray NULs — the sweep names `gbk, big5` while `read`
+      // under `utf16le` AND `utf16be` both fail with `E_DECODE_FAILED`. On the
+      // mirror image, an over-cap BOM-less UTF-16LE file, the sweep names
+      // `gbk, big5`, both of those fail, and `utf16le` is the one that returns the
+      // line. The merge is last-writer-wins on `(path, lineNumber)`, so without
+      // this the second case replaced the correct pair with the first case's — the
+      // defect this parameter exists to fix, in the other direction.
+      //
+      // The sweep's list leads, because its evidence is stronger: it says these
+      // pages DECODED the file, while this one only says these pages could. The
+      // `read` this placeholder invites is a single call with one candidate, so the
+      // order is the difference between the answer on the first try and on the
+      // second.
+      if (order === "tied") {
+        const prior = refusedCandidates.get(`${displayPath}\u0000${raw.lineNumber}`);
+        const candidates =
+          prior === undefined
+            ? [...UNICODE_SEARCH_ENCODINGS]
+            : [...new Set([...prior, ...UNICODE_SEARCH_ENCODINGS])];
+        out.push({
+          path: displayPath,
+          lineNumber: raw.lineNumber,
+          line: placeholderFor(candidates),
+        });
+        continue;
+      }
       // Only the pass whose order the file's own bytes name may report it.
       if (order !== encoding) continue;
       out.push({ path: displayPath, lineNumber: raw.lineNumber, line: raw.text });
@@ -1015,13 +1347,22 @@ async function searchUnicodeFiles(
  * ways it can be undecided are not the same for the caller's gate. {@link
  * Utf16Order} separates them: `not-text` is the UTF-32 file (which has its own
  * BOM-driven path, and which the U+0000 guard above refuses outright), while
- * `tied` is a file whose NULs sit at both parities — its two readings are
- * byte-swaps of each other, both well-formed, and which of them is the text is
- * not decidable from the bytes. The gate refuses both.
+ * `tied` is a file whose two readings are byte-swaps of each other, both
+ * well-formed, and which of them is the text is not decidable from the bytes.
+ * The gate refuses both.
  *
- * @param bytes - the file's bytes, or as much of them as were read.
+ * `tied` is reached two ways, and the second is not a tie of counts at all: the
+ * NUL parities may both be populated, or `bytes` may be a PREFIX of a larger file
+ * that named no order by its line breaks. The second is refused for the same
+ * reason as the first — see the `partial` branch below, where the reading a
+ * window would have named is shown to be a coin toss.
+ *
+ * @param bytes - the file's bytes, or a bounded PREFIX of them.
+ * @param partial - whether `bytes` is a prefix of a larger file rather than the
+ *   whole of it. Only the NUL counts depend on it, and they depend on it
+ *   completely — see the `partial` branch below.
  */
-function utf16ByteOrder(bytes: Uint8Array): Utf16Order {
+function utf16ByteOrder(bytes: Uint8Array, partial: boolean): Utf16Order {
   if (
     bytes.length >= 4 &&
     bytes[0] === 0xff &&
@@ -1081,10 +1422,28 @@ function utf16ByteOrder(bytes: Uint8Array): Utf16Order {
   // be right rather than a rule.
   const byNewline = utf16NewlineOrder(bytes);
   if (byNewline === "utf16le" || byNewline === "utf16be") return byNewline;
-  if (odd > 0 && even === 0) return "utf16le";
-  if (even > 0 && odd === 0) return "utf16be";
+  // The counts below are a WHOLE-FILE statistic, and a truncated window is not
+  // entitled to them. Parity is a property of the offset, so a prefix does
+  // sample the same statistic — but it samples it without the file's own
+  // counter-evidence, and that is enough to invert the verdict. A BOM-less
+  // UTF-16BE file of CJK whose every code unit ends in a NUL byte puts those
+  // NULs at ODD offsets, which is exactly the shape ASCII puts at odd offsets
+  // in UTF-16LE; on the whole file the trailing `00 0a` adds a NUL at the other
+  // parity and the counts come out `tied`, while the first 4096 bytes of the
+  // same file hold no break at all and the counts name `utf16le` — the opposite
+  // order. Measured on a 3000-character CJK line with no break before byte
+  // 4096, in both orders: the window named the other order each time and the
+  // wrong page's re-pairing replaced the file's real text with mojibake. So a
+  // window that names no order by its line breaks abstains instead of guessing,
+  // which is what the caller already does with `tied`.
+  if (!partial) {
+    if (odd > 0 && even === 0) return "utf16le";
+    if (even > 0 && odd === 0) return "utf16be";
+  }
   // Neither parity wins, which is a genuine tie: the file is UTF-16-shaped but
   // its order is a coin toss, and the caller refuses it rather than guessing.
+  // A `partial` window lands here too, and for the same reason: the one order it
+  // could name is one it cannot rule the other out against.
   return "tied";
 }
 
@@ -1101,12 +1460,73 @@ function utf16ByteOrder(bytes: Uint8Array): Utf16Order {
 type Utf16Order = "utf16le" | "utf16be" | "tied" | "not-text";
 
 /**
+ * The bytes {@link utf16ByteOrder} reads its verdict from, for one file, and
+ * whether they are the whole file.
+ *
+ * The whole file when it fits the cap, and a bounded PREFIX of it when it does
+ * not. The prefix carries two of the three facts the verdict rests on — the
+ * byte-order mark and which alignment the line breaks sit on — and it is exactly
+ * those two that can decide a file on their own. The third, the parity of the
+ * NUL bytes, is a whole-file statistic that a window is not entitled to, so it
+ * is reported as unusable rather than guessed at; see the `partial` branch in
+ * {@link utf16ByteOrder} for the measurement that made that necessary. The window
+ * is bounded by the same `cap`, so this reads no more than the whole-file path
+ * would have.
+ *
+ * The fallback is a fallback rather than the only path, and that is deliberate.
+ * `readBytes` is the seam every deployment has, so a file it CAN serve is read
+ * exactly as before; only a read it refuses is retried as a window. Taking the
+ * window unconditionally would make a backend without `readByteRange` answer
+ * `not-text` for every file — the whole UTF-16 half of this tool, gone — whereas
+ * a fallback that cannot run leaves the refusal it was standing in for.
+ *
+ * `readBytes` is where this is needed, and the reason is its contract: it THROWS
+ * `FS_TOO_LARGE` on a file over the cap instead of returning a truncated result.
+ * The caller's `catch` reads any failure as `not-text`, which for a file whose
+ * own bytes name a UTF-16 order refuses BOTH UTF-16 pages — and they are the only
+ * two that can decode it, so the file leaves the result entirely. Measured with
+ * `maxFileBytes` at 64 KiB over a BOM-less UTF-16LE file of a few lines past the
+ * cap: the file vanished from a directory search that names its line before the
+ * change, and naming the file directly answered `(line is not valid UTF-8 —
+ * candidates: gbk, big5)` — two pages that cannot hold those bytes at all,
+ * offered as the remedy for a file this gate had thrown away.
+ *
+ * @param ctx - the plugin context, for `fs`.
+ * @param exec - the calling execution, for the abort signal.
+ * @param target - the resolved file.
+ * @param cap - the inclusive byte cap, already reduced to the file's own size.
+ * @returns the bytes to decide on, and whether they are only a prefix of it.
+ * @throws when neither read can be taken, for the caller's `not-text`.
+ */
+async function utf16BytesOfFile(
+  ctx: Context,
+  exec: ToolExecution,
+  target: FsTarget,
+  cap: number,
+): Promise<{ bytes: Uint8Array; partial: boolean }> {
+  try {
+    return { bytes: await ctx.fs.readBytes(target, exec.signal, cap), partial: false };
+  } catch (error) {
+    if (exec.signal.aborted) throw error;
+    return {
+      bytes: await ctx.fs.readByteRange(target, { offset: 0, length: cap }, exec.signal),
+      // The refusal being retried is `readBytes` declining to answer a file over
+      // `cap` — that is the one failure it has that a window can serve — so the
+      // bytes coming back are a prefix of a file larger than them.
+      partial: true,
+    };
+  }
+}
+
+/**
  * Read one file's bytes and report the byte order they are consistent with.
  *
  * A failure to read is `not-text`, which the caller treats exactly like "this is
  * not a UTF-16 file": this pass simply does not report the file. That is
  * deliberate — the file is still covered by the default pass and by pass 2, so
- * an unreadable file must not become a failed search.
+ * an unreadable file must not become a failed search. It is a refusal about the
+ * bytes that could not be TAKEN, and {@link utf16BytesOfFile} is what keeps a
+ * file the cap refused from landing here.
  *
  * @param ctx - the plugin context, for `fs`.
  * @param exec - the calling execution, for the cwd and the abort signal.
@@ -1125,7 +1545,8 @@ async function utf16OrderOfFile(
     if (info === undefined || info.type !== "file") return "not-text";
     const cap =
       info.size === undefined ? config.maxFileBytes : Math.min(info.size, config.maxFileBytes);
-    return utf16ByteOrder(await ctx.fs.readBytes(target, exec.signal, cap));
+    const { bytes, partial } = await utf16BytesOfFile(ctx, exec, target, cap);
+    return utf16ByteOrder(bytes, partial);
   } catch (error) {
     if (exec.signal.aborted) throw error;
     return "not-text";
@@ -1220,6 +1641,23 @@ export function buildGrepTool(ctx: Context, kit: SearchKit, subprocess: Subproce
       // be no undecodable row to react to and the per-file strategy below would
       // never run. Measured: `--regexp=配置项` over a GBK file returns zero
       // matches — the silent miss this tool exists to fix.
+      //
+      // The sweep runs FIRST and seeds the pass below, rather than replacing it.
+      // It is not a superset of the strict pass, and the reason is the ASCII
+      // alternative: for `配置|read`, a GBK file holding only `read` on a line
+      // with legacy bytes produces a strict `bytes` row and NO proof from any
+      // page — the file has the pattern's ASCII half and not its non-ASCII half
+      // — so the strict pass and the per-file pass are what answer for it. What
+      // the sweep uniquely contributes is the files the strict pass cannot even
+      // SEE: a GBK file whose matching line holds `配置` produces no strict row
+      // at all, because the pattern's UTF-8 bytes are not in the file.
+      let proven: DecodedMatch[] = [];
+      // Files two pages read differently. Nothing here can say which is right, so
+      // the sweep claims no text for them: their lines become placeholders that
+      // name the candidates, and the per-file pass below decodes them through
+      // admission — the only pass that can answer for them. See
+      // `searchByTranscoding`.
+      let conflicted: ConflictedFile[] = [];
       if (needsTranscodedSearch(input.pattern)) {
         // The candidate list is the deployment's guess set PLUS the Unicode
         // encodings, which `supportedEncodings` deliberately leaves out: that
@@ -1229,33 +1667,24 @@ export function buildGrepTool(ctx: Context, kit: SearchKit, subprocess: Subproce
         // UTF-16 would miss a BOM-less UTF-16 file entirely. Measured: ripgrep's
         // own BOM sniffing finds a marked UTF-16 file, but `--encoding=utf-16le`
         // is required for an unmarked one.
+        //
+        // UTF-8 is deliberately absent: the strict pass below already decodes
+        // every valid-UTF-8 file, and `--encoding=utf-8` would only add a lossy
+        // reading of the same bytes.
         const candidates = [...config.supportedEncodings, ...UNICODE_SEARCH_ENCODINGS];
         const legacy = encodingsForPattern(input.pattern, candidates);
-        const transcoded = await searchByTranscoding(
+        const sweep = await searchByTranscoding(
           kit,
           ctx,
           subprocess,
           exec,
           input,
-          ["utf8", ...legacy],
+          legacy,
+          config,
           workdir,
         );
-        // UTF-32 cannot be reached through ripgrep's encoding support at all, so
-        // it is found by its BOM and searched in JavaScript.
-        //
-        // Appended one by one rather than spread: the count is the UTF-32 matches
-        // across every file searched, and V8 rejects a call with too many — the
-        // same limit as the per-file sites above, reached here by a DIRECTORY of
-        // large UTF-32 files, so a single modest file per tree is enough to trip
-        // it. See `searchUndecodedFiles`.
-        const utf32 = await searchUtf32Files(kit, ctx, subprocess, exec, input, config, workdir);
-        for (const match of utf32) transcoded.push(match);
-        const matches: GrepMatch[] = mergeMatches([transcoded]).map((match) => ({
-          path: match.path,
-          lineNumber: match.lineNumber,
-          line: match.line,
-        }));
-        return finishSearch(kit, ctx, exec, matches);
+        for (const match of sweep.matches) proven.push(match);
+        for (const file of sweep.conflicted) conflicted.push(file);
       }
 
       // Pass 1: exactly the built-in's call. Everything ripgrep can already read
@@ -1273,6 +1702,59 @@ export function buildGrepTool(ctx: Context, kit: SearchKit, subprocess: Subproce
       }
       if (first.stdoutLossy) throw stdoutOverflow(caps.rawOutputMaxBytes);
       const raw = parseRgJson(first.stdout);
+
+      // A line the strict pass already decoded as clean TEXT is not the sweep's to
+      // answer for, and letting the sweep claim it was the most expensive mistake
+      // this change made.
+      //
+      // The reason is that a UTF-8 file is legible to EVERY legacy page: ripgrep
+      // transcodes its bytes through the page and the result is mojibake, but
+      // mojibake is still non-ASCII text, so it satisfies the proof rule and the
+      // page claims the file. Measured on this repository's README.md (valid
+      // UTF-8) with `[一-龥]`: gbk claimed 258 lines, big5 256, shift_jis 258 and
+      // euc-kr 239 — four contradicting claims about a file the strict pass had
+      // already decoded correctly, all 256 lines of it. Under the file-level
+      // conflict rule that followed, every one of those real matches was withheld
+      // and the file came back as placeholders; 23 files in this repository alone
+      // were affected, README.md and `src/encoding.ts` among them.
+      //
+      // So the precedence is the tool's own promise — `grep` never knows more than
+      // `read` — applied per line: what the strict pass decoded as text IS the
+      // answer, and a page's claim about that line is redundant at best. What the
+      // sweep uniquely contributes is the files the strict pass cannot SEE at all,
+      // which for a non-ASCII pattern is every file in another encoding: measured,
+      // a GBK file yields no strict row for `配置项`, so nothing here filters it.
+      //
+      // A U+0000-bearing `text` row does not count as decoded: ripgrep reports a
+      // BOM-less UTF-16 file that way, and that mojibake is exactly what the
+      // `owned` set refuses below.
+      //
+      // Guarded on the sweep having claimed something, because that is the only
+      // case there is anything to filter: an ASCII search never runs the sweep, so
+      // both lists are empty and building this index would walk every row of the
+      // result — with a `toWorkdirRelative` per row — to decide nothing. That is
+      // the common path, not a corner case.
+      if (proven.length > 0 || conflicted.length > 0) {
+        const strictClean = new Set<string>();
+        for (const match of raw) {
+          if (match.text === undefined || match.text.includes("\u0000")) continue;
+          strictClean.add(
+            `${kit.kit.toWorkdirRelative(match.path, workdir)}\u0000${match.lineNumber}`,
+          );
+        }
+        if (strictClean.size > 0) {
+          proven = proven.filter(
+            (match) => !strictClean.has(`${match.path}\u0000${match.lineNumber}`),
+          );
+          conflicted = conflicted.flatMap((file) => {
+            const displayPath = kit.kit.toWorkdirRelative(file.raw, workdir);
+            const lineNumbers = file.lineNumbers.filter(
+              (lineNumber) => !strictClean.has(`${displayPath}\u0000${lineNumber}`),
+            );
+            return lineNumbers.length > 0 ? [{ ...file, lineNumbers }] : [];
+          });
+        }
+      }
 
       const pass1: DecodedMatch[] = [];
       // The rows the placeholder loop below may rewrite: the ones that are NOT a
@@ -1304,7 +1786,60 @@ export function buildGrepTool(ctx: Context, kit: SearchKit, subprocess: Subproce
       // alongside everything else.
       const utf32 = await searchUtf32Files(kit, ctx, subprocess, exec, input, config, workdir);
 
-      const files = filesNeedingDecoding(raw);
+      // Which files still need the per-file pass: the ones with an undecodable
+      // row that the sweep did not cover, plus every conflicted file.
+      //
+      // Coverage is the load-bearing half. A file the sweep proved is answered by
+      // that page's decode — but only for the lines that page MATCHED, and a
+      // strict `bytes` row can be a line the page does not match at all: measured
+      // on a GBK file whose line 1 is `// 配置` and whose line 2 holds the byte
+      // `0x81` before `read`, the gbk decode of line 2 is `// 乺ead`, so the page
+      // never reports it while the strict pass matches it on the raw bytes.
+      // Skipping such a file leaves that row with a bare placeholder and no
+      // candidate list — the remedy the placeholder exists to carry. So the sweep
+      // answers a file only when it covered every undecodable row of it.
+      //
+      // `undecodedLines` is built from the same rows `filesNeedingDecoding`
+      // projects, so a file in that list always has an entry here; only the
+      // `covered` half can be absent, which is why only that one is checked.
+      const undecodedLines = new Map<string, Set<number>>();
+      for (const match of raw) {
+        if (match.bytes === undefined) continue;
+        const displayPath = kit.kit.toWorkdirRelative(match.path, workdir);
+        const lines = undecodedLines.get(displayPath);
+        if (lines === undefined) undecodedLines.set(displayPath, new Set([match.lineNumber]));
+        else lines.add(match.lineNumber);
+      }
+      const coveredLines = new Map<string, Set<number>>();
+      for (const match of proven) {
+        const lines = coveredLines.get(match.path);
+        if (lines === undefined) coveredLines.set(match.path, new Set([match.lineNumber]));
+        else lines.add(match.lineNumber);
+      }
+      const files: string[] = [];
+      const queued = new Set<string>();
+      for (const file of filesNeedingDecoding(raw)) {
+        const displayPath = kit.kit.toWorkdirRelative(file, workdir);
+        const covered = coveredLines.get(displayPath);
+        const undecoded = undecodedLines.get(displayPath)!;
+        // The sweep answered this file in full, so the per-file pass has nothing
+        // to add — and would pay a read plus a spawn to reach the same rows.
+        if (covered !== undefined && [...undecoded].every((lineNumber) => covered.has(lineNumber))) {
+          continue;
+        }
+        if (queued.has(displayPath)) continue;
+        queued.add(displayPath);
+        files.push(file);
+      }
+      // Both lists carry ripgrep's own paths, because that is what the per-file
+      // pass reads and decodes; `queued` keeps a file in both lists from being
+      // decoded twice.
+      for (const file of conflicted) {
+        const displayPath = kit.kit.toWorkdirRelative(file.raw, workdir);
+        if (queued.has(displayPath)) continue;
+        queued.add(displayPath);
+        files.push(file.raw);
+      }
 
       // Which files an earlier pass already decoded, and which the UTF-16 passes
       // therefore have no business re-reading. A pass-1 row counts only when it
@@ -1317,11 +1852,26 @@ export function buildGrepTool(ctx: Context, kit: SearchKit, subprocess: Subproce
         if (match.text === undefined || match.text.includes("\u0000")) continue;
         owned.add(kit.kit.toWorkdirRelative(match.path, workdir));
       }
+      // A file the sweep PROVED is owned too. Its rows are the answer for that
+      // file, and the UTF-16 passes must not overwrite them — the same rule pass
+      // 2's matches get below, and for the same reason.
+      //
+      // A CONFLICTED file is deliberately NOT owned here. The sweep claimed no
+      // text for it, so there is nothing to protect, and the two passes that can
+      // still answer for it are the per-file pass (which owns it the moment it
+      // decodes the file, just below) and — for a file it cannot decode — the
+      // UTF-16 passes, exactly as for any other undecodable file.
+      for (const match of proven) owned.add(match.path);
 
       if (files.length === 0) {
         // UTF-16 needs the same treatment as UTF-32 for a different reason:
         // ripgrep finds such a file only when its BOM sniffing fires, so a
         // BOM-less one is missed entirely. See `searchUnicodeFiles`.
+        //
+        // No line has been refused on this path: `files` is empty, so
+        // `conflicted` is empty too — every conflicted file is queued for the
+        // per-file pass just below. The map is therefore empty rather than
+        // omitted, and the parameter keeps one meaning at both call sites.
         const unicode = await searchUnicodeFiles(
           kit,
           ctx,
@@ -1331,8 +1881,9 @@ export function buildGrepTool(ctx: Context, kit: SearchKit, subprocess: Subproce
           config,
           workdir,
           owned,
+          EMPTY_REFUSALS,
         );
-        const matches: GrepMatch[] = mergeMatches([pass1, unicode, utf32]).map((match) => ({
+        const matches: GrepMatch[] = mergeMatches([pass1, proven, unicode, utf32]).map((match) => ({
           path: match.path,
           lineNumber: match.lineNumber,
           line: match.line,
@@ -1403,6 +1954,39 @@ export function buildGrepTool(ctx: Context, kit: SearchKit, subprocess: Subproce
         }
       }
 
+      // A conflicted line's placeholder. It is the one outcome that is neither a
+      // silent `Found 0 matches` nor a page's unverified reading shown as the
+      // line: the placeholder names the pages that PROVED the file, which is a
+      // sharper list than a guess because it is exactly the set of encodings that
+      // can hold these bytes.
+      //
+      // Both filters this needs are already applied upstream, so nothing is
+      // re-checked here. `conflicted` holds only lines the strict pass did NOT
+      // decode (filtered where `strictClean` is built), and `mergeMatches` puts
+      // `second.matches` after `pass1`, so a line the per-file pass decoded
+      // replaces this placeholder rather than competing with it. Re-deriving
+      // either fact here is what produced the U+0000 blind spot and the
+      // file-level skip that this comment used to describe.
+      //
+      // The keys are kept alongside the rows, because `mergeMatches` is not the
+      // only later writer: the UTF-16 passes come after this one, and a `tied` file
+      // collides with these rows on the very same key. That map is the LINE-level
+      // counterpart of `owned` — a line another pass has already refused, and the
+      // list it refused it with — and it is what lets the two refusals be UNIONED
+      // instead of one silently replacing the other. See `searchUnicodeFiles`.
+      const conflictedLines = new Map<string, readonly string[]>();
+      for (const file of conflicted) {
+        const displayPath = kit.kit.toWorkdirRelative(file.raw, workdir);
+        for (const lineNumber of file.lineNumbers) {
+          conflictedLines.set(`${displayPath}\u0000${lineNumber}`, file.candidates);
+          pass1.push({
+            path: displayPath,
+            lineNumber,
+            line: placeholderFor(file.candidates),
+          });
+        }
+      }
+
       const unicode = await searchUnicodeFiles(
         kit,
         ctx,
@@ -1412,9 +1996,10 @@ export function buildGrepTool(ctx: Context, kit: SearchKit, subprocess: Subproce
         config,
         workdir,
         owned,
+        conflictedLines,
       );
 
-      const merged = mergeMatches([pass1, second.matches, unicode, utf32]);
+      const merged = mergeMatches([pass1, proven, second.matches, unicode, utf32]);
       // The canonical value carries ONLY the three declared fields. The
       // candidate list that `DecodedMatch` tracks internally is already folded
       // into the placeholder TEXT, and the schema is `additionalProperties:
@@ -1580,7 +2165,17 @@ export const GREP_TOOL_NAME = "grep";
  * UTF-32 is absent on purpose: ripgrep rejects `--encoding=utf-32le` outright
  * (exit 2, "unknown encoding"), so offering it would only produce a failed run.
  */
-const UNICODE_SEARCH_ENCODINGS = ["utf16le", "utf16be"] as const;
+const UNICODE_SEARCH_ENCODINGS: ReadonlySet<string> = new Set(["utf16le", "utf16be"]);
+
+/**
+ * A refusal map with nothing in it, for a call site that has refused no line.
+ *
+ * The parameter it fills means "lines an earlier pass already refused, and the
+ * candidates it named", and a path that queued every conflicted file for the
+ * per-file pass has none. Named rather than inlined as a fresh `new Map()` so that
+ * call site reads as the deliberate empty map it is rather than as an omission.
+ */
+const EMPTY_REFUSALS: ReadonlyMap<string, readonly string[]> = new Map();
 
 /**
  * The byte-mode pattern that matches a UTF-32 byte-order mark.

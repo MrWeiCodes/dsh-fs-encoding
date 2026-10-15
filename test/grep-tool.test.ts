@@ -19,7 +19,7 @@
  * than only a positive one.
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -258,6 +258,395 @@ describe("grep: the reported defects", () => {
 
     const result = await grep(agent, { pattern: "配置项", path: "dedupe.js" });
     expect(result.value.matches).toHaveLength(1);
+  });
+
+  it("does not let an ASCII alternative mojibake a file another page decoded", async () => {
+    // The regression this suite was missing. A pattern holding an ASCII
+    // alternative — `配置|read` — matches under EVERY page, because `read` is the
+    // same bytes in all of them, so a union built on "which pages matched" put one
+    // page's mojibake on screen for a file another page had decoded: measured, a
+    // UTF-8 and a GBK file both came back as Korean-looking garbage, and the page
+    // that happened to run last was the one displayed.
+    //
+    // The evidence that a page decoded a file is a NON-ASCII character in one of
+    // its submatches, which only that page's mapping of the bytes can produce —
+    // so `read`'s ASCII span, identical under every page, proves nothing.
+    const lines = ["// 配置项说明：端口设置", "// read the config first"];
+    fixture("alt-gbk.js", sourceLike(lines), "gbk");
+    fixture("alt-utf8.js", sourceLike(lines), "utf8");
+    const root = makeHost();
+    const agent = makeAgent(root);
+    await install(root, agent);
+
+    const result = await grep(agent, { pattern: "配置|read", path: "." });
+
+    // Both files hold BOTH lines, so each is reported twice. Collected per file
+    // rather than mapped to one line each, because the property under test is
+    // that neither file's rows were replaced by another page's reading of them.
+    const byPath = new Map<string, string[]>();
+    for (const m of result.value.matches) {
+      const key = m.path.replace(/^\.\\/, "");
+      byPath.set(key, [...(byPath.get(key) ?? []), m.line]);
+    }
+    expect(byPath.get("alt-gbk.js")).toEqual(lines);
+    expect(byPath.get("alt-utf8.js")).toEqual(lines);
+  });
+
+  it("keeps an ASCII-only alternative match in a legacy file, without mojibake", async () => {
+    // The other half of the same rule, and the reason the sweep cannot simply
+    // replace the strict pass: a GBK file whose matching line holds ONLY the ASCII
+    // alternative still has to be reported, and it is the file-level proof from a
+    // DIFFERENT line that lets its decode be trusted.
+    fixture(
+      "alt-ascii.js",
+      `${sourceLike(["// 端口配置"])}PORT=8080 read the value\n`,
+      "gbk",
+    );
+    const root = makeHost();
+    const agent = makeAgent(root);
+    await install(root, agent);
+
+    const result = await grep(agent, { pattern: "配置|read", path: "alt-ascii.js" });
+
+    const lines = result.value.matches.map((m) => m.line);
+    expect(lines).toContain("// 端口配置");
+    expect(lines).toContain("PORT=8080 read the value");
+  });
+
+  it("reports a Latin-1 file both single-byte pages read identically", async () => {
+    // `windows-1252` and `iso-8859-1` share a byte table on 0xA0-0xFF, so both
+    // pages prove a Latin-1 file and both produce the SAME text for it. Treating
+    // "two pages proved this file" as a contradiction threw that agreement away,
+    // and since both pages are in the default `supportedEncodings` the result was
+    // `Found 0 matches` for every Western accented search — the silent miss this
+    // tool exists to remove, on a file that plainly holds the text.
+    fixture("latin.txt", "Intro line.\n// café résumé\n", "windows-1252");
+    const root = makeHost();
+    const agent = makeAgent(root);
+    await install(root, agent);
+
+    const result = await grep(agent, { pattern: "café", path: "." });
+
+    expect(result.value.matches.map((m) => m.line)).toEqual(["// café résumé"]);
+  });
+
+  it("lets the per-file pass settle a conflict that admission CAN identify", async () => {
+    // The other half of the conflict rule: the placeholder is a FLOOR, not the
+    // final answer. A file whose bytes carry enough of one page's text for
+    // admission to identify it gets that page's real line instead — measured, this
+    // Big5 file scores 160 under `big5` against 140 under `gbk`, so admission
+    // picks it. Without the per-file pass running for a conflicted file, this
+    // would report the candidate list where the text is knowable.
+    fixture(
+      "settle.txt",
+      sourceLike([
+        "// 操作說明：整體系統設定說明，連接埠設定說明，資料庫連線",
+        "// 資料庫連線設定，整體系統說明",
+      ]),
+      "big5",
+    );
+    const root = makeHost();
+    const agent = makeAgent(root);
+    await install(root, agent);
+
+    const result = await grep(agent, { pattern: "操", path: "settle.txt" });
+
+    expect(result.value.matches.map((m) => m.line)).toEqual([
+      "// 操作說明：整體系統設定說明，連接埠設定說明，資料庫連線",
+    ]);
+  });
+
+  it("splits a mixed-encoding file between the strict pass and the pages", async () => {
+    // The two sources of truth are complementary, and this is the shape that shows
+    // it. Line 1 is valid UTF-8, so the strict pass decodes it and the sweep must
+    // not touch it; line 2 is GBK, which the strict pass cannot see at all, so the
+    // `gbk` page is the only thing that can answer for it. Taking either source as
+    // authoritative for the whole FILE loses the other's line.
+    writeFileSync(
+      join(workspace, "mixlit.txt"),
+      Buffer.concat([
+        Buffer.from("// 配置说明\n", "utf8"),
+        iconv.encode("// 端口配置\n", "gbk"),
+      ]),
+    );
+    const root = makeHost();
+    const agent = makeAgent(root);
+    await install(root, agent);
+
+    const result = await grep(agent, { pattern: "配置", path: "mixlit.txt" });
+
+    expect(result.value.matches.map((m) => m.line)).toEqual(["// 配置说明", "// 端口配置"]);
+  });
+
+  it("compares UTF-16 pages against each other when no legacy page proved the file", async () => {
+    // The two families must not be compared ACROSS — a UTF-16 page's line numbers
+    // address a two-byte re-pairing, not the file's own lines — but WITHIN the
+    // UTF-16 family they pair the same bytes, so their readings ARE of the same
+    // lines and can genuinely contradict. Measured on this UTF-16BE file under
+    // `[一-龥]`: `utf16le` reads line 1 as `⼀⼀䶑湿` while `utf16be` reads it as
+    // `// 端口配置`. Treating the UTF-16 pages as a mere fallback adopted whichever
+    // came first in candidate order, which is always `utf16le` — the mojibake.
+    fixture("be.txt", "// 端口配置\n", "utf16be");
+    const root = makeHost();
+    const agent = makeAgent(root);
+    await install(root, agent);
+
+    const result = await grep(agent, { pattern: "[一-龥]", path: "be.txt" });
+
+    expect(result.value.matches.map((m) => m.line)).toEqual(["// 端口配置"]);
+  });
+
+  it("names the candidates instead of guessing when two pages contradict", async () => {
+    // A GBK file holding both `操` and `巨`: `巨` is `be de` in GBK, and `be de`
+    // is `操` in Big5, so BOTH pages prove this file — and they read it
+    // differently. Nothing in the sweep can order them, and the candidate list is
+    // ordered for GUESSING rather than for this: measured, taking its first entry
+    // renders this file as `// 巨弧操砰╰参砞﹚弧`, mojibake shown as if it were the
+    // line. Admission cannot settle it either (measured: `gbk` and `big5` score
+    // 177.5 apiece), so the honest answer is the one `read` would give — the line
+    // number, and the pages that could hold these bytes.
+    //
+    // The two answers that are NOT acceptable are the ones this replaced: the
+    // sweep used to drop such a file entirely (a silent `Found 0 matches` for a
+    // file holding the pattern), and adopting the first candidate shows garbage.
+    fixture(
+      "tie.js",
+      sourceLike(["// 操作说明：巨大的数据集，配置端口设置", "// 中文注释第二行，管理系统服务连接"]),
+      "gbk",
+    );
+    const root = makeHost();
+    const agent = makeAgent(root);
+    await install(root, agent);
+
+    const result = await grep(agent, { pattern: "操", path: "tie.js" });
+
+    const lines = result.value.matches.map((m) => m.line);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/not valid UTF-8/);
+    expect(lines[0]).toMatch(/candidates: /);
+  });
+
+  it("does not adopt one page's reading of an overlapping file as the answer", async () => {
+    // The case that makes "take the first candidate" untenable rather than merely
+    // arbitrary. `操` is `be de` in Big5 and `b2 d9` in GBK, so a Big5 file
+    // holding both is proved by both pages — and `gbk` comes FIRST in the
+    // candidate list, so a first-candidate rule renders this Big5 file as
+    // `// 巨弧操砰╰参砞﹚弧`. Asserting the placeholder is asserting that no page's
+    // unverified reading reaches the model.
+    fixture("overlap.txt", sourceLike(["// 操作說明：紱體系統設定說明"]), "big5");
+    const root = makeHost();
+    const agent = makeAgent(root);
+    await install(root, agent);
+
+    const result = await grep(agent, { pattern: "操", path: "overlap.txt" });
+
+    const lines = result.value.matches.map((m) => m.line);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/candidates: /);
+  });
+
+  it("finds Chinese through a character-class pattern, which spells no CJK", async () => {
+    // `[一-龥]` matches Chinese without ever spelling `一` or `龥`, so a proof rule
+    // keyed on "a character the pattern holds" found no evidence under any page
+    // and answered `Found 0 matches` for a GBK file full of Chinese.
+    //
+    // This file is a genuine conflict: gbk, big5, shift_jis and euc-kr all prove
+    // it and all four read lines 41 and 42 DIFFERENTLY (measured: gbk gives
+    // `// 端口配置说明：中文注释`, big5 gives `// 傷諳饜离佽隴ㄩ笢恅蛁庋`). Nothing in
+    // the sweep can order four contradicting readings, and admission cannot
+    // either (measured: gbk and big5 both score 152.5), so the honest answer is
+    // the placeholder naming the candidate pages — which is what `read` would
+    // give for the same bytes.
+    //
+    // What this pins is that the file is REPORTED at all: two lines with their
+    // possible encodings, where the rule this replaced said `Found 0 matches`.
+    fixture(
+      "range.js",
+      sourceLike(["// 端口配置说明：中文注释", "// 管理系统服务连接信息"]),
+      "gbk",
+    );
+    const root = makeHost();
+    const agent = makeAgent(root);
+    await install(root, agent);
+
+    const result = await grep(agent, { pattern: "[一-龥]", path: "range.js" });
+
+    expect(result.value.matches.map((m) => m.lineNumber)).toEqual([41, 42]);
+    for (const match of result.value.matches) {
+      expect(match.line).toMatch(/candidates: /);
+    }
+  });
+
+  it("keeps a valid UTF-8 file's text out of the transcoding pages' hands", async () => {
+    // The regression that made the file-level rule untenable. Every legacy page
+    // "proves" a UTF-8 file — its bytes transcode to mojibake, and mojibake is
+    // non-ASCII, so it satisfies the evidence rule — and they all disagree with
+    // each other AND with the correct text. Measured on this repository's
+    // README.md under `[一-龥]`: gbk 258 lines, big5 256, shift_jis 258, euc-kr
+    // 239, against 256 lines the strict pass had decoded correctly; 23 files in
+    // the repository were affected.
+    //
+    // So the strict pass wins for any line it decoded, and the pages answer only
+    // for files it cannot see. This asserts the plainest form of that: a UTF-8
+    // file's Chinese comes back as its own text, not as a placeholder.
+    fixture("utf8-only.txt", sourceLike(["// 中文注释，合法 UTF-8 文件", "// 第二行中文说明"]), "utf8");
+    const root = makeHost();
+    const agent = makeAgent(root);
+    await install(root, agent);
+
+    const result = await grep(agent, { pattern: "[一-龥]", path: "utf8-only.txt" });
+
+    expect(result.value.matches.map((m) => m.line)).toEqual([
+      "// 中文注释，合法 UTF-8 文件",
+      "// 第二行中文说明",
+    ]);
+  });
+
+  it("finds a case-folded match whose text differs from the pattern", async () => {
+    // `(?i)` makes the matched text differ from the pattern's own characters, so
+    // a proof rule comparing the two saw no evidence and reported nothing for a
+    // file that holds the text. README documents `(?i)` as available here.
+    fixture(
+      "fold.txt",
+      sourceLike(["// ПРИВЕТ мир, это тестовый файл", "// вторая строка комментария"]),
+      "windows-1251",
+    );
+    const root = makeHost();
+    const agent = makeAgent(root);
+    await install(root, agent);
+
+    const result = await grep(agent, { pattern: "(?i)привет", path: "fold.txt" });
+
+    expect(result.value.matches.map((m) => m.line)).toEqual(["// ПРИВЕТ мир, это тестовый файл"]);
+  });
+
+  it("still re-searches a proved file whose other row only the strict pass matched", async () => {
+    // A file the sweep proved is answered by that page's decode — but only for the
+    // lines that page MATCHED. Here line 41 proves the file under `gbk`, while the
+    // byte `0x81` in the last line makes its gbk decode `// 乺ead`, so the gbk run
+    // never reports that line: only the strict pass matches it, on the raw bytes.
+    // Treating the file as fully answered skipped the per-file pass, which left
+    // that row a BARE `(line is not valid UTF-8)` — the remedy the placeholder
+    // exists to carry is the candidate list, and only that pass can supply it.
+    const head = Array.from({ length: 40 }, (_, i) => `const key_${i} = value_${i};`).join("\n");
+    const tail = Buffer.from([0x2f, 0x2f, 0x20, 0x81, 0x72, 0x65, 0x61, 0x64, 0x0a]);
+    fixture("mixed-row.js", `${head}\n// 端口配置项\n`, "gbk");
+    // Appended as raw bytes, because the 0x81 pair is not expressible as GBK text.
+    appendFileSync(join(workspace, "mixed-row.js"), tail);
+    const root = makeHost();
+    const agent = makeAgent(root);
+    await install(root, agent);
+
+    const result = await grep(agent, { pattern: "配置项|read", path: "mixed-row.js" });
+
+    const lines = result.value.matches.map((m) => m.line);
+    // The proved row is reported from the gbk decode...
+    expect(lines).toContain("// 端口配置项");
+    // ...and the row only the strict pass could see still gets its remedy: a
+    // placeholder that NAMES the candidate encodings, rather than a bare one.
+    const undecoded = lines.find((line) => line.includes("not valid UTF-8"));
+    expect(undecoded).toBeDefined();
+    expect(undecoded).toMatch(/candidates: /);
+  });
+
+  it("does not report a valid UTF-8 file that holds none of what the pattern matches", async () => {
+    // The defect that the `strictClean` rule could not reach. That rule covers
+    // lines the strict pass MATCHED, and this file has no `[一-龥]` line to match
+    // — its only non-ASCII character is an em-dash, whose UTF-8 bytes decode to
+    // CJK under `gbk`. So the `gbk` page proved the file, `big5` reported nothing
+    // on that line to contradict it, and the mojibake `鈥` was adopted as the
+    // line's text.
+    //
+    // Measured over four such files (em-dash, arrow, bullet, trademark) before the
+    // fix: 4 of 4 reported a bogus match. The rule that removes them is `read`'s
+    // own: strict UTF-8 settles a file's encoding before any guessing, so such a
+    // file has exactly one correct reading and no page may claim it.
+    const body = Array.from({ length: 40 }, (_, i) => `const key_${i} = value_${i};`).join("\n");
+    // A subdirectory of its own, so the search root holds exactly these files:
+    // every test in this suite shares one workspace, and `.` would report their
+    // fixtures too.
+    mkdirSync(join(workspace, "punct"), { recursive: true });
+    for (const [name, line] of [
+      ["dash.js", "// note — dash only"],
+      ["arrow.js", "// flow → next"],
+      ["bullet.js", "// item • bullet"],
+      ["tm.js", "// brand™ mark"],
+    ] as const) {
+      writeFileSync(join(workspace, "punct", name), Buffer.from(`${body}\n${line}\n`, "utf8"));
+    }
+    const root = makeHost();
+    const agent = makeAgent(root);
+    await install(root, agent);
+
+    const result = await grep(agent, { pattern: "[一-龥]", path: "punct" });
+
+    // None of these files holds a CJK character, so none of them may be reported.
+    expect(result.value.matches).toEqual([]);
+  });
+
+  it("still reports a legacy file for the same class pattern", async () => {
+    // The other side of that rule, and the reason it tests the BYTES rather than
+    // the pattern or the page: a GBK file holding the same text must keep its
+    // hits. `[一-龥]` narrows the candidates to `gbk, big5, utf16le, utf16be`, and
+    // the GBK file is claimed by both legacy pages with contradicting text — so
+    // the honest answer for that file is the candidate placeholder, which is what
+    // this asserts: reported, never silently dropped.
+    const body = Array.from({ length: 40 }, (_, i) => `const key_${i} = value_${i};`).join("\n");
+    writeFileSync(
+      join(workspace, "cjk-class.js"),
+      iconv.encode(`${body}\n// 端口配置说明：中文注释\n`, "gbk"),
+    );
+    const root = makeHost();
+    const agent = makeAgent(root);
+    await install(root, agent);
+
+    const result = await grep(agent, { pattern: "[一-龥]", path: "cjk-class.js" });
+
+    const lines = result.value.matches.map((m) => m.line);
+    expect(lines).toHaveLength(1);
+    // Either the decoded text or a placeholder naming the candidates is an
+    // acceptable answer; a silent `Found 0 matches` is not.
+    expect(lines[0] === "// 端口配置说明：中文注释" || /candidates: /.test(lines[0]!)).toBe(true);
+  });
+
+  it("does not let a UTF-16 page claim a BOM-less file of the OTHER order", async () => {
+    // The same defect as the row above, in the second family that can produce it.
+    // A UTF-16 page re-pairs the file's bytes, so its line numbers do not address
+    // the file's real lines — and for a BOM-less UTF-16LE file the `utf16be`
+    // re-pairing of the ASCII lines is itself CJK, so it matched `[一-龥]` at
+    // "line 1" and that row was reported beside the correct line 41.
+    //
+    // `searchUnicodeFiles` gates every row it reports through `utf16OrderOfFile`
+    // ("only the pass whose order the file's own bytes name may report it"); the
+    // sweep ran the same two pages without that gate. This asserts the gate holds
+    // on the sweep's path too.
+    const body = Array.from({ length: 40 }, (_, i) => `const key_${i} = value_${i};`).join("\n");
+    mkdirSync(join(workspace, "u16order"), { recursive: true });
+    for (const [name, buf] of [
+      ["le.js", Buffer.from(`${body}\n// 端口配置说明：中文注释\n`, "utf16le")],
+      ["be.js", Buffer.from(`${body}\n// 端口配置说明：中文注释\n`, "utf16le").swap16()],
+    ] as const) {
+      writeFileSync(join(workspace, "u16order", name), buf);
+    }
+    const root = makeHost();
+    const agent = makeAgent(root);
+    await install(root, agent);
+
+    const result = await grep(agent, { pattern: "[一-龥]", path: "u16order" });
+
+    // One row per file, at the line the text is really on — no re-paired "line 1".
+    const byPath = new Map<string, Array<{ lineNumber: number; line: string }>>();
+    for (const m of result.value.matches) {
+      const key = m.path.replace(/^\.\\/, "").replace(/^u16order\\/, "");
+      byPath.set(key, [...(byPath.get(key) ?? []), { lineNumber: m.lineNumber, line: m.line }]);
+    }
+    expect([...byPath.keys()].sort()).toEqual(["be.js", "le.js"]);
+    for (const name of ["le.js", "be.js"]) {
+      const rows = byPath.get(name);
+      expect(rows).toHaveLength(1);
+      expect(rows?.[0]?.line).toBe("// 端口配置说明：中文注释");
+      expect(rows?.[0]?.lineNumber).toBe(41);
+    }
   });
 
   it("searches a Big5 file holding traditional characters", async () => {

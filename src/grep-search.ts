@@ -49,14 +49,36 @@
  * number of files that actually contained a non-UTF-8 matched line, which is
  * zero for an ASCII search over a UTF-8 repository.
  *
- * ## Why the non-ASCII case needs no detection at all
+ * ## How a page PROVES it decoded a file
  *
- * A non-ASCII pattern is self-validating. The pattern's UTF-8 bytes only match
- * after ripgrep has transcoded the file with the CORRECT encoding, so running
- * the pattern under each candidate and keeping the ones that match identifies
- * the file's encoding exactly. Measured over five encodings holding the same
- * text, each `(path, lineNumber)` was claimed by exactly one encoding — no
- * duplicates, no false positives.
+ * ripgrep transcodes a file with the page it was given and only then matches, so
+ * a submatch holding a non-ASCII character is one that page's own mapping
+ * produced. That is a proof about the file, and {@link provedFiles} keeps it.
+ *
+ * What is NOT a proof is a match, which is what this module used to assume.
+ * A pattern that also holds an ASCII alternative — `配置|read` — matches under
+ * EVERY page, because `read` is the same bytes in all of them, and the union
+ * then carried one page's mojibake for a file another page had decoded.
+ * Measured on a directory holding the same text as UTF-8 and as GBK, `配置|read`
+ * returned four claims per line from four pages, agreeing on nothing. An ASCII
+ * submatch is therefore no evidence at all, which is what rules that alternative
+ * out without this module having to parse the pattern's syntax.
+ *
+ * The evidence deliberately is NOT "a character the pattern holds". The two
+ * differ wherever the pattern's syntax keeps its characters out of the matched
+ * text: `[一-龥]` matches Chinese without ever spelling `一` or `龥`, and
+ * `(?i)привет` matches `ПРИВЕТ`, whose characters the pattern does not hold.
+ * Measured, both proved nothing under that older rule and left a GBK file
+ * unreported — the silent miss this tool exists to remove. U+FFFD is excluded
+ * for the opposite reason: a decoder SYNTHESISES it for a byte it cannot map, so
+ * it is evidence against a page rather than for it.
+ *
+ * The unit is the FILE rather than the line, because `--encoding` transcodes the
+ * whole file in one pass: one proving character makes every row of that file
+ * trustworthy — including a row whose own match was the ASCII alternative.
+ * Measured on a GBK file whose line 1 is `# 端口配置` and whose line 2 is the
+ * plain-ASCII `PORT=8080 read this`, the gbk run proves the file on line 1 and
+ * both rows come out decoded.
  *
  * @module dsh-fs-encoding/grep-search
  */
@@ -66,7 +88,7 @@ import type { Context } from "@deepseek-ai/cordis";
 import type { FsTarget, FsVersion } from "@deepseek-ai/dsh-fs";
 import type { ToolExecution } from "@deepseek-ai/dsh-tools";
 import type { PluginConfig } from "./config.js";
-import { decodeBytes, encodeText } from "./encoding.js";
+import { decodeBytes, encodeText, isValidUtf8 } from "./encoding.js";
 import {
   decodeForOpen,
   DecodeError,
@@ -93,6 +115,24 @@ export interface RawMatch {
   text?: string;
   /** The line's raw bytes, when ripgrep could not. */
   bytes?: Uint8Array;
+  /**
+   * Whether any submatch on this line holds a non-ASCII character.
+   *
+   * This is what makes a page's claim checkable. `lines.text` says what the page
+   * decoded the line INTO, which says nothing about whether it decoded it
+   * CORRECTLY — under a wrong page every byte still decodes to something. A
+   * submatch is different in kind: a page can only put a NON-ASCII character into
+   * a matched span by mapping the file's bytes onto it. See {@link provedFiles}.
+   *
+   * Reduced to a boolean HERE rather than kept as texts, because that is the only
+   * thing any caller asks of it and the texts are not free: measured at the 20 MB
+   * stdout cap, retaining them took the heap from 7.9 MB to 17.5 MB on searches
+   * that never read them. Deferring the parse behind a per-row closure was
+   * measured WORSE still — 41.3 MB, because the closure costs more than the
+   * strings and pins the raw record against collection. One boolean is the shape
+   * that costs nothing on the three parse sites that ignore it.
+   */
+  submatchEvidence: boolean;
 }
 
 /**
@@ -259,6 +299,7 @@ export function parseRgJson(stdout: string): RawMatch[] {
       path?: { text?: unknown };
       line_number?: unknown;
       lines?: { text?: unknown; bytes?: unknown };
+      submatches?: unknown;
     } | null;
     if (typeof data !== "object" || data === null) continue;
     const path = data.path?.text;
@@ -266,18 +307,107 @@ export function parseRgJson(stdout: string): RawMatch[] {
     if (typeof path !== "string" || typeof lineNumber !== "number") continue;
     const lines = data.lines;
     if (typeof lines !== "object" || lines === null) continue;
+    // Reduced to the one fact a caller needs, at the point where the record is
+    // already in hand: both branches below can carry submatches, and nothing
+    // outside the transcoding sweep wants the texts themselves.
+    const submatchEvidence = hasSubmatchEvidence(data.submatches);
 
     if (typeof lines.text === "string") {
-      matches.push({ path, lineNumber, text: lines.text.replace(/\r?\n$/, "") });
+      matches.push({
+        path,
+        lineNumber,
+        text: lines.text.replace(/\r?\n$/, ""),
+        submatchEvidence,
+      });
     } else if (typeof lines.bytes === "string") {
       matches.push({
         path,
         lineNumber,
         bytes: new Uint8Array(Buffer.from(lines.bytes, "base64")),
+        submatchEvidence,
       });
     }
   }
   return matches;
+}
+
+/**
+ * Whether one `match` record's submatches hold a character only a real decode
+ * yields.
+ *
+ * Only a character above U+007F can distinguish two pages, because ASCII is the
+ * same bytes in all of them — which is what rules out an ASCII alternative like
+ * `配置|read`'s `read` without this module having to parse the pattern. U+FFFD is
+ * the exception that proves the rule: a decoder SYNTHESISES it for a byte it
+ * could not map, so its presence says the page FAILED on that byte. Measured,
+ * ripgrep's UTF-16 decoder emits it for a lone surrogate, which was enough to let
+ * a `utf-16le` page "prove" a plain UTF-8 file and overwrite its correct text.
+ *
+ * Malformed entries are skipped rather than fatal, for the same reason the parser
+ * skips malformed records: ripgrep's stdout is a transport this module drives.
+ *
+ * @param raw - the record's `submatches` field, of unknown shape.
+ * @returns whether any submatch is evidence that its page decoded the file.
+ */
+function hasSubmatchEvidence(raw: unknown): boolean {
+  if (!Array.isArray(raw)) return false;
+  for (const entry of raw) {
+    const text = (entry as { match?: { text?: unknown } } | null)?.match?.text;
+    if (typeof text !== "string") continue;
+    for (const ch of text) {
+      if (ch === "\uFFFD") continue;
+      if ((ch.codePointAt(0) ?? 0) > 0x7f) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The files one page PROVED it decoded, from that page's submatches.
+ *
+ * A page proves a file when some submatch on one of that file's DECODED rows
+ * holds a non-ASCII character. That is a proof rather than a correlation:
+ * ripgrep transcodes the file with the page it was given and only then matches,
+ * so a non-ASCII character in the matched span can only have come from that
+ * page's mapping of the file's bytes.
+ *
+ * The reasoning this replaces treated a MATCH as the proof. It is not one, and
+ * the difference is not subtle: a pattern holding an ASCII alternative —
+ * `配置|read` — matches under every page, because `read` is the same bytes in all
+ * of them. Measured on a directory holding the same text as UTF-8 and as GBK,
+ * `配置|read` produced four contradicting claims per line, and the page that
+ * happened to run last was the one on screen. An ASCII-only submatch is
+ * therefore not evidence, which is what rules that alternative out.
+ *
+ * The evidence deliberately is NOT "a character the PATTERN holds". Those differ
+ * wherever regex syntax keeps the pattern's characters out of the matched text,
+ * and both directions were measured as silent misses on a GBK file that plainly
+ * held the text: `[一-龥]` matches Chinese without ever spelling `一` or `龥`, and
+ * `(?i)привет` matches `ПРИВЕТ`, whose characters the pattern does not hold.
+ * See {@link hasSubmatchEvidence} for why U+FFFD is not evidence either.
+ *
+ * The granularity is the file, and it has to be: `--encoding` transcodes the
+ * whole file in one pass, so one proving character makes every row of that file
+ * trustworthy — including rows whose own match was an ASCII alternative. A file
+ * the page did not prove contributes nothing, even if that page matched it.
+ *
+ * @param rows - the `match` rows one page's run produced, in output order.
+ * @returns the paths of the files this page proved, in first-seen order.
+ */
+export function provedFiles(rows: readonly RawMatch[]): string[] {
+  const proved: string[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (seen.has(row.path)) continue;
+    // A row still in `bytes` is one this page could not decode, so it cannot
+    // speak for the page: the proof has to come from a line it rendered.
+    if (row.text === undefined) continue;
+    if (row.submatchEvidence) {
+      seen.add(row.path);
+      proved.push(row.path);
+    }
+  }
+  return proved;
 }
 
 /** Which files produced at least one undecodable row, in first-seen order. */
@@ -806,6 +936,64 @@ export async function searchDecodedTextIsolated(
     // one does not keep burning CPU. Measured: `terminate()` on a running worker
     // stops it outright.
     await worker.terminate();
+  }
+}
+
+/**
+ * Whether a file's bytes are strict UTF-8 TEXT, which settles its encoding.
+ *
+ * A file that passes this test has exactly ONE correct reading, and it is the
+ * strict pass's. Every legacy page's decode of it is mojibake by construction —
+ * the bytes are already text, so re-reading them through another page can only
+ * corrupt them. That makes this the discriminator the sweep's proof rule needs,
+ * and it is the same rule `read` applies: `encoding-state` tests strict UTF-8
+ * deterministically, BEFORE any guessing, and a file that passes never reaches
+ * the heuristic at all.
+ *
+ * Why the proof rule needs it. A page "proves" a file by producing a non-ASCII
+ * character in a submatch, and a UTF-8 file's bytes satisfy that under pages the
+ * file was never in: measured, this repository's `LICENSE` under `[一-龥]` was
+ * claimed by 4 pages, and a valid-UTF-8 file whose only non-ASCII character was
+ * an em-dash came back as the mojibake `// note 鈥� dash only` — the em-dash's
+ * bytes decode to CJK under `gbk`. 57 files of this repository alone were
+ * affected. The `strictClean` filter at the call site cannot catch these: it
+ * covers lines the strict pass MATCHED, and the bug lives precisely on the lines
+ * it did not match (a file with no CJK has no `[一-龥]` line to match).
+ *
+ * The NUL test is not optional. Every byte pair of an ASCII-only UTF-16 file is
+ * `xx 00`, and U+0000 is a legal code point, so such a file IS valid UTF-8 by
+ * this test — measured. Without the NUL half the rule would void the claims for
+ * a UTF-16 file that legitimately holds the text, which is the one family the
+ * sweep exists to serve for BOM-less files. `looksBinary` is the same predicate
+ * `readAndDecode` uses at its own refusal.
+ *
+ * Never throws: an unreadable path answers `false`, so the claim stands and the
+ * ordinary paths decide it — this filter may only ever REMOVE a claim it can
+ * prove wrong, never fail a search.
+ *
+ * @param ctx - the plugin context, for `fs`.
+ * @param exec - the calling execution, for the sandbox and session cwd.
+ * @param path - the path as ripgrep printed it.
+ * @param config - the deployment's admission config, for the read cap.
+ * @returns whether the bytes are strict UTF-8 text with no NUL.
+ */
+export async function isPlainUtf8Text(
+  ctx: Context,
+  exec: ToolExecution,
+  path: string,
+  config: PluginConfig,
+): Promise<boolean> {
+  try {
+    const fs = ctx.fs;
+    const target = await fs.resolve(path, { cwd: workdirOf(exec) });
+    const info = await fs.stat(target, exec.signal);
+    if (info === undefined || info.type !== "file") return false;
+    const cap = info.size === undefined ? config.maxFileBytes : Math.min(info.size, config.maxFileBytes);
+    const bytes = await fs.readBytes(target, exec.signal, cap);
+    if (looksBinary(bytes)) return false;
+    return isValidUtf8(bytes);
+  } catch {
+    return false;
   }
 }
 
