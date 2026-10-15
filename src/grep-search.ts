@@ -85,7 +85,7 @@
 
 import { Worker } from "node:worker_threads";
 import type { Context } from "@deepseek-ai/cordis";
-import type { FsTarget, FsVersion } from "@deepseek-ai/dsh-fs";
+import type { FileSystem, FsTarget, FsVersion } from "@deepseek-ai/dsh-fs";
 import type { ToolExecution } from "@deepseek-ai/dsh-tools";
 import type { PluginConfig } from "./config.js";
 import { decodeBytes, encodeText, isValidUtf8 } from "./encoding.js";
@@ -971,6 +971,16 @@ export async function searchDecodedTextIsolated(
  * ordinary paths decide it — this filter may only ever REMOVE a claim it can
  * prove wrong, never fail a search.
  *
+ * A file over the read cap is answered from its bytes rather than refused. The
+ * cap makes `readBytes` THROW instead of returning a prefix, and reading that
+ * throw as "not plain UTF-8" is what let the mojibake above survive on exactly
+ * the files this filter exists for: measured, a valid-UTF-8 file of 11.5 MB
+ * whose only non-ASCII character was an em-dash still came back as
+ * `// note 鈥� dash only` under the default cap. A prefix cannot settle this
+ * question — one malformed sequence or one NUL ANYWHERE refutes it, and the
+ * prefix that happened to be clean is not the file — so the bytes are streamed
+ * instead, in windows bounded by the same cap. See {@link plainUtf8OfFile}.
+ *
  * @param ctx - the plugin context, for `fs`.
  * @param exec - the calling execution, for the sandbox and session cwd.
  * @param path - the path as ripgrep printed it.
@@ -989,12 +999,76 @@ export async function isPlainUtf8Text(
     const info = await fs.stat(target, exec.signal);
     if (info === undefined || info.type !== "file") return false;
     const cap = info.size === undefined ? config.maxFileBytes : Math.min(info.size, config.maxFileBytes);
-    const bytes = await fs.readBytes(target, exec.signal, cap);
-    if (looksBinary(bytes)) return false;
-    return isValidUtf8(bytes);
+    return await plainUtf8OfFile(fs, target, cap, exec.signal);
   } catch {
     return false;
   }
+}
+
+/**
+ * Whether one file's bytes are strict UTF-8 text with no NUL, whole or streamed.
+ *
+ * The whole-file read is the fast path and stays the only path for a file the
+ * cap can serve, so the answer for every file that fits is byte-for-byte the one
+ * this filter has always given. The windowed path exists for the one refusal
+ * `readBytes` has that a window can serve — `FS_TOO_LARGE` — and it is a
+ * fallback rather than the only path for the same reason
+ * {@link utf16BytesOfFile} is: `readBytes` is the seam every deployment has, and
+ * taking windows unconditionally would make a backend without `readByteRange`
+ * answer `false` for every file, which is a claim this filter may not make.
+ *
+ * The windows are fed to ONE `fatal` decoder in `stream` mode, so a multi-byte
+ * sequence straddling a window boundary is decoded exactly as one that sits
+ * inside a window — the decoder carries the partial sequence across the call,
+ * which is the whole reason a windowed test can answer a whole-file question.
+ * Nothing is ever held whole: the largest buffer alive is one window, bounded by
+ * the same `cap` the whole-file read would have used.
+ *
+ * The closing flush is not optional. A file that ends mid-sequence — `e4 bd` of
+ * a three-byte character — leaves those bytes pending inside the decoder and
+ * throws nothing until it is asked for the rest, so without the flush a
+ * TRUNCATED file would pass as text.
+ *
+ * @param fs - the file system seam to read through.
+ * @param target - the resolved file.
+ * @param cap - the byte cap, already reduced to the file's own size; also the window size.
+ * @param signal - aborts the read.
+ * @returns whether the bytes are strict UTF-8 text with no NUL.
+ */
+async function plainUtf8OfFile(
+  fs: FileSystem,
+  target: FsTarget,
+  cap: number,
+  signal: AbortSignal | undefined,
+): Promise<boolean> {
+  try {
+    const bytes = await fs.readBytes(target, signal, cap);
+    if (looksBinary(bytes)) return false;
+    return isValidUtf8(bytes);
+  } catch (error) {
+    if (signal?.aborted) throw error;
+  }
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  for (let offset = 0; ; ) {
+    const window = await fs.readByteRange(target, { offset, length: cap }, signal);
+    // An empty window is the end of the file: `readByteRange` returns one for an
+    // offset at or past it, and the file is not empty because a read of it was
+    // refused for being too large.
+    if (window.length === 0) break;
+    if (looksBinary(window)) return false;
+    try {
+      decoder.decode(window, { stream: true });
+    } catch {
+      return false;
+    }
+    offset += window.length;
+  }
+  try {
+    decoder.decode();
+  } catch {
+    return false;
+  }
+  return true;
 }
 
 /**
