@@ -189,19 +189,23 @@ export function buildWriteTool(ctx: Context, sandbox: EncodingSandbox) {
       // the model only meant to save, and the model cannot see the difference.
       //
       // The message deliberately does NOT suggest deleting the file to get the
-      // conversion. That advice is actively harmful, and it used to be here:
-      // deleting is the one action that bypasses the read-before-write gate, so a
-      // file this session had never read could be destroyed and recreated with
-      // the reply reporting `operation: "create"` / `before: null` — identical to
-      // creating a brand-new file, with the old content unrecoverable and
-      // invisible. And when the session HAD read the file (the common case, since
-      // the gate requires a read), the deletion left the observation policy
-      // holding `present@old-version` while the plugin could no longer emit
-      // `absent` for a path that does not exist, so every later write failed
-      // `FS_STALE_VERSION` and the path was unwritable for the rest of the
-      // session. There is no in-session recovery from that, so the advice must
-      // not be given. A genuine conversion needs a purpose-built tool that reads
-      // first and carries the version guard; it is not a side effect of `write`.
+      // conversion. That advice is actively harmful, and it used to be here.
+      //
+      // The reason is the READ-BEFORE-WRITE GATE, not the stale observation. An
+      // earlier version of this comment justified the removal with the deletion
+      // deadlock instead — the policy holding `present@old-version` so every later
+      // write failed `FS_STALE_VERSION`. That deadlock no longer exists: the write
+      // path records the absence itself (see `writeFile`), so a deleted file is
+      // recreated by simply retrying. The advice stays out for the half that was
+      // never about the deadlock: deleting is the one action that bypasses the
+      // gate, so a file this session had NEVER read can be destroyed and recreated
+      // with the reply reporting `operation: "create"` / `before: null` —
+      // indistinguishable from creating a brand-new file, with the old content
+      // unrecoverable and invisible. A convenience that costs a silent
+      // whole-file loss is not a convenience.
+      //
+      // A genuine conversion needs a purpose-built tool that reads first and
+      // carries the version guard; it is not a side effect of `write`.
       if (input.encoding !== undefined && operation === "update") {
         throw new Error(
           `[E_ENCODING_NOT_APPLICABLE] "${input.path}" already exists, so it keeps its own ` +

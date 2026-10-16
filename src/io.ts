@@ -30,6 +30,7 @@ import {
   type FileEncodingState,
 } from "./encoding-state.js";
 import type { EncodingSandbox } from "./sandbox.js";
+import { emitObservation } from "./sandbox.js";
 import { detectEnding, toLF } from "./line-endings.js";
 import { clearUndoFor, recordUndo } from "./undo-state.js";
 
@@ -197,23 +198,16 @@ export async function readFile(
     if (info === undefined) {
       // Report the absence to the observation gate before failing, exactly as the
       // built-in `read` does. Without this the policy keeps whatever it last knew
-      // — normally `present@old-version` — and every later write to this path
-      // fails `FS_STALE_VERSION` ("file no longer exists") for the rest of the
-      // session, with nothing able to clear it: a file the model deleted can
-      // never be recreated, and the refusal names a cause the caller cannot act
-      // on. A read is the one moment the plugin learns a file is gone, so it is
-      // the moment to say so. Suppressed for a presentation-only read, which must
-      // not move the gate in either direction.
+      // — normally `present@old-version` — and the next write to this path fails
+      // `FS_STALE_VERSION` ("file no longer exists"), naming a cause the caller
+      // cannot act on. A read is the one moment the plugin learns a file is gone,
+      // so it is the moment to say so: the record turns the path back into
+      // `createIfAbsent`, sparing the caller the doomed first write that
+      // `writeFile`'s own `emitAbsent` would otherwise have to absorb. Suppressed
+      // for a presentation-only read, which must not move the gate in either
+      // direction.
       if (opts.observe !== false) {
-        try {
-          ctx.emit("fs/observed", target, { kind: "absent" }, opts.exec);
-        } catch (error) {
-          ctx.logger.warn(
-            `dsh-fs-encoding: fs/observed (absent) emission failed for ${path}: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
-        }
+        emitObservation(ctx, target, { kind: "absent" }, opts.exec);
       }
       throw new FsError(`cannot read "${path}": no such file`, "FS_NOT_FOUND");
     }
@@ -287,17 +281,9 @@ export async function readFile(
     decoded.footer ?? (opts.encodingHint === undefined ? memo?.footer : undefined);
 
   if (opts.observe !== false) {
-    try {
-      ctx.emit("fs/observed", target, { kind: "present", version }, opts.exec);
-    } catch (error) {
-      // The read succeeded; a failed observation only means a later built-in
-      // tool re-reads. Never fail the read for it.
-      ctx.logger.warn(
-        `dsh-fs-encoding: fs/observed emission failed for ${path}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
+    // A failed observation only means a later built-in tool re-reads. Never fail
+    // the read for it.
+    emitObservation(ctx, target, { kind: "present", version }, opts.exec);
   }
 
   return {
@@ -447,14 +433,72 @@ export async function writeFile(
     //                      its presence already proves the file was read.
     if (guardKind === "replaceIfVersion" || guardKind === "versionOnly") {
       if (current === undefined) {
+        // The guard expected a file the backend no longer has. Record that
+        // absence before refusing, or this path is locked for the rest of the
+        // session: the policy goes on answering `replaceIfVersion` from a
+        // `present@old-version` it can never correct, so EVERY later write here
+        // fails the same way, including the recreate the caller obviously wants.
+        // Measured before this line existed: a read file that was then deleted
+        // failed three consecutive writes with no in-session way out, and the
+        // only thing that could clear it was an unrelated FAILED read (which
+        // happens to emit the same absence as a side effect).
+        //
+        // Emitted here, AFTER the guard has already decided, rather than before
+        // it: correcting the record first would make `fs/write-intent` answer
+        // `createIfAbsent` for this very call, which the backend accepts — so a
+        // concurrent delete-and-rename would have its file overwritten during the
+        // window it was briefly absent. Refusing this call keeps that race
+        // fail-closed; recording the absence only changes what the NEXT call sees.
+        sandbox.emitAbsent(checked, exec);
+        // The remedy is CONDITIONAL, and neither branch mentions the absence
+        // record. Three earlier wordings were wrong, each recorded here so none
+        // comes back:
+        //
+        // 1. "repeating this write recreates the file" — reads as "send the same
+        //    content again" rather than "retry the operation", and states a fact
+        //    instead of saying what to do.
+        // 2. "the deletion is now recorded, so …" — invited the model to think a
+        //    record of the deleted CONTENT exists, something to inspect or restore
+        //    from. What is stored is a boolean: this path is absent. It is the
+        //    plugin's own bookkeeping, it carries no content, and the model can
+        //    neither see it nor act on it.
+        // 3. "retry this write to recreate the file" — an imperative, which reads
+        //    as an obligation to continue. A deletion may well be the caller's
+        //    intent, and the tool must not push it into undoing that: the remedy
+        //    applies only if the caller still wants the file. Hence the condition.
+        //
+        // The harness's own wording for this family is "…, then retry", which is
+        // the vocabulary kept here.
         throw new FsError(
-          `cannot write "${checked.displayPath}": file no longer exists`,
+          mode === "edit"
+            ? `cannot edit "${checked.displayPath}": file no longer exists. It was deleted ` +
+              `after this session read it; if you need to recreate it, do so with a write and ` +
+              `then retry this edit.`
+            : `cannot write "${checked.displayPath}": file no longer exists. It was deleted ` +
+              `after this session read it; retry this write if you need to recreate it.`,
           "FS_STALE_VERSION",
         );
       }
       if (guardVersion !== undefined && current.version !== guardVersion) {
+        // The remedy here is specific and the opposite of the deletion case
+        // above: the file EXISTS, so repeating the call cannot help — the record
+        // is still the old version and the comparison fails identically forever.
+        // Only re-reading clears it, because a read is what moves the session's
+        // observation to the current version.
+        //
+        // Deliberately NOT recording the version just observed, which would
+        // unblock the next attempt the way `emitAbsent` does above. That record
+        // would authorize a write against content the model has never seen —
+        // precisely the silent clobber this guard exists to prevent. The model
+        // must re-read and see the new content before overwriting it.
+        //
+        // `mode` is spelled into the verb rather than hard-coded, because edit
+        // mode reaches this branch too (`versionOnly`) and "cannot write" would
+        // name a tool the caller never invoked.
         throw new FsError(
-          `cannot write "${checked.displayPath}": file changed since it was read`,
+          `cannot ${mode} "${checked.displayPath}": file changed since it was read. ` +
+            `The content on disk is no longer the one this session saw, so re-read the ` +
+            `file to pick up the current content, then ${mode} again.`,
           "FS_STALE_VERSION",
         );
       }

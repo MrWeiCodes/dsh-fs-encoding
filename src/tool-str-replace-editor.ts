@@ -46,6 +46,7 @@ import { toLF } from "./line-endings.js";
 import { parseUndoArgs, performUndo } from "./tool-undo.js";
 import { STR_REPLACE_EDITOR_DESCRIPTION, DEFAULT_LIMIT, clipLine, formatReadOutput } from "./prompts.js";
 import type { EncodingSandbox, FsEscalationArgs } from "./sandbox.js";
+import { emitObservation } from "./sandbox.js";
 import { execCwd } from "./workspace-context.js";
 
 /**
@@ -306,17 +307,10 @@ export function buildStrReplaceEditorTool(ctx: Context, sandbox: EncodingSandbox
           // Report the absence to the observation gate before failing, exactly as
           // the built-in `read` and this plugin's `readFile` do. Without it the
           // policy keeps whatever it last knew — normally `present@old-version` —
-          // and every later write to this path fails `FS_STALE_VERSION` for the
-          // rest of the session, with nothing able to clear it.
-          try {
-            ctx.emit("fs/observed", target, { kind: "absent" }, exec);
-          } catch (error) {
-            ctx.logger.warn(
-              `dsh-fs-encoding: fs/observed (absent) emission failed for ${path}: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
-            );
-          }
+          // and the next write to this path fails `FS_STALE_VERSION` naming a
+          // cause the caller cannot act on. Recording it here turns the path back
+          // into `createIfAbsent` before that doomed first write happens.
+          emitObservation(ctx, target, { kind: "absent" }, exec);
           throw new FsError(`cannot view "${path}": no such file or directory`, "FS_NOT_FOUND");
         }
         if (info.type === "directory") {

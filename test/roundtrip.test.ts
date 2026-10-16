@@ -360,6 +360,155 @@ describe("the fs event gate still lines up with the built-ins", () => {
       pluginWrite(root, sandbox, { target, content: "blind\n", exec, policy }, "write"),
     ).rejects.toThrow(/without reading it first/);
   });
+
+  it("a write onto a deleted file records the absence and unlocks the path", async () => {
+    // The dead end this pins: reading a file and then deleting it left the policy
+    // holding `present@old-version`, so `fs/write-intent` kept answering
+    // `replaceIfVersion` and EVERY later write failed `FS_STALE_VERSION` with no
+    // way out. The only thing that could clear it was an unrelated FAILED read,
+    // because the read path emits the absence as a side effect — an accident, not
+    // a recovery the caller could be expected to find.
+    //
+    // The first write still fails (that is the guard doing its job), and the
+    // SECOND one succeeds because the failure recorded the absence. Deliberately
+    // not "the first write succeeds": see the race test below.
+    const p = join(dir, "deleted.txt");
+    await writeFile(p, utf8("original\n"));
+    await pluginRead(root, "deleted.txt", dir, { exec });
+    await rm(p);
+
+    const target = await root.fs.resolve(p);
+    await expect(
+      pluginWrite(root, sandbox, { target, content: "recreated\n", exec, policy }, "write"),
+    ).rejects.toThrow(/file no longer exists/);
+
+    const intent = await root.waterfall("fs/write-intent", target, exec, () => undefined);
+    expect(intent).toMatchObject({ kind: "createIfAbsent" });
+
+    await pluginWrite(root, sandbox, { target, content: "recreated\n", exec, policy }, "write");
+    expect((await readFile(p)).toString("utf8")).toBe("recreated\n");
+  });
+
+  it("a delete-then-recreate race is still refused, not overwritten", async () => {
+    // Why the absence is recorded AFTER the guard rather than before it. If the
+    // write path corrected the record first, `fs/write-intent` would answer
+    // `createIfAbsent` for that very call — and the backend ACCEPTS that intent
+    // when the file is present, so a concurrent delete-and-rename (a common way
+    // to replace a file) would have its result overwritten during the window it
+    // was briefly absent. That is exactly the clobber the version guard exists to
+    // prevent, so this must stay fail-closed.
+    const p = join(dir, "raced.txt");
+    await writeFile(p, utf8("original\n"));
+    await pluginRead(root, "raced.txt", dir, { exec });
+    await rm(p);
+    await writeFile(p, utf8("someone else recreated this\n"));
+
+    const target = await root.fs.resolve(p);
+    await expect(
+      pluginWrite(root, sandbox, { target, content: "ours\n", exec, policy }, "write"),
+    ).rejects.toThrow(/changed since it was read/);
+
+    // And again, so a record corrected by the first failure cannot sneak the
+    // second attempt past the version comparison.
+    await expect(
+      pluginWrite(root, sandbox, { target, content: "ours\n", exec, policy }, "write"),
+    ).rejects.toThrow(/changed since it was read/);
+
+    expect((await readFile(p)).toString("utf8")).toBe("someone else recreated this\n");
+  });
+
+  it("the stale-version refusal names re-reading as the way out, and it works", async () => {
+    // The message must not give advice that does not work. Repeating the call
+    // cannot clear a version mismatch — the record stays stale and the comparison
+    // fails identically — so the remedy is a re-read, and this pins that the
+    // re-read is what actually unblocks it.
+    const p = join(dir, "advice.txt");
+    await writeFile(p, utf8("original\n"));
+    await pluginRead(root, "advice.txt", dir, { exec });
+    await writeFile(p, utf8("changed externally\n"));
+
+    const target = await root.fs.resolve(p);
+    await expect(
+      pluginWrite(root, sandbox, { target, content: "ours\n", exec, policy }, "write"),
+    ).rejects.toThrow(/re-read the file to pick up the current content, then write again/);
+
+    // Repeating without re-reading must NOT help: a guard that could be talked
+    // past by retrying would authorize writing over content never seen.
+    await expect(
+      pluginWrite(root, sandbox, { target, content: "ours\n", exec, policy }, "write"),
+    ).rejects.toThrow(/changed since it was read/);
+    expect((await readFile(p)).toString("utf8")).toBe("changed externally\n");
+
+    // The advice, followed.
+    await pluginRead(root, "advice.txt", dir, { exec });
+    await pluginWrite(root, sandbox, { target, content: "ours\n", exec, policy }, "write");
+    expect((await readFile(p)).toString("utf8")).toBe("ours\n");
+  });
+
+  it("an edit-mode refusal names edit, not write", async () => {
+    // `versionOnly` reaches the same branch as `replaceIfVersion`, so a hard-coded
+    // "cannot write" would name a tool the caller never invoked — and the remedy
+    // it offers has to be the mode the caller actually used.
+    const p = join(dir, "editmode.txt");
+    await writeFile(p, utf8("original\n"));
+    await pluginRead(root, "editmode.txt", dir, { exec });
+    await writeFile(p, utf8("changed externally\n"));
+
+    const target = await root.fs.resolve(p);
+    await expect(
+      pluginWrite(root, sandbox, { target, content: "ours\n", exec, policy }, "edit"),
+    ).rejects.toThrow(/cannot edit .*: file changed since it was read/);
+  });
+
+  it("the deleted-file remedy for edit mode is the one that actually works", async () => {
+    // An edit CANNOT recreate a deleted file: `fs/edit-intent` answers
+    // `FS_NOT_FOUND` once the absence is recorded, so retrying the edit alone is a
+    // dead end (measured: `cannot edit …: not found`). The message therefore names
+    // the write as the way to recreate it — and this pins that the instruction is
+    // followable rather than merely plausible.
+    const p = join(dir, "editremedy.txt");
+    await writeFile(p, utf8("original\n"));
+    await pluginRead(root, "editremedy.txt", dir, { exec });
+    await rm(p);
+
+    const target = await root.fs.resolve(p);
+    await expect(
+      pluginWrite(root, sandbox, { target, content: "x\n", exec, policy }, "edit"),
+    ).rejects.toThrow(/if you need to recreate it, do so with a write and then retry this edit/);
+
+    // Retrying the edit without recreating is the dead end the wording avoids.
+    await expect(
+      pluginWrite(root, sandbox, { target, content: "x\n", exec, policy }, "edit"),
+    ).rejects.toThrow(/not found/);
+
+    // The instruction, followed literally: write to recreate, then edit.
+    await pluginWrite(root, sandbox, { target, content: "original\n", exec, policy }, "write");
+    await pluginWrite(root, sandbox, { target, content: "x\n", exec, policy }, "edit");
+    expect((await readFile(p)).toString("utf8")).toBe("x\n");
+  });
+
+  it("the deleted-file remedy for write mode is offered, not imposed", async () => {
+    // The remedy is conditional on the caller still wanting the file. A deletion
+    // may be exactly what the caller intended, so the refusal must not read as an
+    // instruction to undo it — the earlier imperative wording did.
+    const p = join(dir, "writereadmedy.txt");
+    await writeFile(p, utf8("original\n"));
+    await pluginRead(root, "writereadmedy.txt", dir, { exec });
+    await rm(p);
+
+    const target = await root.fs.resolve(p);
+    await expect(
+      pluginWrite(root, sandbox, { target, content: "x\n", exec, policy }, "write"),
+    ).rejects.toThrow(/retry this write if you need to recreate it/);
+
+    // Declining the remedy is a valid outcome: the path stays deleted and the
+    // session is not left in a state that blocks anything else.
+    expect(await root.fs.stat(target, undefined)).toBeUndefined();
+
+    // Accepting it works on the very next call.
+    await pluginWrite(root, sandbox, { target, content: "x\n", exec, policy }, "write");
+    expect((await readFile(p)).toString("utf8")).toBe("x\n");
+  });
 });
 
 describe("an evicted encoding record", () => {

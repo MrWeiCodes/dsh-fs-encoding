@@ -16,7 +16,7 @@
  */
 
 import type { Context } from "@deepseek-ai/cordis";
-import { FsError, type FsTarget, type FsVersion } from "@deepseek-ai/dsh-fs";
+import { FsError, type FsObservation, type FsTarget, type FsVersion } from "@deepseek-ai/dsh-fs";
 import {
   approveEscalation,
   ESCALATION_TARGETS,
@@ -54,6 +54,43 @@ interface ApprovalLike {
 export interface WriteIntent {
   kind: string;
   version?: FsVersion;
+}
+
+/**
+ * Report an observation to the gate, swallowing a listener failure.
+ *
+ * The one place this plugin emits `fs/observed`. It is exported as a function
+ * rather than left as a method because not every emitter has an
+ * {@link EncodingSandbox} to hand: `readFile` is called with a bare context, and
+ * the read path is the most load-bearing emitter of all.
+ *
+ * Failures are logged and swallowed. An observation is a RECORD of something
+ * that already happened, so a listener that throws cannot change the outcome —
+ * failing the call would turn a successful read or write into an error over a
+ * bookkeeping step. The cost of a lost record is bounded and known: the policy
+ * keeps its previous belief, and the next guarded write either re-reads or
+ * refuses, which is the fail-closed direction.
+ *
+ * @param ctx - the plugin's context, for `emit` and the logger.
+ * @param target - the target whose presence or absence was observed.
+ * @param observation - present with its version, or confirmed absent.
+ * @param exec - the observing execution, which the policy keys its state by.
+ */
+export function emitObservation(
+  ctx: Context,
+  target: FsTarget,
+  observation: FsObservation,
+  exec: ToolExecution | undefined,
+): void {
+  try {
+    ctx.emit("fs/observed", target, observation, exec);
+  } catch (error) {
+    ctx.logger.warn(
+      `dsh-fs-encoding: fs/observed emission failed for ${target.displayPath}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
 }
 
 /**
@@ -240,24 +277,45 @@ export class EncodingSandbox {
    * observed at the new version.
    *
    * Without this the policy's state stays stale and the very next built-in
-   * `write` fails `FS_NOT_OBSERVED` or `FS_STALE_VERSION`. Failures are logged
-   * and swallowed: the write already succeeded.
+   * `write` fails `FS_NOT_OBSERVED` or `FS_STALE_VERSION`.
    *
    * @param target - the target that was written.
    * @param version - the version the write produced, when the backend reports one.
    * @param exec - the calling execution.
    */
   emitObserved(target: FsTarget, version: FsVersion | undefined, exec: ToolExecution): void {
+    // No version means the backend did not report one, and a `present` record
+    // without a version cannot be compared against anything — recording it would
+    // turn every later guarded write into a mismatch. Emitting nothing leaves the
+    // policy's previous belief in place, which fails closed instead.
     if (version === undefined) return;
-    try {
-      this.ctx.emit("fs/observed", target, { kind: "present", version }, exec);
-    } catch (error) {
-      this.ctx.logger.warn(
-        `dsh-fs-encoding: fs/observed emission failed for ${target.displayPath}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
+    emitObservation(this.ctx, target, { kind: "present", version }, exec);
+  }
+
+  /**
+   * Record that a target is GONE, which is what unlocks the path again.
+   *
+   * The counterpart to {@link emitObserved}, and the reason it exists: the
+   * observation policy keys its guard off the last thing this session knew, so a
+   * file that was read and then deleted leaves `present@old-version` behind. The
+   * next `fs/write-intent` therefore answers `replaceIfVersion`, and the backend
+   * refuses with `FS_STALE_VERSION` ("file no longer exists") — for the rest of
+   * the session, because nothing in a write ever clears it. Emitting the absence
+   * is what turns that path back into `createIfAbsent`.
+   *
+   * Called from the write path when the guard expected a file that is not there.
+   * That is deliberately the moment AFTER the guard was taken and the refusal is
+   * already certain: the record is corrected for the NEXT call, while this one
+   * still fails. Emitting before the guard would flip this very call from
+   * `replaceIfVersion` to `createIfAbsent` and let it overwrite a file that a
+   * concurrent delete-and-rename had momentarily moved aside — the race the
+   * guard exists to catch.
+   *
+   * @param target - the target found to be absent.
+   * @param exec - the calling execution.
+   */
+  emitAbsent(target: FsTarget, exec: ToolExecution): void {
+    emitObservation(this.ctx, target, { kind: "absent" }, exec);
   }
 
   /**

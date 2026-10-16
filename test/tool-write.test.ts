@@ -135,12 +135,17 @@ describe("write: the encoding argument on an existing file", () => {
 
   it("does not tell the caller to delete the file", async () => {
     // The refusal used to recommend "delete the file first if you really mean to
-    // recreate it". Following that is destructive in one case and a dead end in
-    // the other: an unread file is destroyed with the reply reporting
-    // `operation: "create"` / `before: null` (indistinguishable from creating a
-    // new file), and a read file leaves the observation policy holding a stale
-    // `present`, so every later write fails `FS_STALE_VERSION` and the path can
-    // never be recreated in this session. The message must not suggest it.
+    // recreate it". Following that destroys content silently in the case that
+    // matters: an unread file is destroyed and the reply reports
+    // `operation: "create"` / `before: null`, indistinguishable from creating a
+    // new file. That is why the advice stays out.
+    //
+    // The OTHER reason this comment used to give is obsolete and is not repeated
+    // here: a read file whose deletion left a stale `present` used to fail every
+    // later write, so the advice led to a path that "can never be recreated in
+    // this session". The write path now records the absence itself, so one retry
+    // recreates it. The test is unchanged because the remaining reason is
+    // sufficient on its own.
     await writeFile(join(dir, "nodescribelete.txt"), gbkBytes("原有内容\n"));
 
     const error = await run({
