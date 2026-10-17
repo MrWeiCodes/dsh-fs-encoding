@@ -19,7 +19,7 @@ import { readFile } from "./io.js";
 import { READ_DESCRIPTION, DEFAULT_LIMIT, clipLine, formatReadOutput } from "./prompts.js";
 import { countVisibleLines } from "./line-edit.js";
 import { splitLines } from "./line-endings.js";
-import { execCwd } from "./workspace-context.js";
+import { resolveWorkspace } from "./workspace-context.js";
 
 /** Parse and validate the read arguments, returning a stable shape. */
 function parseArgs(args: Record<string, unknown>): {
@@ -139,23 +139,30 @@ export function buildReadTool(ctx: Context) {
         if (v.warning !== undefined) blocks.push({ type: "text" as const, text: v.warning });
         return blocks;
       },
+      // The client's read card is built from this projection, not from `render`.
+      // `totalLines` is REQUIRED by it: `readMeta` in `dsh-client-ui-tool`
+      // narrows `{ path, offset, lines, totalLines }` and returns `null` when
+      // `totalLines` is not a number, which silently degrades every read to the
+      // generic text card. Measured against the client's own predicate.
       presentationMeta: (_args, value) => {
         const v = value as {
           path: string;
           offset: number;
           lines: Array<{ number: number; text: string }>;
+          totalLines: number;
         };
         return {
           path: v.path,
           offset: v.offset,
           lines: v.lines.map(({ number, text }) => ({ number, text })),
+          totalLines: v.totalLines,
         };
       },
     },
     isConcurrencySafe: () => true,
     async execute(args, exec: ToolExecution) {
       const input = parseArgs((args ?? {}) as Record<string, unknown>);
-      const cwd = execCwd(exec);
+      const cwd = await resolveWorkspace(ctx, exec);
 
       let outcome: Awaited<ReturnType<typeof readFile>>;
       try {

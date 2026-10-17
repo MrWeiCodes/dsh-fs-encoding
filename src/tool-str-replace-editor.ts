@@ -47,7 +47,7 @@ import { parseUndoArgs, performUndo } from "./tool-undo.js";
 import { STR_REPLACE_EDITOR_DESCRIPTION, DEFAULT_LIMIT, clipLine, formatReadOutput } from "./prompts.js";
 import type { EncodingSandbox, FsEscalationArgs } from "./sandbox.js";
 import { emitObservation } from "./sandbox.js";
-import { execCwd } from "./workspace-context.js";
+import { resolveWorkspace } from "./workspace-context.js";
 
 /**
  * The commands this tool answers to.
@@ -228,7 +228,7 @@ export function buildStrReplaceEditorTool(ctx: Context, sandbox: EncodingSandbox
     },
     async execute(args, exec: ToolExecution) {
       const rec = (args ?? {}) as Record<string, unknown>;
-      const cwd = execCwd(exec);
+      const cwd = await resolveWorkspace(ctx, exec);
 
       const command = rec["command"];
       if (typeof command !== "string" || !(COMMANDS as readonly string[]).includes(command)) {

@@ -982,9 +982,11 @@ export async function searchDecodedTextIsolated(
  * instead, in windows bounded by the same cap. See {@link plainUtf8OfFile}.
  *
  * @param ctx - the plugin context, for `fs`.
- * @param exec - the calling execution, for the sandbox and session cwd.
+ * @param exec - the calling execution, for the abort signal.
  * @param path - the path as ripgrep printed it.
  * @param config - the deployment's admission config, for the read cap.
+ * @param cwd - the search's spawn directory, which is what ripgrep printed
+ *   `path` relative to.
  * @returns whether the bytes are strict UTF-8 text with no NUL.
  */
 export async function isPlainUtf8Text(
@@ -992,10 +994,11 @@ export async function isPlainUtf8Text(
   exec: ToolExecution,
   path: string,
   config: PluginConfig,
+  cwd: string,
 ): Promise<boolean> {
   try {
     const fs = ctx.fs;
-    const target = await fs.resolve(path, { cwd: workdirOf(exec) });
+    const target = await fs.resolve(path, { cwd });
     const info = await fs.stat(target, exec.signal);
     if (info === undefined || info.type !== "file") return false;
     const cap = info.size === undefined ? config.maxFileBytes : Math.min(info.size, config.maxFileBytes);
@@ -1108,9 +1111,11 @@ export type ReadAttempt =
  * {@link ReadAttempt} with its reason attached.
  *
  * @param ctx - the plugin context, for `fs`.
- * @param exec - the calling execution, for the sandbox, session cwd and records.
+ * @param exec - the calling execution, for the abort signal and the records.
  * @param path - the path as ripgrep printed it.
  * @param config - the deployment's admission config.
+ * @param cwd - the search's spawn directory, which is what ripgrep printed
+ *   `path` relative to.
  * @returns the decoded text and encoding, or the reason there is none.
  */
 export async function readAndDecode(
@@ -1118,11 +1123,12 @@ export async function readAndDecode(
   exec: ToolExecution,
   path: string,
   config: PluginConfig,
+  cwd: string,
 ): Promise<ReadAttempt> {
   let bytes: Uint8Array | undefined;
   try {
     const fs = ctx.fs;
-    const target = await fs.resolve(path, { cwd: workdirOf(exec) });
+    const target = await fs.resolve(path, { cwd });
     const info = await fs.stat(target, exec.signal);
     if (info === undefined || info.type !== "file") return { error: undefined };
     const cap = info.size === undefined ? config.maxFileBytes : Math.min(info.size, config.maxFileBytes);
@@ -1167,17 +1173,4 @@ export async function readAndDecode(
     if (bytes !== undefined && looksBinary(bytes)) return { error: undefined };
     return { error };
   }
-}
-
-/**
- * The session workspace root a search runs in.
- *
- * Mirrors `runRipgrep`'s own rule in the built-in package: the calling agent's
- * session cwd, never `process.cwd()`, which is the harness's launch directory
- * and would resolve a relative search root against the wrong place.
- *
- * @param exec - the calling tool execution.
- */
-export function workdirOf(exec: ToolExecution): string {
-  return exec.agent?.session.header.cwd ?? process.cwd();
 }

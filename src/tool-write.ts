@@ -20,7 +20,7 @@ import { readFile, writeFile } from "./io.js";
 import { toLF } from "./line-endings.js";
 import { WRITE_DESCRIPTION } from "./prompts.js";
 import type { EncodingSandbox, FsEscalationArgs } from "./sandbox.js";
-import { execCwd } from "./workspace-context.js";
+import { resolveWorkspace } from "./workspace-context.js";
 
 /**
  * The built-in `write` result block, plus how much was written.
@@ -156,7 +156,7 @@ export function buildWriteTool(ctx: Context, sandbox: EncodingSandbox) {
     },
     async execute(args, exec: ToolExecution) {
       const input = parseArgs((args ?? {}) as Record<string, unknown>);
-      const cwd = execCwd(exec);
+      const cwd = await resolveWorkspace(ctx, exec);
       const policy = await sandbox.resolvePolicy(
         "write",
         (args ?? {}) as FsEscalationArgs,

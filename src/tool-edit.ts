@@ -22,7 +22,7 @@ import { countOccurrences } from "./line-edit.js";
 import { toLF } from "./line-endings.js";
 import { EDIT_DESCRIPTION } from "./prompts.js";
 import type { EncodingSandbox, FsEscalationArgs } from "./sandbox.js";
-import { execCwd } from "./workspace-context.js";
+import { resolveWorkspace } from "./workspace-context.js";
 
 function formatEditOutput(displayPath: string, replaceAll: boolean): string {
   return replaceAll
@@ -135,7 +135,7 @@ export function buildEditTool(ctx: Context, sandbox: EncodingSandbox) {
     },
     async execute(args, exec: ToolExecution) {
       const input = parseArgs((args ?? {}) as Record<string, unknown>);
-      const cwd = execCwd(exec);
+      const cwd = await resolveWorkspace(ctx, exec);
       const policy = await sandbox.resolvePolicy("edit", (args ?? {}) as FsEscalationArgs, exec);
 
       let target;

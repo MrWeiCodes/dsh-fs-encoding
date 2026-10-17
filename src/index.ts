@@ -243,7 +243,8 @@ function installAgentTools(rootCtx: Context, agent: Agent): void {
   agent.ctx.effect(() => {
     // `fs` is host-plane: read it off the plugin's own context (covered by
     // `inject`) rather than the agent's scoped one, whose fiber chain does not
-    // declare it. Session cwd still reaches each call via `execCwd`.
+    // declare it. Session cwd still reaches each call via `resolveWorkspace`,
+    // which reads it off the plugin context for the same reason.
     const sandbox = new EncodingSandbox(rootCtx);
     const disposers: Array<() => void> = [];
 

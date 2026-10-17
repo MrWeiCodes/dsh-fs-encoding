@@ -34,7 +34,7 @@ import { readFile, writeFile } from "./io.js";
 import { toLF } from "./line-endings.js";
 import { INSERT_DESCRIPTION } from "./prompts.js";
 import type { EncodingSandbox, FsEscalationArgs } from "./sandbox.js";
-import { execCwd } from "./workspace-context.js";
+import { resolveWorkspace } from "./workspace-context.js";
 
 /** Parse and validate the insert arguments. */
 function parseArgs(args: Record<string, unknown>): {
@@ -127,7 +127,7 @@ export function buildInsertTool(ctx: Context, sandbox: EncodingSandbox) {
     },
     async execute(args, exec: ToolExecution) {
       const input = parseArgs((args ?? {}) as Record<string, unknown>);
-      const cwd = execCwd(exec);
+      const cwd = await resolveWorkspace(ctx, exec);
       const policy = await sandbox.resolvePolicy("insert", (args ?? {}) as FsEscalationArgs, exec);
 
       let target;

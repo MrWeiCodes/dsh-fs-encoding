@@ -30,7 +30,7 @@ import { toLF } from "./line-endings.js";
 import { UNDO_DESCRIPTION } from "./prompts.js";
 import type { EncodingSandbox, FsEscalationArgs } from "./sandbox.js";
 import { clearUndoFor, getUndo } from "./undo-state.js";
-import { execCwd } from "./workspace-context.js";
+import { resolveWorkspace } from "./workspace-context.js";
 
 /** What one undo produced, in the shape the tool result carries. */
 export interface UndoOutcome {
@@ -101,7 +101,7 @@ export async function performUndo(
   toolName: string,
   escalationArgs: FsEscalationArgs = {},
 ): Promise<UndoOutcome> {
-  const cwd = execCwd(exec);
+  const cwd = await resolveWorkspace(ctx, exec);
   const policy = await sandbox.resolvePolicy(toolName, escalationArgs, exec);
 
   let target;

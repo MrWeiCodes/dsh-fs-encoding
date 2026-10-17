@@ -1,6 +1,6 @@
 {
   "name": "dsh-fs-encoding",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "description": "Encoding-governed read/write/edit/grep tools for DeepSeek Harness (dsh): UTF-8 BOM fidelity and byte-exact round-trips for GBK, Big5, Shift-JIS, EUC-KR, Windows-1251 and UTF-16 text files.",
   "keywords": [
     "bom",
@@ -68,14 +68,14 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-agent": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0",
-    "@deepseek-ai/dsh-fs": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0",
-    "@deepseek-ai/dsh-home-paths": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0",
-    "@deepseek-ai/dsh-output-retention": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0",
-    "@deepseek-ai/dsh-sandbox": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0",
-    "@deepseek-ai/dsh-spill": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0",
-    "@deepseek-ai/dsh-tool-fs-search": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0",
-    "@deepseek-ai/dsh-tools": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0"
+    "@deepseek-ai/dsh-agent": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0 || >=0.2.1-alpha.1 <0.3.0",
+    "@deepseek-ai/dsh-fs": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0 || >=0.2.1-alpha.1 <0.3.0",
+    "@deepseek-ai/dsh-home-paths": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0 || >=0.2.1-alpha.1 <0.3.0",
+    "@deepseek-ai/dsh-output-retention": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0 || >=0.2.1-alpha.1 <0.3.0",
+    "@deepseek-ai/dsh-sandbox": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0 || >=0.2.1-alpha.1 <0.3.0",
+    "@deepseek-ai/dsh-spill": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0 || >=0.2.1-alpha.1 <0.3.0",
+    "@deepseek-ai/dsh-tool-fs-search": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0 || >=0.2.1-alpha.1 <0.3.0",
+    "@deepseek-ai/dsh-tools": ">=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-alpha.1 <0.3.0 || >=0.2.1-alpha.1 <0.3.0"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-output-retention": {

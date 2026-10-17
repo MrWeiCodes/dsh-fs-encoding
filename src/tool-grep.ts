@@ -67,11 +67,11 @@ import {
   rgLabelFor,
   searchDecodedTextIsolated,
   utf16NewlineOrder,
-  workdirOf,
   type DecodedMatch,
 } from "./grep-search.js";
 import { GREP_DESCRIPTION } from "./prompts.js";
 import type { SearchKit } from "./search-kit.js";
+import { resolveWorkspace } from "./workspace-context.js";
 
 /**
  * The subset of `ctx.subprocess` this tool calls.
@@ -200,8 +200,12 @@ interface RgRun {
  *
  * @param kit - the loaded search toolkit, for the binary path and the caps.
  * @param subprocess - the seam, already validated by {@link subprocessOf}.
- * @param exec - the calling execution, for the session cwd and the abort signal.
+ * @param exec - the calling execution, for the abort signal.
  * @param argv - ripgrep arguments, excluding the binary and `--no-config`.
+ * @param workdir - the spawn directory, resolved once per tool call by
+ *   {@link resolveWorkspace}. Passed in rather than derived here because every
+ *   run of one search shares it, and because `ctx.fs.resolve` on a path printed
+ *   relative to it needs the same answer.
  * @returns the exit code and the collected stdout/stderr, with `lossy` reporting
  *   whether the seam dropped the HEAD of stdout to fit its cap.
  * @throws when the command cannot be started, or when the caller aborts.
@@ -211,12 +215,13 @@ async function spawnRg(
   subprocess: SubprocessLike,
   exec: ToolExecution,
   argv: readonly string[],
+  workdir: string,
 ): Promise<RgRun> {
   const caps = capsOf(kit);
   const rgPath = await kit.kit.resolveRgPath();
   const handle = subprocess.spawn({
     argv: [rgPath, "--no-config", ...argv],
-    cwd: workdirOf(exec),
+    cwd: workdir,
     stdio: {
       stdin: "ignore",
       stdout: { maxBytes: caps.rawOutputMaxBytes },
@@ -356,6 +361,8 @@ interface SecondPass {
  * @param input - the validated arguments (the pattern and include filter).
  * @param config - the deployment's admission config.
  * @param workdir - the resolved workdir, for display paths.
+ * @param cwd - the spawn directory, which is what ripgrep printed these paths
+ *   relative to.
  */
 async function searchUndecodedFiles(
   ctx: Context,
@@ -366,6 +373,7 @@ async function searchUndecodedFiles(
   input: { pattern: string; include?: string },
   config: PluginConfig,
   workdir: string,
+  cwd: string,
 ): Promise<SecondPass> {
   const matches: DecodedMatch[] = [];
   const unresolved: UnresolvedFile[] = [];
@@ -375,7 +383,7 @@ async function searchUndecodedFiles(
     // No `try` here: `readAndDecode` answers with a value for every outcome,
     // including an aborted read, which is one unresolved file rather than a
     // failed search — the same disposition the rest of this loop takes.
-    const attempt = await readAndDecode(ctx, exec, file, config);
+    const attempt = await readAndDecode(ctx, exec, file, config, cwd);
     if ("error" in attempt) {
       // `decoded` travels with the refusal rather than being re-derived here:
       // it is the one thing the caller's placeholder loop cannot see for itself,
@@ -429,7 +437,7 @@ async function searchUndecodedFiles(
       // cap is refused, and a file over the cap is refused before the NUL is
       // even reached — the four shapes (under/over the cap × NUL present/absent)
       // admit only the one with no NUL at all.
-      const run = await spawnRg(kit, subprocess, exec, [`--encoding=${label}`, ...argv]);
+      const run = await spawnRg(kit, subprocess, exec, [`--encoding=${label}`, ...argv], cwd);
       // A truncated stream is a SUFFIX of this file's rows, so it is not the
       // complete answer for the file. The file is reported as unresolved instead
       // of being answered with a partial list: the placeholder it keeps is
@@ -525,17 +533,19 @@ interface GrepValue {
  * off the run whose target ripgrep is about to reject anyway.
  *
  * @param ctx - the plugin context, for `fs`.
- * @param exec - the calling execution, for the cwd and the abort signal.
+ * @param exec - the calling execution, for the abort signal.
  * @param path - the caller's search target, when one was given.
+ * @param cwd - the directory a relative `path` resolves against.
  */
 async function isExplicitFile(
   ctx: Context,
   exec: ToolExecution,
   path: string | undefined,
+  cwd: string,
 ): Promise<boolean> {
   if (path === undefined) return false;
   try {
-    const target = await ctx.fs.resolve(path, { cwd: workdirOf(exec) });
+    const target = await ctx.fs.resolve(path, { cwd });
     const info = await ctx.fs.stat(target, exec.signal);
     return info?.type === "file";
   } catch (error) {
@@ -681,6 +691,8 @@ function contradictedLines(
  * @param encodings - the canonical names to try, in order.
  * @param config - the deployment's admission config, for the read cap.
  * @param workdir - the resolved workdir, for display paths.
+ * @param cwd - the spawn directory, which is what ripgrep prints its paths
+ *   relative to.
  */
 async function searchByTranscoding(
   kit: SearchKit,
@@ -691,6 +703,7 @@ async function searchByTranscoding(
   encodings: readonly string[],
   config: PluginConfig,
   workdir: string,
+  cwd: string,
 ): Promise<SweepResult> {
   const labels: Array<{ encoding: string; label: string }> = [];
   for (const encoding of encodings) {
@@ -699,7 +712,7 @@ async function searchByTranscoding(
   }
   // Resolved once for the whole sweep rather than per encoding: the answer is a
   // property of the caller's target, not of the encoding being tried.
-  const byteLines = await isExplicitFile(ctx, exec, input.path);
+  const byteLines = await isExplicitFile(ctx, exec, input.path, cwd);
   // How many runs ripgrep actually started, and how many of those it refused
   // with its own error channel. Kept to tell "one encoding's run failed" from
   // "the pattern is not a regex at all": the first is why the loop continues,
@@ -741,7 +754,7 @@ async function searchByTranscoding(
         ...(byteLines ? ["-a"] : []),
         `--encoding=${label}`,
         ...argv,
-      ]);
+      ], cwd);
     } catch (error) {
       if (exec.signal.aborted) throw error;
       firstLaunchError ??= error;
@@ -793,7 +806,7 @@ async function searchByTranscoding(
     for (const path of proved) {
       let plain = plainUtf8.get(path);
       if (plain === undefined) {
-        plain = await isPlainUtf8Text(ctx, exec, path, config);
+        plain = await isPlainUtf8Text(ctx, exec, path, config, cwd);
         plainUtf8.set(path, plain);
       }
       if (plain) continue;
@@ -809,7 +822,7 @@ async function searchByTranscoding(
       if (encoding === "utf16le" || encoding === "utf16be") {
         let order = orderCache.get(path);
         if (order === undefined) {
-          order = await utf16OrderOfFile(ctx, exec, path, config);
+          order = await utf16OrderOfFile(ctx, exec, path, config, cwd);
           orderCache.set(path, order);
         }
         if (order !== encoding) continue;
@@ -1011,6 +1024,8 @@ async function searchByTranscoding(
  * @param subprocess - the validated seam.
  * @param exec - the calling execution.
  * @param input - the validated arguments, for the search root and include filter.
+ * @param cwd - the spawn directory, which is what the returned paths are
+ *   relative to.
  * @returns the absolute paths of the UTF-32 files found.
  */
 async function findUtf32Files(
@@ -1018,13 +1033,14 @@ async function findUtf32Files(
   subprocess: SubprocessLike,
   exec: ToolExecution,
   input: { path?: string; include?: string },
+  cwd: string,
 ): Promise<string[]> {
   const argv = ["--files-with-matches", "-a", "--encoding=none", `--regexp=${UTF32_BOM_PATTERN}`];
   if (input.include !== undefined) argv.push(`--glob=${input.include}`);
   if (input.path !== undefined) argv.push("--", input.path);
   let run: RgRun;
   try {
-    run = await spawnRg(kit, subprocess, exec, argv);
+    run = await spawnRg(kit, subprocess, exec, argv, cwd);
   } catch (error) {
     if (exec.signal.aborted) throw error;
     return [];
@@ -1057,6 +1073,8 @@ async function findUtf32Files(
  * @param input - the validated arguments.
  * @param config - the deployment's admission config.
  * @param workdir - the resolved workdir, for display paths.
+ * @param cwd - the spawn directory, which is what ripgrep printed these paths
+ *   relative to.
  */
 async function searchUtf32Files(
   kit: SearchKit,
@@ -1066,16 +1084,17 @@ async function searchUtf32Files(
   input: { pattern: string; path?: string; include?: string },
   config: PluginConfig,
   workdir: string,
+  cwd: string,
 ): Promise<DecodedMatch[]> {
-  const files = await findUtf32Files(kit, subprocess, exec, input);
+  const files = await findUtf32Files(kit, subprocess, exec, input, cwd);
   const out: DecodedMatch[] = [];
   for (const file of files) {
     // ripgrep prints the path relative to the spawn cwd when the search root was
     // relative, and absolute when it was absolute. `ctx.fs.resolve` handles both
-    // against the session cwd, so no rewriting is needed here — but the DISPLAY
+    // against that same cwd, so no rewriting is needed here — but the DISPLAY
     // path has to be derived from what ripgrep printed, not from the resolved
     // target, so the two agree with the rest of the results.
-    const attempt = await readAndDecode(ctx, exec, file, config);
+    const attempt = await readAndDecode(ctx, exec, file, config, cwd);
     // A file that cannot be read is simply not reported by this pass, exactly as
     // before — the reason is of no use here, since this path has no placeholder
     // to enrich.
@@ -1190,6 +1209,8 @@ async function searchUtf32Files(
  * @param input - the validated arguments.
  * @param config - the deployment's admission config.
  * @param workdir - the resolved workdir, for display paths.
+ * @param cwd - the spawn directory, which is what ripgrep prints its paths
+ *   relative to.
  * @param owned - display paths an earlier pass already decoded.
  * @param refusedCandidates - the candidate list an earlier pass already refused a
  *   line with, keyed by `(displayPath, lineNumber)`. See the `tied` branch.
@@ -1202,6 +1223,7 @@ async function searchUnicodeFiles(
   input: { pattern: string; path?: string; include?: string },
   config: PluginConfig,
   workdir: string,
+  cwd: string,
   owned: ReadonlySet<string>,
   refusedCandidates: ReadonlyMap<string, readonly string[]>,
 ): Promise<DecodedMatch[]> {
@@ -1214,7 +1236,7 @@ async function searchUnicodeFiles(
       run = await spawnRg(kit, subprocess, exec, [
         `--encoding=${label}`,
         ...kit.kit.buildGrepCommand(input),
-      ]);
+      ], cwd);
     } catch (error) {
       if (exec.signal.aborted) throw error;
       continue;
@@ -1236,7 +1258,7 @@ async function searchUnicodeFiles(
       const displayPath = kit.kit.toWorkdirRelative(raw.path, workdir);
       if (owned.has(displayPath)) continue;
       if (!orderByPath.has(raw.path)) {
-        orderByPath.set(raw.path, await utf16OrderOfFile(ctx, exec, raw.path, config));
+        orderByPath.set(raw.path, await utf16OrderOfFile(ctx, exec, raw.path, config, cwd));
       }
       const order = orderByPath.get(raw.path);
       // `not-text` is a UTF-32 file, an unreadable path, or a file whose own
@@ -1529,18 +1551,21 @@ async function utf16BytesOfFile(
  * file the cap refused from landing here.
  *
  * @param ctx - the plugin context, for `fs`.
- * @param exec - the calling execution, for the cwd and the abort signal.
+ * @param exec - the calling execution, for the abort signal.
  * @param file - the path as ripgrep printed it.
  * @param config - the deployment's admission config, for the read cap.
+ * @param cwd - the spawn directory, which is what ripgrep printed `file`
+ *   relative to.
  */
 async function utf16OrderOfFile(
   ctx: Context,
   exec: ToolExecution,
   file: string,
   config: PluginConfig,
+  cwd: string,
 ): Promise<Utf16Order> {
   try {
-    const target = await ctx.fs.resolve(file, { cwd: workdirOf(exec) });
+    const target = await ctx.fs.resolve(file, { cwd });
     const info = await ctx.fs.stat(target, exec.signal);
     if (info === undefined || info.type !== "file") return "not-text";
     const cap =
@@ -1634,7 +1659,13 @@ export function buildGrepTool(ctx: Context, kit: SearchKit, subprocess: Subproce
         args as { pattern: string; path?: string; include?: string },
       );
       const config = loadConfig();
-      const workdir = workdirOf(exec);
+      // Resolved ONCE for the whole call, and threaded through every pass.
+      // `resolveWorkspace` may perform a filesystem round-trip and can append a
+      // recovery notice, so deriving it per file would pay that for one answer —
+      // and, worse, two passes of the SAME search could disagree if the
+      // directory changed between them.
+      const cwd = await resolveWorkspace(ctx, exec);
+      const workdir = cwd;
 
       // A non-ASCII pattern needs the transcoding strategy: the default call
       // cannot match it in any file whose encoding is not UTF-8, so there would
@@ -1682,6 +1713,7 @@ export function buildGrepTool(ctx: Context, kit: SearchKit, subprocess: Subproce
           legacy,
           config,
           workdir,
+          cwd,
         );
         for (const match of sweep.matches) proven.push(match);
         for (const file of sweep.conflicted) conflicted.push(file);
@@ -1689,7 +1721,7 @@ export function buildGrepTool(ctx: Context, kit: SearchKit, subprocess: Subproce
 
       // Pass 1: exactly the built-in's call. Everything ripgrep can already read
       // is adopted here, which is every line of a UTF-8 repository.
-      const first = await spawnRg(kit, subprocess, exec, kit.kit.buildGrepCommand(input));
+      const first = await spawnRg(kit, subprocess, exec, kit.kit.buildGrepCommand(input), cwd);
       // The order is the built-in's: a non-zero exit is its own actionable error
       // (an invalid regex names itself on stderr), and only then is the retained
       // stdout checked. A `lossy` stream is a SUFFIX of the real output — the
@@ -1784,7 +1816,7 @@ export function buildGrepTool(ctx: Context, kit: SearchKit, subprocess: Subproce
       // in such a file is not an undecodable ROW — it is no row at all. They are
       // found by their BOM and searched in JavaScript, and their hits merge in
       // alongside everything else.
-      const utf32 = await searchUtf32Files(kit, ctx, subprocess, exec, input, config, workdir);
+      const utf32 = await searchUtf32Files(kit, ctx, subprocess, exec, input, config, workdir, cwd);
 
       // Which files still need the per-file pass: the ones with an undecodable
       // row that the sweep did not cover, plus every conflicted file.
@@ -1880,6 +1912,7 @@ export function buildGrepTool(ctx: Context, kit: SearchKit, subprocess: Subproce
           input,
           config,
           workdir,
+          cwd,
           owned,
           EMPTY_REFUSALS,
         );
@@ -1900,6 +1933,7 @@ export function buildGrepTool(ctx: Context, kit: SearchKit, subprocess: Subproce
         input,
         config,
         workdir,
+        cwd,
       );
 
       // A file pass 2 decoded is owned too. Its rows are the answer for that
@@ -1995,6 +2029,7 @@ export function buildGrepTool(ctx: Context, kit: SearchKit, subprocess: Subproce
         input,
         config,
         workdir,
+        cwd,
         owned,
         conflictedLines,
       );
