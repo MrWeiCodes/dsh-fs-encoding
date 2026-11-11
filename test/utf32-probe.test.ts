@@ -10,7 +10,7 @@
  *
  * A genuine UTF-32LE file and a genuine UTF-16LE file whose first character is
  * U+0000 are byte-identical in their first four bytes. No probe can separate
- * them, so that one file is deliberately absent here — see the note in
+ * them, so that one file is deliberately absent here — the trade is stated in
  * `findUtf32Files`.
  */
 
@@ -176,5 +176,72 @@ describe("utf32 probe: names the mark, not the byte sequence", () => {
       Buffer.concat([Buffer.from("xxxx"), Buffer.from([0x00, 0x00, 0xfe, 0xff])]),
     );
     expect(probe(dir).sort()).toEqual(["mixed/real-be.txt", "mixed/real-le.txt"]);
+  });
+});
+
+describe("utf32 probe: --max-filesize bounds the walker only", () => {
+  /**
+   * The file's own path, searched with a cap far below its size.
+   *
+   * This is the shape `findUtf32Files` passes when the model names one file,
+   * and it is the case `--max-filesize` does not cover: the flag is applied by
+   * the directory walker, so a root named on the command line is searched no
+   * matter how large it is.
+   */
+  function probeFileWithCap(file: string, cap: number): string[] {
+    let stdout: string;
+    try {
+      stdout = execFileSync(
+        rgPath,
+        ["--no-config", ...utf32ProbeArgv({}, cap), "--", file],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+      );
+    } catch (error) {
+      const status = (error as { status?: number }).status;
+      if (status !== 1) throw error;
+      stdout = String((error as { stdout?: string }).stdout ?? "");
+    }
+    return stdout.split("\n").filter((line) => line.length > 0);
+  }
+
+  it("still names an oversized file when that file IS the search root", () => {
+    // Pinning the limitation rather than the fix: this is why `findUtf32Files`
+    // cannot rely on the argv alone, and it fails if ripgrep ever starts
+    // honouring the cap for a named root — at which point the extra stat in
+    // `fileRootExceedsCap` becomes dead weight worth removing.
+    const dir = join(root, "rootfile");
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, "big.bin");
+    writeFileSync(
+      file,
+      Buffer.concat([Buffer.from([0xff, 0xfe, 0x00, 0x00]), Buffer.alloc(4096, 0x41)]),
+    );
+    expect(probeFileWithCap(file, 16)).toHaveLength(1);
+  });
+
+  it("names a file inside the cap when that file is the search root", () => {
+    // The same root, under a cap it fits in: the probe answers normally, so the
+    // check above is about the cap and not about file roots being refused
+    // wholesale.
+    const dir = join(root, "rootfile-small");
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, "small.txt");
+    writeFileSync(
+      file,
+      Buffer.concat([Buffer.from([0xff, 0xfe, 0x00, 0x00]), utf32("ok\n", true)]),
+    );
+    expect(probeFileWithCap(file, 10 * 1024 * 1024)).toHaveLength(1);
+  });
+
+  it("skips an oversized file under a directory root", () => {
+    // The walker half, which the flag does cover: the same oversized file is
+    // dropped when the root is its parent directory.
+    const dir = join(root, "walked");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "big.bin"),
+      Buffer.concat([Buffer.from([0xff, 0xfe, 0x00, 0x00]), Buffer.alloc(4096, 0x41)]),
+    );
+    expect(probeFileWithCap(dir, 16)).toEqual([]);
   });
 });

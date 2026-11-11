@@ -1013,14 +1013,21 @@ async function searchByTranscoding(
  * `(?-u)`-anchored because ripgrep's default Unicode mode would reject the raw
  * byte escapes, and `--encoding=none` keeps the search on the bytes themselves.
  * Measured against a directory holding UTF-32LE, UTF-32BE, UTF-16LE, UTF-8-BOM,
- * GBK and plain ASCII files, the alternation named exactly the two UTF-32 files
- * and nothing else — so it is a precise trigger, not a heuristic.
+ * GBK and plain ASCII files, the anchored alternation named exactly the two
+ * UTF-32 files and nothing else.
+ *
+ * One ambiguity is irreducible and is NOT a defect in the pattern: a UTF-32LE
+ * mark and a UTF-16LE file whose first code unit is U+0000 are the same four
+ * bytes. No test on the bytes can separate them, so such a file is named as
+ * UTF-32 and then decoded as such. The reverse trade would lose every UTF-32
+ * file, which is the case this pass exists for.
  *
  * The mark is required. A BOM-less UTF-32 file is genuinely undetectable here
  * (nothing distinguishes its bytes from binary), which is the same limit the
  * plugin's own admission has.
  *
  * @param kit - the loaded search toolkit.
+ * @param ctx - the plugin context, for the file-root size check.
  * @param subprocess - the validated seam.
  * @param exec - the calling execution.
  * @param input - the validated arguments, for the search root and include filter.
@@ -1031,12 +1038,18 @@ async function searchByTranscoding(
  */
 async function findUtf32Files(
   kit: SearchKit,
+  ctx: Context,
   subprocess: SubprocessLike,
   exec: ToolExecution,
   input: { path?: string; include?: string },
   config: PluginConfig,
   cwd: string,
 ): Promise<string[]> {
+  // The cap in the argv is a WALKER filter, so a search root that is itself a
+  // file bypasses it. See {@link fileRootExceedsCap}.
+  if (input.path !== undefined && (await fileRootExceedsCap(ctx, exec, input.path, config, cwd))) {
+    return [];
+  }
   const argv = [...utf32ProbeArgv(input, config.maxFileBytes)];
   if (input.path !== undefined) argv.push("--", input.path);
   let run: RgRun;
@@ -1056,17 +1069,63 @@ async function findUtf32Files(
 }
 
 /**
+ * Whether the search root is a single file over the read cap.
+ *
+ * `--max-filesize` is enforced by ripgrep's DIRECTORY WALKER, so it never sees
+ * a root named on the command line: measured, a 4804-byte file searched through
+ * `--max-filesize=100` still matched, and a 1 GiB file named as the root peaked
+ * at 1030 MB with the flag exactly as without it. The probe therefore has to
+ * refuse such a root itself.
+ *
+ * Refusing is the same answer admission would give. A file over `maxFileBytes`
+ * fails `readAndDecode` with `FS_TOO_LARGE` regardless, so the per-file search
+ * this probe feeds would have discarded the file anyway — the only thing the
+ * check changes is whether ripgrep buffers it first.
+ *
+ * A root that is not a file — a directory, or a path that cannot be statted —
+ * answers `false` and is left to ripgrep, whose own error reporting is what the
+ * caller already handles.
+ *
+ * @param ctx - the plugin context, for `fs`.
+ * @param exec - the calling execution, for the abort signal.
+ * @param path - the search root as the model supplied it.
+ * @param config - the deployment's admission config, for the read cap.
+ * @param cwd - the spawn directory, which is what `path` resolves against.
+ * @returns whether the root is a file that the cap refuses.
+ */
+async function fileRootExceedsCap(
+  ctx: Context,
+  exec: ToolExecution,
+  path: string,
+  config: PluginConfig,
+  cwd: string,
+): Promise<boolean> {
+  try {
+    const target = await ctx.fs.resolve(path, { cwd });
+    const info = await ctx.fs.stat(target, exec.signal);
+    if (info === undefined || info.type !== "file") return false;
+    // An unknown size cannot be compared, and refusing on ignorance would drop
+    // a file that may well be inside the cap. ripgrep is left to read it; the
+    // per-file pass still refuses it afterwards if admission does.
+    return info.size !== undefined && info.size > config.maxFileBytes;
+  } catch (error) {
+    if (exec.signal.aborted) throw error;
+    return false;
+  }
+}
+
+/**
  * The ripgrep arguments that name every UTF-32 file, minus the search root.
  *
  * Exported so the probe's own semantics can be pinned by a test: the pattern and
  * the flags are one unit, and getting either wrong is what made this probe name
  * hundreds of files that were not UTF-32.
  *
- * `--max-filesize` is part of the unit because {@link UTF32_BOM_PROBE_FLAGS}
- * turns the search into a whole-file haystack: under a DIRECTORY the walker has
- * no mmap path, so every file it visits is read into memory whole. Files above
- * the cap are already refused by admission (`FS_TOO_LARGE`), so skipping them
- * here loses nothing that could have been decoded.
+ * `--max-filesize` bounds the DIRECTORY walk, where `-a` makes ripgrep read every
+ * file it visits — binaries included — into memory. It does NOT bound a search
+ * root that is itself a file; {@link fileRootExceedsCap} covers that case. Files
+ * above the cap are already refused by admission (`FS_TOO_LARGE`), so skipping
+ * them here loses nothing that could have been decoded.
  *
  * @param input - the validated arguments, for the include filter.
  * @param maxFileBytes - the deployment's whole-file read cap.
@@ -1117,7 +1176,7 @@ async function searchUtf32Files(
   workdir: string,
   cwd: string,
 ): Promise<DecodedMatch[]> {
-  const files = await findUtf32Files(kit, subprocess, exec, input, config, cwd);
+  const files = await findUtf32Files(kit, ctx, subprocess, exec, input, config, cwd);
   const out: DecodedMatch[] = [];
   for (const file of files) {
     // ripgrep prints the path relative to the spawn cwd when the search root was
@@ -2270,13 +2329,17 @@ const UTF32_BOM_PATTERN = "(?-u)\\A(\\xff\\xfe\\x00\\x00|\\x00\\x00\\xfe\\xff)";
  * Flags that make `\A` anchor to the start of the FILE.
  *
  * `--multiline` makes ripgrep treat the file as one haystack rather than a line
- * at a time, which is the only way `\A` reaches past line 1. `-U` is its short
- * form and is passed alongside because the flag has changed spelling across
- * ripgrep releases; both name the same behaviour.
+ * at a time, which is the only way `\A` reaches past line 1.
  *
- * The whole-file haystack is why {@link utf32ProbeArgv} carries
- * `--max-filesize`: a directory search has no mmap path, so every file the
- * walker visits is loaded into memory whole, and `-a` puts binaries in that set
- * too.
+ * `-U` is the same flag's short form and is redundant beside `--multiline`; it
+ * is passed because it is the spelling used throughout ripgrep's own help text
+ * and error messages, so a log line showing the probe's argv reads like the
+ * documentation the next reader will consult.
+ *
+ * Multiline mode is NOT what makes this probe read whole files. Ripgrep skips
+ * that buffering when the pattern cannot match a newline, and this one cannot —
+ * measured on a 400 MiB file, peak working set was 418 MiB with `-a` alone and
+ * 408 MiB with `-a -U`. The buffering is `-a`'s doing: it asks for the binary
+ * contents to be searched as text, which ripgrep will not do line-by-line.
  */
 const UTF32_BOM_PROBE_FLAGS = ["-U", "--multiline"] as const;
