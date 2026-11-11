@@ -291,6 +291,9 @@ $DSH_HOME/plugins/dsh-fs-encoding/config.yaml
 | `supportedEncodings` | 内置清单 | **参与自动猜测**的编码清单 |
 | `excludeEncodings` | 空 | 从内置清单里**去掉**几个编码 |
 | `maxFileBytes` | 10 MiB | 单个文件的读取上限 |
+| `grepTimeoutMs` | 内置 `grep` 的默认预算 | `grep` 的超时时间（毫秒） |
+
+> `grepTimeoutMs` 不设置时，用的是内置 `grep` 的**默认**预算。如果部署把内置 `grep` 自己的 `timeoutMs` 改成了别的值，本插件不会自动跟随，需要在这里一并设置。
 
 ### 常见需求（直接抄）
 
@@ -339,6 +342,7 @@ excludeEncodings: [windows-1251]
 | `DSH_FS_ENCODING_NORMALIZE_TO_UTF8` | `normalizeToUtf8` |
 | `DSH_FS_ENCODING_SUPPORTED_ENCODINGS` | `supportedEncodings` |
 | `DSH_FS_ENCODING_MAX_FILE_BYTES` | `maxFileBytes` |
+| `DSH_FS_ENCODING_GREP_TIMEOUT_MS` | `grepTimeoutMs` |
 
 `excludeEncodings` **没有**环境变量——它是唯一只能在配置文件里写的选项。
 

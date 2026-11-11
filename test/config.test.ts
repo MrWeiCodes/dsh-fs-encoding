@@ -40,6 +40,7 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env["DSH_HOME"];
   delete process.env["DSH_FS_ENCODING_SUPPORTED_ENCODINGS"];
+  delete process.env["DSH_FS_ENCODING_GREP_TIMEOUT_MS"];
   resetConfigCache();
   rmSync(home, { recursive: true, force: true });
 });
@@ -238,5 +239,45 @@ describe("excludeEncodings", () => {
     expect(loadWith("excludeEncodings: [latin1]\n").supportedEncodings).not.toContain(
       "iso-8859-1",
     );
+  });
+});
+
+describe("grepTimeoutMs", () => {
+  it("is unset by default, so the built-in's own budget applies", () => {
+    // The shadow must time out exactly like the tool it replaces until someone
+    // says otherwise; a hardcoded default here would silently diverge from
+    // SEARCH_TIMEOUT_MS on the next release of the toolkit.
+    expect(loadWith().grepTimeoutMs).toBeUndefined();
+    expect(loadWith(DEFAULT_CONFIG_YAML).grepTimeoutMs).toBeUndefined();
+  });
+
+  it("reads the config-file key", () => {
+    expect(loadWith("grepTimeoutMs: 120000\n").grepTimeoutMs).toBe(120000);
+  });
+
+  it("lets the environment override the file", () => {
+    process.env["DSH_FS_ENCODING_GREP_TIMEOUT_MS"] = "600000";
+    expect(loadWith("grepTimeoutMs: 120000\n").grepTimeoutMs).toBe(600000);
+  });
+
+  it("ignores a value that is not a positive integer", () => {
+    // `defineTool` rejects a non-positive timeout at registration, which would
+    // take the whole tool down over a config typo. A bad value therefore falls
+    // back to the toolkit's own budget instead.
+    expect(loadWith("grepTimeoutMs: 0\n").grepTimeoutMs).toBeUndefined();
+    expect(loadWith("grepTimeoutMs: -1\n").grepTimeoutMs).toBeUndefined();
+    expect(loadWith("grepTimeoutMs: not-a-number\n").grepTimeoutMs).toBeUndefined();
+    expect(loadWith("grepTimeoutMs: 1.5\n").grepTimeoutMs).toBeUndefined();
+  });
+
+  it("ignores a value no timer can schedule", () => {
+    // A value above the timer bound registers fine and then throws inside the
+    // tool-call timeout policy on EVERY call, which takes `grep` down for the
+    // life of the process — the opposite of what "effectively no timeout" is
+    // meant to buy. The bound applies to both sources, so a bad environment
+    // value cannot reintroduce it either.
+    expect(loadWith("grepTimeoutMs: 2147483648\n").grepTimeoutMs).toBeUndefined();
+    process.env["DSH_FS_ENCODING_GREP_TIMEOUT_MS"] = "3000000000";
+    expect(loadWith().grepTimeoutMs).toBeUndefined();
   });
 });

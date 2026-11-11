@@ -1024,6 +1024,7 @@ async function searchByTranscoding(
  * @param subprocess - the validated seam.
  * @param exec - the calling execution.
  * @param input - the validated arguments, for the search root and include filter.
+ * @param config - the deployment's admission config, for the probe's file-size cap.
  * @param cwd - the spawn directory, which is what the returned paths are
  *   relative to.
  * @returns the absolute paths of the UTF-32 files found.
@@ -1033,10 +1034,10 @@ async function findUtf32Files(
   subprocess: SubprocessLike,
   exec: ToolExecution,
   input: { path?: string; include?: string },
+  config: PluginConfig,
   cwd: string,
 ): Promise<string[]> {
-  const argv = ["--files-with-matches", "-a", "--encoding=none", `--regexp=${UTF32_BOM_PATTERN}`];
-  if (input.include !== undefined) argv.push(`--glob=${input.include}`);
+  const argv = [...utf32ProbeArgv(input, config.maxFileBytes)];
   if (input.path !== undefined) argv.push("--", input.path);
   let run: RgRun;
   try {
@@ -1052,6 +1053,36 @@ async function findUtf32Files(
   if (run.stdoutLossy) return [];
   if (run.exitCode !== 0 && run.exitCode !== 1) return [];
   return run.stdout.split("\n").filter((line) => line.length > 0);
+}
+
+/**
+ * The ripgrep arguments that name every UTF-32 file, minus the search root.
+ *
+ * Exported so the probe's own semantics can be pinned by a test: the pattern and
+ * the flags are one unit, and getting either wrong is what made this probe name
+ * hundreds of files that were not UTF-32.
+ *
+ * `--max-filesize` is part of the unit because {@link UTF32_BOM_PROBE_FLAGS}
+ * turns the search into a whole-file haystack: under a DIRECTORY the walker has
+ * no mmap path, so every file it visits is read into memory whole. Files above
+ * the cap are already refused by admission (`FS_TOO_LARGE`), so skipping them
+ * here loses nothing that could have been decoded.
+ *
+ * @param input - the validated arguments, for the include filter.
+ * @param maxFileBytes - the deployment's whole-file read cap.
+ * @returns the arguments, before the search root is appended.
+ */
+export function utf32ProbeArgv(input: { include?: string }, maxFileBytes: number): string[] {
+  const argv = [
+    "--files-with-matches",
+    "-a",
+    ...UTF32_BOM_PROBE_FLAGS,
+    `--max-filesize=${maxFileBytes}`,
+    "--encoding=none",
+    `--regexp=${UTF32_BOM_PATTERN}`,
+  ];
+  if (input.include !== undefined) argv.push(`--glob=${input.include}`);
+  return argv;
 }
 
 /**
@@ -1086,7 +1117,7 @@ async function searchUtf32Files(
   workdir: string,
   cwd: string,
 ): Promise<DecodedMatch[]> {
-  const files = await findUtf32Files(kit, subprocess, exec, input, cwd);
+  const files = await findUtf32Files(kit, subprocess, exec, input, config, cwd);
   const out: DecodedMatch[] = [];
   for (const file of files) {
     // ripgrep prints the path relative to the spawn cwd when the search root was
@@ -1587,6 +1618,12 @@ async function utf16OrderOfFile(
  */
 export function buildGrepTool(ctx: Context, kit: SearchKit, subprocess: SubprocessLike) {
   const caps = capsOf(kit);
+  // The declared timeout is part of the tool DEFINITION, so the deployment's
+  // override is read once at registration rather than per call. Unset means the
+  // toolkit's own constant — the built-in's budget under default configuration,
+  // not whatever a deployment set for the built-in itself, whose config is not
+  // readable here (see `capsOf`).
+  const declaredTimeoutMs = loadConfig().grepTimeoutMs ?? caps.timeoutMs;
   return defineTool({
     name: "grep",
     description: GREP_DESCRIPTION,
@@ -1607,7 +1644,7 @@ export function buildGrepTool(ctx: Context, kit: SearchKit, subprocess: Subproce
           'One glob filter for which files to search (e.g. "*.ts", "*.{js,jsx}"). Not a list; negation is not supported.',
       },
     },
-    timeoutMs: caps.timeoutMs,
+    timeoutMs: declaredTimeoutMs,
     output: {
       schema: {
         type: "object",
@@ -2218,5 +2255,28 @@ const EMPTY_REFUSALS: ReadonlyMap<string, readonly string[]> = new Map();
  * `(?-u)` disables ripgrep's Unicode mode, which is what allows raw byte escapes
  * at all; without it the pattern is rejected as a bad escape. Both byte orders
  * are covered because a file may be either.
+ *
+ * `\A` is what makes this a mark test rather than a substring test, and it is
+ * load-bearing: the same alternation without it matches the four bytes ANYWHERE,
+ * which a UTF-16LE mark (`FF FE`) followed by a NUL pair satisfies.
+ *
+ * `\A` only means "start of file" under {@link UTF32_BOM_PROBE_FLAGS}. Without
+ * multiline mode ripgrep runs the pattern once per LINE and `\A` anchors to the
+ * start of each, which is why an offset-11 mark still matched.
  */
-const UTF32_BOM_PATTERN = "(?-u)(\\xff\\xfe\\x00\\x00|\\x00\\x00\\xfe\\xff)";
+const UTF32_BOM_PATTERN = "(?-u)\\A(\\xff\\xfe\\x00\\x00|\\x00\\x00\\xfe\\xff)";
+
+/**
+ * Flags that make `\A` anchor to the start of the FILE.
+ *
+ * `--multiline` makes ripgrep treat the file as one haystack rather than a line
+ * at a time, which is the only way `\A` reaches past line 1. `-U` is its short
+ * form and is passed alongside because the flag has changed spelling across
+ * ripgrep releases; both name the same behaviour.
+ *
+ * The whole-file haystack is why {@link utf32ProbeArgv} carries
+ * `--max-filesize`: a directory search has no mmap path, so every file the
+ * walker visits is loaded into memory whole, and `-a` puts binaries in that set
+ * too.
+ */
+const UTF32_BOM_PROBE_FLAGS = ["-U", "--multiline"] as const;

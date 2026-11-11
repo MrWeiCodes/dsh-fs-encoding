@@ -291,6 +291,9 @@ $DSH_HOME/plugins/dsh-fs-encoding/config.yaml
 | `supportedEncodings` | built-in list | The encodings considered by **automatic guessing** |
 | `excludeEncodings` | empty | **Remove** a few encodings from the built-in list |
 | `maxFileBytes` | 10 MiB | Read size limit for a single file |
+| `grepTimeoutMs` | built-in `grep`'s default budget | Timeout for `grep`, in milliseconds |
+
+> With `grepTimeoutMs` unset, the budget is the built-in `grep`'s **default**. If a deployment overrides the built-in `grep`'s own `timeoutMs`, this plugin does not follow it — set this key as well.
 
 ### Common needs (copy and paste)
 
@@ -339,6 +342,7 @@ Useful for a quick test or a container deployment. **An environment override alw
 | `DSH_FS_ENCODING_NORMALIZE_TO_UTF8` | `normalizeToUtf8` |
 | `DSH_FS_ENCODING_SUPPORTED_ENCODINGS` | `supportedEncodings` |
 | `DSH_FS_ENCODING_MAX_FILE_BYTES` | `maxFileBytes` |
+| `DSH_FS_ENCODING_GREP_TIMEOUT_MS` | `grepTimeoutMs` |
 
 `excludeEncodings` has **no** environment variable — it is the only option that lives in the config file alone.
 

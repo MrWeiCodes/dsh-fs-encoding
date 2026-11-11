@@ -59,6 +59,22 @@ export interface PluginConfig {
   excludeEncodings: string[];
   /** Inclusive byte cap for a whole-file read; larger files fail loud. */
   maxFileBytes: number;
+  /**
+   * Override for the `grep` tool's declared timeout, in milliseconds.
+   *
+   * `undefined` uses the search toolkit's own `SEARCH_TIMEOUT_MS`, which is the
+   * budget the built-in `grep` has under default configuration. A deployment that
+   * overrides the built-in's own `timeoutMs` is NOT followed — see `capsOf` for
+   * why that config is unreadable here — so such a deployment has to set this key
+   * as well. A deployment overrides it when its trees are large enough that the
+   * shipped budget is spent before the encoding-aware path finishes: that path
+   * pays a per-file decode on top of ripgrep's own run, and a cold cache on
+   * Windows can push a wide search past the default on its own.
+   *
+   * Read when the tool is REGISTERED, not per call — the declared timeout is
+   * part of the tool definition — so changing this key needs the plugin reloaded.
+   */
+  grepTimeoutMs: number | undefined;
 }
 
 const DEFAULT_CONFIG: PluginConfig = {
@@ -67,6 +83,7 @@ const DEFAULT_CONFIG: PluginConfig = {
   supportedEncodings: [...DEFAULT_SUPPORTED_ENCODINGS],
   excludeEncodings: [],
   maxFileBytes: 10 * 1024 * 1024,
+  grepTimeoutMs: undefined,
 };
 
 /** Commented YAML written on first load so the file is discoverable and editable. */
@@ -104,6 +121,14 @@ normalizeToUtf8: false
 
 # Inclusive byte cap for reading a whole file into memory (default 10485760 = 10 MiB).
 maxFileBytes: 10485760
+
+# Timeout for the encoding-aware grep, in milliseconds.
+# Unset (default) uses the built-in grep's DEFAULT budget. If a deployment
+# overrides the built-in grep's own timeoutMs, this key does NOT follow it —
+# set it here too. Raise it on very large trees, where the per-file decode this
+# tool adds can spend the default budget before the search finishes.
+# Read when the plugin registers the tool, so a change needs a plugin reload.
+# grepTimeoutMs: 120000
 `;
 
 /** Directory holding this plugin's shared home (config, caches). */
@@ -145,6 +170,36 @@ function parseBool(value: string | undefined): boolean | undefined {
   if (t === "true") return true;
   if (t === "false") return false;
   return undefined;
+}
+
+/**
+ * Largest delay a timer can be given, in milliseconds.
+ *
+ * The declared tool timeout is enforced by a timer, and a value above this bound
+ * does not mean "effectively no timeout": the timer throws, on EVERY call, before
+ * the tool body runs. `defineTool` only requires a positive number, so the bound
+ * has to be enforced where the value is parsed.
+ */
+const MAX_TOOL_TIMEOUT_MS = 2147483647;
+
+/**
+ * Parse the `grep` timeout, refusing values no timer can schedule.
+ *
+ * Out-of-range values fall back to "unset" for the same reason a non-positive one
+ * does: a config typo must not take the whole tool down. The bound is checked
+ * here rather than at the tool definition because this is where both sources
+ * (config file and environment) are parsed, and the failure it prevents is a
+ * property of the value, not of the source that supplied it.
+ *
+ * @param value - the raw value from the config file or the environment.
+ * @returns the timeout in milliseconds, or `undefined` when unset or unusable.
+ */
+function parseGrepTimeout(value: string | undefined): number | undefined {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > MAX_TOOL_TIMEOUT_MS) {
+    return undefined;
+  }
+  return parsed;
 }
 
 function parseEncodings(value: string | undefined): string[] | undefined {
@@ -223,6 +278,8 @@ function envOverrides(): Partial<PluginConfig> {
   if (encs !== undefined) out.supportedEncodings = encs;
   const maxBytes = Number(process.env["DSH_FS_ENCODING_MAX_FILE_BYTES"]);
   if (Number.isSafeInteger(maxBytes) && maxBytes > 0) out.maxFileBytes = maxBytes;
+  const grepTimeout = parseGrepTimeout(process.env["DSH_FS_ENCODING_GREP_TIMEOUT_MS"]);
+  if (grepTimeout !== undefined) out.grepTimeoutMs = grepTimeout;
   return out;
 }
 
@@ -272,6 +329,8 @@ export function loadConfig(): PluginConfig {
     if (excluded.length > 0) fromFile.excludeEncodings = excluded;
     const maxBytes = Number(parsed["maxFileBytes"]);
     if (Number.isSafeInteger(maxBytes) && maxBytes > 0) fromFile.maxFileBytes = maxBytes;
+    const grepTimeout = parseGrepTimeout(parsed["grepTimeoutMs"]);
+    if (grepTimeout !== undefined) fromFile.grepTimeoutMs = grepTimeout;
   } catch {
     // ENOENT or unreadable: keep the defaults.
     fromFile = {};
